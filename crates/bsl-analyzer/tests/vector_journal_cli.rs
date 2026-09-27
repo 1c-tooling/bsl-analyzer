@@ -1,5 +1,6 @@
 //! Protocol acceptance uses isolated XDG directories and the real CLI entrypoint.
-#![cfg(unix)]
+// macOS resolves the journal root under `~/Library`, not from XDG variables.
+#![cfg(all(unix, not(target_os = "macos")))]
 use std::{
     fs,
     io::{BufRead, BufReader, Write},

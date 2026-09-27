@@ -1036,6 +1036,17 @@ impl SharedState {
     }
 
     pub(super) fn embedding_config() -> Result<Option<bsl_search::SearchConfig>, SearchError> {
+        // Окружение разработчика в тесты не протекает. `EMBEDDING_URL`, выставленный в
+        // оболочке, уводил прогон к настоящему сервису эмбеддингов: запросы упирались в
+        // сетевые таймауты и повторы, и завершение состояния ждало их десятками минут —
+        // вместо проверки логики тест мерил доступность чужой сети. Внешний эмбеддер в
+        // тестовой сборке включает только явная подмена (`test_support::mock_embedding_env`
+        // либо `BSL_TEST_EMBEDDING` рядом с ручной установкой адреса).
+        #[cfg(test)]
+        if std::env::var_os("BSL_TEST_EMBEDDING").is_none() {
+            return Ok(None);
+        }
+
         let Ok(base_url) = std::env::var("EMBEDDING_URL") else { return Ok(None) };
         // The model must be declared explicitly: a wrong default would silently mix
         // vectors from different models into one index. Unset means FTS-only.
@@ -2247,6 +2258,7 @@ mod tests {
     #[test]
     fn payload_lifecycle_reference_config_error_reaches_the_runtime_owner() {
         let _lock = env_lock();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
         let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
         let _limit = EnvVarGuard::set("EMBEDDING_MAX_REQUEST_BYTES", "private-invalid-value");
@@ -2272,6 +2284,7 @@ mod tests {
     #[test]
     fn payload_configuration_rejects_invalid_enabled_settings_before_opening_storage() {
         let _lock = env_lock();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
         let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
         let _batch = EnvVarGuard::set("EMBEDDING_BATCH_SIZE", "7");
@@ -3342,6 +3355,7 @@ mod tests {
     #[test]
     fn workspace_external_failure_with_embeddings_fails_closed_without_hybrid_warmup() {
         let _env_lock = env_lock();
+        let _embedding_enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
         let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         // A configured embedder now requires an explicit model (no silent default), so set
         // one here; otherwise the ambient env decides whether the engine is semantic, which
@@ -3405,6 +3419,7 @@ mod tests {
         // A configured embedder makes the engine semantic, but the URL is unreachable:
         // the point is that init must NOT run the synchronous embed here. It writes the
         // FTS chunks and defers embedding, so init returns promptly with work pending.
+        let _embedding_enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
         let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         // A configured embedder now requires an explicit model (no silent default), so set
         // one here; otherwise the ambient env decides whether the engine is semantic, which
@@ -3905,6 +3920,7 @@ mod tests {
         let _env_lock = env_lock();
         // A configured embedder selects the semantic deferred branch; the URL is never dialed
         // (deferred indexing writes NULL embeddings), it only flips `has_semantic` true.
+        let _embedding_enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
         let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         let _embedding_model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
 
@@ -4746,6 +4762,7 @@ mod tests {
     fn a_deferred_boot_queues_the_extension_for_embedding() {
         let _env_lock = env_lock();
         // A configured embedder selects the semantic deferred branch; the URL is never dialed.
+        let _embedding_enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
         let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         let _embedding_model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
 

@@ -25,6 +25,8 @@ const QUEUE_RECORDS: usize = 511;
 const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 const SLOTS: usize = 8;
 const DRAIN: Duration = Duration::from_secs(2);
+const RETRY: Duration = Duration::from_millis(20);
+const RETRY_LIMIT: Duration = Duration::from_secs(1);
 static ACTIVE: OnceLock<Arc<Shared>> = OnceLock::new();
 
 #[derive(Default)]
@@ -157,12 +159,28 @@ fn worker(
     directory: &Path,
     diagnostics: &mut Diagnostics,
 ) {
+    worker_with(receiver, shared, directory, diagnostics, |directory, record, dropped| {
+        append(directory, record, dropped, SEGMENT_BYTES)
+    })
+}
+
+fn worker_with(
+    receiver: Receiver<Box<[u8]>>,
+    shared: &Shared,
+    directory: &Path,
+    diagnostics: &mut Diagnostics,
+    mut append: impl FnMut(&Path, &[u8], &mut u64) -> io::Result<()>,
+) {
     let mut pending = None;
     let mut stopping = None;
+    let mut backoff = RETRY;
+    let mut refused = false;
     loop {
         if shared.stop.load(Ordering::Acquire) {
             let since = stopping.get_or_insert_with(Instant::now);
-            if since.elapsed() >= DRAIN {
+            // Draining is for a sink that is merely busy; a refused one will not accept the
+            // backlog in the remaining time either.
+            if refused || since.elapsed() >= DRAIN {
                 return;
             }
         }
@@ -175,14 +193,28 @@ fn worker(
             }
         }
         let mut dropped = shared.dropped.swap(0, Ordering::AcqRel);
-        match append(directory, pending.as_ref().unwrap(), &mut dropped, SEGMENT_BYTES) {
-            Ok(()) => pending = None,
+        match append(directory, pending.as_ref().unwrap(), &mut dropped) {
+            Ok(()) => {
+                pending = None;
+                backoff = RETRY;
+                refused = false;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                shared.dropped.fetch_add(dropped, Ordering::Relaxed);
+                refused = false;
+                std::thread::sleep(RETRY);
+            }
             Err(error) => {
                 shared.dropped.fetch_add(dropped, Ordering::Relaxed);
-                if error.kind() != io::ErrorKind::WouldBlock {
-                    diagnostics.report(error.kind());
+                diagnostics.report(error.kind());
+                refused = true;
+                // Nothing in this process repairs a refused target, so it is not retried at
+                // lock-contention pace; the wait still ends as soon as shutdown begins.
+                let until = Instant::now() + backoff;
+                while Instant::now() < until && !shared.stop.load(Ordering::Acquire) {
+                    std::thread::sleep(RETRY);
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                backoff = (backoff * 2).min(RETRY_LIMIT);
             }
         }
     }
@@ -630,6 +662,44 @@ mod tests {
         drop(lock);
         assert!(result.is_ok(), "shutdown must finish while the disk lock remains held");
         guard.join().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_journal_neither_spins_nor_delays_shutdown() {
+        let directory = private_temp();
+        // A foreign entry makes every append fail closed until someone removes it.
+        fs::write(directory.path().join(".DS_Store"), b"x").unwrap();
+        let shared = Arc::new(Shared::default());
+        let (sender, receiver) = bounded(QUEUE_RECORDS);
+        sender.send(Vec::from(&b"{}\n"[..]).into_boxed_slice()).unwrap();
+        shared.sender.set(sender).unwrap();
+        let (done_tx, done_rx) = bounded(1);
+        shared.done.set(done_rx).unwrap();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let worker_shared = shared.clone();
+        let worker_attempts = attempts.clone();
+        let path = directory.path().to_owned();
+        let handle = std::thread::spawn(move || {
+            let mut diagnostics = Diagnostics::default();
+            worker_with(
+                receiver,
+                &worker_shared,
+                &path,
+                &mut diagnostics,
+                |directory, record, dropped| {
+                    worker_attempts.fetch_add(1, Ordering::Relaxed);
+                    append(directory, record, dropped, SEGMENT_BYTES)
+                },
+            );
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        // A fixed 20 ms retry makes about fifty attempts in this second.
+        assert!(attempts.load(Ordering::Relaxed) < 15, "{attempts:?}");
+        let started = Instant::now();
+        drop(JournalGuard(shared));
+        assert!(started.elapsed() < DRAIN / 2, "{:?}", started.elapsed());
         handle.join().unwrap();
     }
 

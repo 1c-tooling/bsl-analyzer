@@ -405,7 +405,7 @@ pub fn loading(detail: Option<&str>) -> CallToolResult {
 /// independent of the on-disk SQLite cache layout in [`crate::graph_db`]).
 fn schema_json() -> Value {
     json!({
-        "schema_version": "34",
+        "schema_version": "35",
         "indexing_contract": "Lifecycle status and loading responses include indexing schema_version 1 with a graph target; data/schema responses do not require indexing. States: waiting|running|ready|disabled|failed|cancelled|superseded|unknown. Phase, progress and pass_id are null for graph targets.",
         "actions": ["overview", "schema", "status", "node", "source", "neighbors", "callers", "callees", "resolve"],
         "status": "`status` returns the graph lifecycle ({state: disabled|loading|ready|failed, and when ready: files, unread_files, revision, stale, reload}; for a workspace graph always `drift_watch`, see the envelope) and kicks the lazy build — poll it instead of reading a flat `loading` envelope from a data action (mirrors `diagnostics status`). `unread_files` counts modules whose bytes could not be read when the artefact was built or last patched: they contributed no nodes and no edges, so the graph is missing them, `stale` is true, and no fingerprint comparison reveals it (stat needs no read permission). A patch never clears an inherited one — only a full rebuild restores the missing rows. `files` here is the module count the artefact COVERS, unread ones included, so `unread_files` is a subset of it — unlike `diagnostics status`, whose `files` counts only what it serves and excludes them; do not apply one arithmetic to both. `superseded: true` (emitted only when it holds) means another daemon generation owns this workspace's derived caches and this server no longer rebuilds. It reports `ready + superseded` and serves data only while one of its own pre-opened SQLite descriptors is available in the pool; otherwise status is `failed + superseded` and every data action returns the same reconnect error, never `loading`. Reconnect to use the current daemon. The static `schema` action remains available without a snapshot.",
@@ -814,7 +814,7 @@ mod tests {
         // The contract version must be bumped in lockstep with any response-shape change
         // (a new action, node/edge kind, or result field). The history of what each bump
         // added lives in git, not here.
-        assert_eq!(schema["schema_version"], "34");
+        assert_eq!(schema["schema_version"], "35");
         // A bumped number over unchanged text would certify a contract the server no longer
         // honours, so the new keys are asserted by description, not by version alone.
         assert!(schema["envelope"]["freshness"].is_string(), "the freshness envelope advertised");
@@ -922,7 +922,7 @@ mod tests {
     #[test]
     fn schema_and_loading_populate_structured_content() {
         assert_structured_mirrors_text(&schema());
-        assert_eq!(schema().structured_content.unwrap()["schema_version"], "34");
+        assert_eq!(schema().structured_content.unwrap()["schema_version"], "35");
 
         assert_structured_mirrors_text(&loading(Some("indexing")));
         let body = loading(Some("indexing")).structured_content.unwrap();

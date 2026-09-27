@@ -306,6 +306,18 @@ impl Record {
         }
     }
 
+    /// A started record for the next interval: none of the interval's own tallies repeat in it.
+    fn intent(&self) -> Self {
+        let mut intent = self.clone();
+        intent.outcome = Outcome::Started;
+        intent.counts = Counts::default();
+        intent.files = 0;
+        intent.outcomes.clear();
+        intent.reasons.clear();
+        intent.examples.clear();
+        intent
+    }
+
     pub fn emit(&mut self, debug: bool) {
         if debug {
             if tracing::enabled!(target: "bsl_vector_lifecycle", tracing::Level::DEBUG) {
@@ -318,13 +330,7 @@ impl Record {
             let text = String::from_utf8_lossy(&bytes);
             tracing::info!(target: "bsl_vector_lifecycle", record = text.trim_end_matches('\n'));
             if self.outcome == Outcome::Progress {
-                let mut intent = self.clone();
-                intent.outcome = Outcome::Started;
-                intent.counts = Counts::default();
-                intent.files = 0;
-                intent.reasons.clear();
-                intent.examples.clear();
-                intent.emit(false);
+                self.intent().emit(false);
             }
         }
     }
@@ -425,6 +431,7 @@ impl Summary {
         event.outcome = outcome;
         self.record.files = 0;
         self.record.counts = Counts::default();
+        self.record.outcomes.clear();
         self.record.reasons.clear();
         self.record.examples.clear();
         self.since = Instant::now();
@@ -465,7 +472,7 @@ impl Batch {
         let mut record = {
             let mut summary = self.context.0.lock().unwrap_or_else(|e| e.into_inner());
             summary.record.pending = Some(count);
-            summary.record.clone()
+            summary.record.intent()
         };
         record.emit(false);
     }
@@ -719,6 +726,17 @@ mod tests {
         assert_eq!(terminal["outcome"], "cancelled");
         assert!(records.iter().all(|r| r["examples"].as_array().unwrap().len() <= 10));
         assert!(records.iter().all(|r| r["operation_id"] == terminal["operation_id"]));
+        // Like `files` and `counts`, `outcomes` covers only its own summary interval, so the
+        // summaries of one operation add up to the mutations it ran.
+        let summaries = records.iter().filter(|r| r["outcome"] != "started");
+        let (files, committed) = summaries.fold((0, 0), |(files, committed), r| {
+            assert_eq!(r["outcomes"]["committed"].as_u64().unwrap_or(0), r["files"]);
+            (
+                files + r["files"].as_u64().unwrap(),
+                committed + r["outcomes"]["committed"].as_u64().unwrap_or(0),
+            )
+        });
+        assert_eq!((files, committed), (10_000, 10_000));
     }
 
     #[test]
@@ -746,15 +764,43 @@ mod tests {
     }
 
     #[test]
+    fn started_intents_carry_no_interval_data() {
+        let records = capture(|| {
+            let batch = Batch::new(Path::new("db"), Reason::ExplicitRebuild);
+            batch.context().in_scope(|| {
+                // Pending arrives mid-interval here; its intent must not repeat that interval.
+                Mutation::new(Path::new("db"), Reason::HashChanged)
+                    .finish(Outcome::Committed, Counts::default());
+                batch.pending(7);
+                for _ in 1..SUMMARY_FILES {
+                    Mutation::new(Path::new("db"), Reason::HashChanged)
+                        .finish(Outcome::Committed, Counts::default());
+                }
+            });
+            batch.finish(Outcome::Completed);
+        });
+        let started: Vec<_> = records.iter().filter(|r| r["outcome"] == "started").collect();
+        assert_eq!(started.len(), 3); // Initial, pending, after the progress summary.
+        for record in started {
+            assert_eq!(record["files"], 0, "{record}");
+            assert!(record["outcomes"].as_object().unwrap().is_empty(), "{record}");
+            assert!(record["reasons"].as_object().unwrap().is_empty(), "{record}");
+            assert!(record["examples"].as_array().unwrap().is_empty(), "{record}");
+        }
+    }
+
+    #[test]
     fn scoped_capture_survives_first_callsite_on_unsubscribed_thread() {
         const CHILD: &str = "BSL_LIFECYCLE_CAPTURE_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lifecycle::tests::scoped_capture_survives_first_callsite_on_unsubscribed_thread"])
                 .env(CHILD, "1")
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // A drifted name would select no test and still exit successfully.
+            assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}");
             return;
         }
         let records = capture(|| {

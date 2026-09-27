@@ -1948,13 +1948,31 @@ impl GraphState {
             drift_watch,
             poll_cycle_secs: watch_sample.and_then(|(_, cycle, _)| cycle),
         };
+        let superseded = self.lease.is_superseded();
+        // A busy owner reads as loading, but a superseded one is terminal and never loads.
+        let busy = || {
+            if superseded {
+                (
+                    GraphStatusReport {
+                        error: Some(SUPERSEDED_GRAPH_ERROR.to_owned()),
+                        ..report("failed", Some(true))
+                    },
+                    Target::new(
+                        Kind::Graph,
+                        crate::indexing::State::Superseded,
+                        Some(crate::indexing::Reason::Superseded),
+                    ),
+                )
+            } else {
+                (report("loading", None), Target::unknown(Kind::Graph))
+            }
+        };
         let Some((_, _, watch_stale)) = watch_sample else {
-            return (report("loading", None), Target::unknown(Kind::Graph));
+            return busy();
         };
         let Ok(inner) = self.inner.try_lock() else {
-            return (report("loading", None), Target::unknown(Kind::Graph));
+            return busy();
         };
-        let superseded = self.lease.is_superseded();
         let debt_stale = self.debt.try_lock().ok().map(|debt| debt.stale());
         let snapshot_stale = inner.published.as_ref().and_then(|published| {
             self.snapshot_pool.try_lock().ok().and_then(|pool| {
@@ -4238,6 +4256,13 @@ mod tests {
         let own_revision = held[0].generation;
         let _newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
         assert!(graph.is_superseded(), "the foreign token establishes the terminal verdict");
+        {
+            let _busy = graph.inner.lock().unwrap();
+            let (report, target) = graph.status_report_with_indexing();
+            assert_eq!(report.state, "failed", "a superseded owner never reports loading");
+            assert_eq!(report.superseded, Some(true));
+            assert_eq!(target.state, crate::indexing::State::Superseded);
+        }
 
         for lifecycle in [
             GraphStatus::Idle,

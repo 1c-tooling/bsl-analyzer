@@ -1422,7 +1422,7 @@ impl WorkspaceOverlayCache {
     ) -> Result<(), SearchError> {
         let mut embedding_failure = None;
         let baseline_identity =
-            store.load_baseline_manifest()?.map(|r| (r.snapshot_id, r.fingerprint));
+            store.load_baseline_manifest().ok().flatten().map(|r| (r.snapshot_id, r.fingerprint));
         let manifest_snapshot_id = baseline_identity.as_ref().map(|r| r.0.as_str()).unwrap_or("");
         let persisted = store
             .load_overlay_fingerprint_cache(manifest_snapshot_id)
@@ -1702,7 +1702,7 @@ impl WorkspaceOverlayCache {
         distrusted: &HashSet<FileKey>,
     ) -> Result<RefreshPlan, SearchError> {
         let baseline_identity =
-            store.load_baseline_manifest()?.map(|r| (r.snapshot_id, r.fingerprint));
+            store.load_baseline_manifest().ok().flatten().map(|r| (r.snapshot_id, r.fingerprint));
         let snapshot_id = baseline_identity.as_ref().map(|r| r.0.clone()).unwrap_or_default();
         let persisted =
             store.load_overlay_fingerprint_cache(&snapshot_id).unwrap_or(None).unwrap_or_default();
@@ -6537,6 +6537,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.overlay_file_count(), 1, "the edit survives the restart");
+    }
+
+    /// The baseline manifest only names which fingerprint cache and baseline identity the
+    /// overlay belongs to. An unreadable manifest leaves that identity unknown; it must not
+    /// abort the refresh that keeps the overlay current.
+    #[test]
+    fn an_unreadable_manifest_leaves_identity_unknown_and_refreshes() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let original = "Процедура Первая()\nКонецПроцедуры";
+        fs::write(workspace.join("A.bsl"), original).unwrap();
+        let manifest =
+            HashMap::from([(key("A.bsl"), super::fingerprint_content(original, "A.bsl"))]);
+        let roots = single_root(workspace);
+        let db_path = workspace.join("search.db");
+        let store = Store::open(&db_path).unwrap();
+        let mut cache = WorkspaceOverlayCache::default();
+        cache.refresh_with_manifest(&manifest, &roots, None, 32, &store, true).unwrap();
+        fs::write(workspace.join("A.bsl"), "Процедура Вторая()\nКонецПроцедуры").unwrap();
+        let saboteur = rusqlite::Connection::open(&db_path).unwrap();
+        saboteur.execute_batch("ALTER TABLE baseline_manifest RENAME TO hidden_manifest;").unwrap();
+        assert!(store.load_baseline_manifest().is_err(), "the fixture must break the read");
+
+        cache.mark_dirty_path(key("A.bsl"));
+        cache.full_refresh_from_manifest(&manifest, &roots, None, 32, &store).unwrap();
+        assert_eq!(cache.snapshot().lexical_documents[0].symbol_name, "Вторая");
+        assert!(cache.baseline_identity.is_none());
+        let plan = WorkspaceOverlayCache::plan_full_refresh_from_manifest(
+            &manifest,
+            &roots,
+            &store,
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(plan.overlay_file_count(), 1);
     }
 
     /// Failed row retractions are a STORE fault, not a per-path one: they must not eat the

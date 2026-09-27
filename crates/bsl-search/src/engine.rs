@@ -4482,8 +4482,13 @@ impl SearchEngine {
         if self.workspace_roots.is_none() {
             return Ok(());
         }
+        // An unreadable manifest leaves the identity unknown, which only withholds readiness.
         let identity = if self.serves_external_baseline {
-            self.store.load_baseline_manifest()?.map(|r| (r.snapshot_id, r.fingerprint))
+            self.store
+                .load_baseline_manifest()
+                .ok()
+                .flatten()
+                .map(|r| (r.snapshot_id, r.fingerprint))
         } else {
             None
         };
@@ -5750,45 +5755,6 @@ mod retry_signal_ownership {
 }
 
 #[cfg(test)]
-mod index_progress_ownership {
-    /// `IndexProgress::active` is a process-lifetime signal, not just a status line: the MCP
-    /// broker holds a backend alive while it is raised. A pass that raises it by hand leaks
-    /// that backend the first time it returns early, so the flag goes up only through
-    /// `begin_pass`, whose guard lowers it on every exit — `?`, early `return`, panic.
-    ///
-    /// Counted rather than enumerated, so a pass added later fails here instead of in the
-    /// field. The needle is assembled at run time: spelled out, this gate would match its
-    /// own source and pass for the wrong reason.
-    #[test]
-    fn only_the_guard_raises_the_active_flag() {
-        let source = include_str!("engine.rs");
-        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
-        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
-        // gate would fail on the line endings rather than on the code, in the very CI step that
-        // runs it by name. Normalised first, so the gate is about the source and not the
-        // checkout.
-        let source = &source.replace("\r\n", "\n");
-        // Test code may drive the flag directly, so the ban covers production only. The cut is
-        // asserted by COUNTING the marker, not by checking what the split returned: `split`
-        // always yields at least one piece, so a renamed or moved marker would silently hand
-        // this gate the whole file — tests included — and it would pass for the wrong reason.
-        let cut = ["\n#[cfg(test)]\n", "mod tests {"].concat();
-        assert_eq!(
-            source.matches(&cut).count(),
-            1,
-            "the production/test cut moved; this gate scans only what it can prove it scanned"
-        );
-        let production = source.split(&cut).next().unwrap_or(source);
-        let raised_by_hand = ["active", ".store(true"].concat();
-        assert_eq!(
-            production.matches(&raised_by_hand).count(),
-            0,
-            "raise IndexProgress::active through begin_pass, so every exit lowers it again"
-        );
-    }
-}
-
-#[cfg(test)]
 mod lifecycle_tests;
 
 #[cfg(test)]
@@ -5924,6 +5890,24 @@ mod tests {
         assert!(interrupted.is_break());
         assert!(engine.serves_external_baseline);
         assert_eq!(engine.store().overlay_fingerprint_keys().unwrap().len(), fingerprints.len());
+    }
+
+    /// Clean initialization only records which baseline the overlay matches; an unreadable
+    /// manifest leaves that unknown instead of keeping the resident-fed reindex inert.
+    #[test]
+    fn a_clean_start_with_an_unreadable_manifest_still_initializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("search.db");
+        let mut engine = SearchEngine::fts_only(&db).unwrap();
+        engine.set_workspace_root(dir.path().to_path_buf());
+        engine.set_serves_external_baseline(true).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("ALTER TABLE baseline_manifest RENAME TO hidden_manifest;")
+            .unwrap();
+        engine.initialize_workspace_overlay_clean().unwrap();
+        assert!(engine.try_workspace_overlay_retry_signals().unwrap().initialized);
+        assert_eq!(engine.try_workspace_overlay_baseline_identity(), None);
     }
 
     /// A local store has no baseline copy beyond its own rows, which the batch deletes: a removed

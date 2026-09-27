@@ -24,16 +24,6 @@ pub enum SaturatingCount {
 }
 
 impl SaturatingCount {
-    pub fn lower_bound(self) -> u8 {
-        match self {
-            Self::Exact(n) | Self::AtLeast(n) => n,
-        }
-    }
-
-    pub fn is_definitely_open(self) -> bool {
-        self.lower_bound() > 0
-    }
-
     pub fn inc(self) -> Self {
         match self {
             Self::Exact(n) if n < K_MAX => Self::Exact(n + 1),
@@ -537,6 +527,33 @@ mod tests {
         assert_eq!(s, SaturatingCount::AtLeast(0));
     }
 
+    /// Каждый отдельный шаг `AtLeast` наблюдается здесь, а не через доведение до
+    /// насыщения: упёршийся в `AtLeast(K_MAX)` счётчик даёт один и тот же итог при
+    /// любом искажении самого шага, поэтому итог о шаге ничего не говорит.
+    #[test]
+    fn saturating_inc_steps_through_at_least() {
+        assert_eq!(SaturatingCount::AtLeast(0).inc(), SaturatingCount::AtLeast(1));
+        assert_eq!(SaturatingCount::AtLeast(K_MAX - 1).inc(), SaturatingCount::AtLeast(K_MAX));
+        assert_eq!(SaturatingCount::AtLeast(K_MAX).inc(), SaturatingCount::AtLeast(K_MAX));
+    }
+
+    /// Точка перехода `Exact` -> `AtLeast` лежит ровно на `K_MAX`: до неё счётчик
+    /// остаётся точным, на ней теряет точность.
+    #[test]
+    fn saturating_inc_leaves_exact_exactly_at_k_max() {
+        assert_eq!(SaturatingCount::Exact(K_MAX - 1).inc(), SaturatingCount::Exact(K_MAX));
+        assert_eq!(SaturatingCount::Exact(K_MAX).inc(), SaturatingCount::AtLeast(K_MAX));
+    }
+
+    /// Шаг вниз с положительного значения — вторая половина `dec`, которую проверка
+    /// одного лишь пола на нуле не затрагивает.
+    #[test]
+    fn saturating_dec_steps_down_above_zero() {
+        assert_eq!(SaturatingCount::Exact(1).dec(), SaturatingCount::Exact(0));
+        assert_eq!(SaturatingCount::AtLeast(1).dec(), SaturatingCount::AtLeast(0));
+        assert_eq!(SaturatingCount::AtLeast(K_MAX).dec(), SaturatingCount::AtLeast(K_MAX - 1));
+    }
+
     #[test]
     fn unreachable_is_join_identity() {
         let bot = SecurityModeState::unreachable();
@@ -610,5 +627,52 @@ mod tests {
         let r = reachable_with_overlay(pc(1, 1), ValueOverlay::empty());
         assert_eq!(bot.join(&r), r);
         assert_eq!(r.join(&bot), r);
+    }
+
+    fn call_info(category: Category, opens_unsafe_when: bool, arg: ArgValue) -> SecurityCallInfo {
+        SecurityCallInfo { category, opens_unsafe_when, arg }
+    }
+
+    /// `УстановитьПривилегированныйРежим(Истина)` снимает проверку прав, `(Ложь)` её
+    /// возвращает: аргумент `Истина` открывает кадр.
+    #[test]
+    fn call_opening_on_true_arg_opens_and_closes_mirrored() {
+        let mut counters =
+            SecurityCounters { privilege: pc(1, 1), unsafe_frame: PrivilegeCounter::ENTRY };
+        apply_call_to_counters(
+            &mut counters,
+            call_info(Category::PrivilegedMode, true, ArgValue::KnownTrue),
+        );
+        assert_eq!(counters.privilege, pc(2, 2));
+
+        let mut counters =
+            SecurityCounters { privilege: pc(1, 1), unsafe_frame: PrivilegeCounter::ENTRY };
+        apply_call_to_counters(
+            &mut counters,
+            call_info(Category::PrivilegedMode, false, ArgValue::KnownTrue),
+        );
+        assert_eq!(counters.privilege, pc(0, 0));
+    }
+
+    /// Зеркальная форма: `УстановитьБезопасныйРежим(Ложь)` снимает защиту, `(Истина)`
+    /// её включает — то есть кадр открывает аргумент `Ложь`. Обе формы обязаны
+    /// различаться, иначе вызовы двух категорий трактуются одинаково.
+    #[test]
+    fn call_opening_on_false_arg_opens_and_closes_mirrored() {
+        let mut counters =
+            SecurityCounters { privilege: PrivilegeCounter::ENTRY, unsafe_frame: pc(1, 1) };
+        apply_call_to_counters(
+            &mut counters,
+            call_info(Category::SafeMode, false, ArgValue::KnownFalse),
+        );
+        assert_eq!(counters.unsafe_frame, pc(2, 2));
+
+        let mut counters =
+            SecurityCounters { privilege: PrivilegeCounter::ENTRY, unsafe_frame: pc(1, 1) };
+        apply_call_to_counters(
+            &mut counters,
+            call_info(Category::SafeMode, true, ArgValue::KnownFalse),
+        );
+        assert_eq!(counters.unsafe_frame, pc(0, 0));
     }
 }

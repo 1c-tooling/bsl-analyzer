@@ -1352,7 +1352,7 @@ impl SharedState {
                                                 engine.set_vector_index(
                                                     prepared.take().expect("prepared index exists"),
                                                 );
-                                                if index_progress.snapshot().is_some_and(|sample| sample.state == bsl_search::IndexPassState::Running) {
+                                                if progress_pass.token().is_running() {
                                                     if let Some(epoch) = publication_epoch { engine.observe_semantic_publication(epoch); }
                                                 }
                                                 Ok::<_, std::convert::Infallible>(())

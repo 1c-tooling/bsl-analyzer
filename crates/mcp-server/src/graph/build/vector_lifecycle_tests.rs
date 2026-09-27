@@ -37,12 +37,14 @@ fn capture(f: impl FnOnce()) -> Vec<Value> {
 fn vector_lifecycle_capture_survives_first_callsite_on_unsubscribed_thread() {
     const CHILD: &str = "BSL_MCP_LIFECYCLE_CAPTURE_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "graph::build::vector_lifecycle_tests::vector_lifecycle_capture_survives_first_callsite_on_unsubscribed_thread"])
             .env(CHILD, "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // A drifted name would select no test and still exit successfully.
+        assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}");
         return;
     }
     let probe = || {

@@ -214,6 +214,7 @@ async fn until(
 
 fn provider_env(provider: &Provider) -> Vec<EnvVarGuard> {
     vec![
+        EnvVarGuard::set("BSL_TEST_EMBEDDING", "1"),
         EnvVarGuard::set("EMBEDDING_URL", &provider.url),
         EnvVarGuard::set("EMBEDDING_MODEL", "test-model"),
         EnvVarGuard::set("EMBEDDING_DIM", "3"),

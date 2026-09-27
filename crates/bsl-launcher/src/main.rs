@@ -43,11 +43,17 @@ fn main() -> Result<()> {
     let requested_version = requested_version
         .or_else(|| env::var("BSL_ANALYZER_VERSION").ok().filter(|s| !s.is_empty()));
 
-    let is_analyze_mode = remaining_args.first().map(|s| s.as_str()) == Some("analyze");
+    let is_version_query =
+        matches!(remaining_args.first().map(|s| s.as_str()), Some("--version" | "-V"));
+
+    // `analyze` updates before it runs, so a version answered from a background update
+    // would name a build the next analysis no longer uses. Both must resolve the same way.
+    let sync_update =
+        is_version_query || remaining_args.first().map(|s| s.as_str()) == Some("analyze");
 
     let analyzer_path = match requested_version {
         Some(ver) => use_cases::ensure_specific_version(&*provider, &ver)?,
-        None => use_cases::ensure_analyzer(&*provider, is_analyze_mode)?,
+        None => use_cases::ensure_analyzer(&*provider, sync_update)?,
     };
 
     let mut cmd = Command::new(&analyzer_path);
@@ -82,6 +88,12 @@ fn main() -> Result<()> {
     let status = child
         .wait()
         .with_context(|| format!("Failed to wait for bsl-analyzer at {:?}", analyzer_path))?;
+
+    // The app prints the build that does the work; the launcher is a separate binary with
+    // its own version, and a bug report needs to name both.
+    if is_version_query && status.success() {
+        println!("bsl-analyzer-launcher {}", env!("CARGO_PKG_VERSION"));
+    }
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -132,6 +144,7 @@ fn show_help_with_launcher_commands(provider: &dyn ReleaseProvider) -> Result<()
     println!("  {:30} {}", "--launcher-cleanup", m.help_cleanup);
     println!();
     println!("  BSL_ANALYZER_VERSION=<VERSION>  {}", m.help_use);
+    println!("  BSL_ANALYZER_HOME=<DIR>         {}", m.help_home);
 
     Ok(())
 }

@@ -14,6 +14,12 @@ wrappers = re.findall(
     re.MULTILINE | re.DOTALL,
 )
 assert wrappers, "no CI test wrappers found"
+# Every wrapper must be checked: one whose spelling drifts from the pattern above
+# would otherwise drop out of the check silently.
+defined = re.findall(
+    r"^\s*(?:function\s+)?run_\w+\s*\(\s*\)\s*\{", workflow.read_text(), re.MULTILINE
+)
+assert len(wrappers) == len(defined), f"checked {len(wrappers)} of {len(defined)} CI wrappers"
 for block in wrappers:
     name = block.strip().split("(", 1)[0]
     for passed, status in [(1, 0), (0, 0), (1, 101)]:

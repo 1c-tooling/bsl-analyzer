@@ -198,6 +198,7 @@ mod fixtures {
     /// test. Returns the guards (kept alive by the caller) plus the shared env lock guard.
     pub(in crate::state) fn mock_embedding_env(base_url: &str) -> Vec<EnvVarGuard> {
         vec![
+            EnvVarGuard::set("BSL_TEST_EMBEDDING", "1"),
             EnvVarGuard::set("EMBEDDING_URL", base_url),
             EnvVarGuard::set("EMBEDDING_MODEL", "test-model"),
             EnvVarGuard::set("EMBEDDING_DIM", "3"),

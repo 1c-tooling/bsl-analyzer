@@ -88,19 +88,35 @@ pub fn ensure_analyzer(provider: &dyn ReleaseProvider, sync_update: bool) -> Res
     swap_and_resolve(&cache_dir)
 }
 
+/// The cached app already is the current version, so starting it swaps nothing.
+fn converged_stable(cache_dir: &Path) -> Option<PathBuf> {
+    let current_ver = get_current_version(cache_dir)?;
+    let stable = stable_app_path(cache_dir);
+    (stable.exists() && read_stable_version(cache_dir).as_deref() == Some(current_ver.as_str()))
+        .then_some(stable)
+}
+
 fn swap_and_resolve(cache_dir: &Path) -> Result<PathBuf> {
+    // Taking the swap lock creates a file, so a converged cache must resolve without it:
+    // that one write is what otherwise stops the analyzer on a read-only home.
+    if let Some(stable) = converged_stable(cache_dir) {
+        return Ok(stable);
+    }
+
     let _lock = SwapLock::acquire(cache_dir)?;
+
+    // `perform_swap` moves the binary into place before it writes the sidecar, so a
+    // sidecar naming the current version always has that binary beside it. Losing the
+    // race against a concurrent swap therefore costs only this second look.
+    if let Some(stable) = converged_stable(cache_dir) {
+        return Ok(stable);
+    }
 
     let Some(current_ver) = get_current_version(cache_dir) else {
         bail!("bsl-analyzer is not installed and could not be downloaded");
     };
 
     let stable = stable_app_path(cache_dir);
-    let stable_ver = read_stable_version(cache_dir);
-    if stable.exists() && stable_ver.as_deref() == Some(current_ver.as_str()) {
-        return Ok(stable);
-    }
-
     let versioned = cache_dir.join(format!("bsl-analyzer-{}", current_ver));
 
     if versioned.exists() {
@@ -929,5 +945,109 @@ mod tests {
             "stable bytes must match version named in sidecar"
         );
         assert_eq!(stable_ver, "0.1.5");
+    }
+
+    use crate::cache::{data_dir, DATA_DIR_ENV, SWAP_LOCK_FILENAME};
+
+    /// `BSL_ANALYZER_HOME` is process-wide, so the tests that move it take turns.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_data_dir_env<T>(value: Option<&Path>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = env::var_os(DATA_DIR_ENV);
+        match value {
+            Some(path) => env::set_var(DATA_DIR_ENV, path),
+            None => env::set_var(DATA_DIR_ENV, ""),
+        }
+        let outcome = body();
+        match previous {
+            Some(prev) => env::set_var(DATA_DIR_ENV, prev),
+            None => env::remove_var(DATA_DIR_ENV),
+        }
+        outcome
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // Root ignores the permission bits these tests rely on.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    fn set_dir_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).expect("read dir permissions").permissions();
+        perms.set_mode(mode);
+        fs::set_permissions(path, perms).expect("set dir permissions");
+    }
+
+    #[test]
+    fn data_dir_follows_the_env_override() {
+        let dir = TestDir::new();
+        let (resolved, cache) = with_data_dir_env(Some(dir.path()), || {
+            (data_dir().expect("override resolves"), get_cache_dir().expect("cache dir created"))
+        });
+
+        assert_eq!(resolved, dir.path());
+        assert_eq!(cache, dir.path().join("bin"));
+        assert!(cache.is_dir(), "the override must be created, not just returned");
+    }
+
+    #[test]
+    fn an_empty_override_falls_back_to_the_home_directory() {
+        let resolved = with_data_dir_env(None, || data_dir().expect("fallback resolves"));
+
+        assert!(
+            resolved.ends_with(".bsl-analyzer"),
+            "an unset override must keep the historical location, got {}",
+            resolved.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_converged_cache_starts_without_writing_to_the_data_dir() {
+        if running_as_root() {
+            return;
+        }
+
+        let dir = TestDir::new();
+        let current = create_version_file(dir.path(), "0.2.80");
+        update_current_link(dir.path(), &current).expect("link");
+        swap_and_resolve(dir.path()).expect("warm the stable app");
+        fs::remove_file(dir.path().join(SWAP_LOCK_FILENAME)).expect("drop the warmed lock file");
+
+        set_dir_mode(dir.path(), 0o555);
+        let resolved = swap_and_resolve(dir.path());
+        set_dir_mode(dir.path(), 0o755);
+
+        assert_eq!(
+            resolved.expect("a cache with nothing to swap must start on a read-only home"),
+            stable_app_path(dir.path())
+        );
+        assert!(
+            !dir.path().join(SWAP_LOCK_FILENAME).exists(),
+            "resolving a converged cache must not create the swap lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_swap_lock_names_the_variable_that_moves_the_data_dir() {
+        if running_as_root() {
+            return;
+        }
+
+        let dir = TestDir::new();
+        let current = create_version_file(dir.path(), "0.2.80");
+        update_current_link(dir.path(), &current).expect("link");
+
+        set_dir_mode(dir.path(), 0o555);
+        let err = swap_and_resolve(dir.path()).expect_err("a swap needs the lock it cannot open");
+        set_dir_mode(dir.path(), 0o755);
+
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(SWAP_LOCK_FILENAME), "must name the path refused: {rendered}");
+        assert!(rendered.contains(DATA_DIR_ENV), "must name the way out: {rendered}");
     }
 }

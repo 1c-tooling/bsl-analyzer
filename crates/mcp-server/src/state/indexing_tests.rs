@@ -693,6 +693,12 @@ fn indexing_remote_qualification_combines_publication_and_overlay() {
         .unwrap();
     assert_eq!(targets(&state)[1]["state"], "waiting");
     assert_eq!(targets(&state)[1]["reason_code"], "overlay_pending");
+    assert_eq!(targets(&state)[0]["state"], "waiting");
+    assert_eq!(
+        targets(&state)[0]["reason_code"],
+        "overlay_pending",
+        "a present baseline with overlay debt is pending overlay work, not an absent baseline"
+    );
     *state.overlay_warmup.lock().unwrap() = OverlayWarmupState::Failed("private diagnostic".into());
     assert_eq!(targets(&state)[1]["state"], "failed", "known failure wins over dirty overlay");
     assert_eq!(targets(&state)[1]["reason_code"], "native_failure");
@@ -718,6 +724,12 @@ fn indexing_remote_qualification_combines_publication_and_overlay() {
     baseline.seed_status_cache_for_test(qualified.clone(), std::time::Duration::from_secs(60));
     assert_eq!(targets(&state)[1]["state"], "unknown");
     assert_eq!(targets(&state)[1]["reason_code"], "stale_generation");
+    assert_eq!(
+        targets(&state)[0]["state"],
+        "unknown",
+        "expired evidence is not an absent baseline"
+    );
+    assert_eq!(targets(&state)[0]["reason_code"], "stale_generation");
     let mut unverified = qualified.clone();
     unverified.semantic_details.as_mut().unwrap().publication.as_mut().unwrap().complete = false;
     baseline.seed_status_cache_for_test(unverified, std::time::Duration::ZERO);

@@ -1,9 +1,12 @@
+use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+
+use crate::messages::messages;
 
 pub const STABLE_APP_FILENAME: &str =
     if cfg!(windows) { "bsl-analyzer-app.exe" } else { "bsl-analyzer-app" };
@@ -16,11 +19,35 @@ pub const SWAP_LOCK_FILENAME: &str = ".swap.lock";
 
 pub const CURRENT_LINK_TEMP_PREFIX: &str = "current.new-";
 
+pub const DATA_DIR_ENV: &str = "BSL_ANALYZER_HOME";
+
+/// Root of the launcher's own state. A home directory is not always writable -- CI
+/// runners, service accounts and file sandboxes all hand the process a read-only one --
+/// so the location has to be movable without moving the whole profile.
+pub fn data_dir() -> Result<PathBuf> {
+    match env::var_os(DATA_DIR_ENV) {
+        Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
+        _ => Ok(dirs::home_dir().context("Cannot determine home directory")?.join(".bsl-analyzer")),
+    }
+}
+
 pub fn get_cache_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
-    let cache_dir = home.join(".bsl-analyzer").join("bin");
-    fs::create_dir_all(&cache_dir)?;
+    let cache_dir = data_dir()?.join("bin");
+    fs::create_dir_all(&cache_dir)
+        .map_err(|e| access_error(e, &cache_dir, "Failed to create launcher data directory"))?;
     Ok(cache_dir)
+}
+
+/// Adds to a refused write the one thing the caller can act on: which path was refused,
+/// and the variable that moves it elsewhere. A bare `os error 5` names neither.
+pub fn access_error(err: std::io::Error, path: &Path, what: &str) -> anyhow::Error {
+    let denied = err.kind() == std::io::ErrorKind::PermissionDenied;
+    let err = anyhow::Error::new(err).context(format!("{what} {}", path.display()));
+    if denied {
+        err.context(messages().needs_write_access.replace("{}", &path.display().to_string()))
+    } else {
+        err
+    }
 }
 
 pub fn stable_app_path(cache_dir: &Path) -> PathBuf {
@@ -95,7 +122,7 @@ impl SwapLock {
             .write(true)
             .truncate(false)
             .open(&path)
-            .with_context(|| format!("Failed to open swap lock {}", path.display()))?;
+            .map_err(|e| access_error(e, &path, "Failed to open swap lock"))?;
 
         #[cfg(unix)]
         {

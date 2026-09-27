@@ -44,6 +44,9 @@ pub struct IndexProgressSnapshot {
 #[derive(Debug)]
 struct Record {
     generation: u64,
+    /// Whether the owner of `generation` has let go of the pass. A helper may record a
+    /// terminal state while the owner keeps working, so liveness follows ownership, not state.
+    released: bool,
     snapshot: IndexProgressSnapshot,
 }
 #[derive(Debug)]
@@ -57,6 +60,7 @@ impl Default for IndexProgress {
             active: AtomicBool::new(false),
             record: Mutex::new(Record {
                 generation: 0,
+                released: true,
                 snapshot: IndexProgressSnapshot {
                     active: false,
                     state: IndexPassState::Waiting,
@@ -98,6 +102,7 @@ impl IndexProgress {
         let mut record = self.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Consume a generation so callbacks from the reset attempt cannot publish again.
         record.generation = 0;
+        record.released = true;
         record.snapshot = IndexProgressSnapshot {
             active: false,
             state: IndexPassState::Waiting,
@@ -123,6 +128,7 @@ impl IndexProgress {
         let mut record = self.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(generation) = generation {
             record.generation = generation;
+            record.released = false;
             record.snapshot = IndexProgressSnapshot {
                 active: true,
                 state: IndexPassState::Running,
@@ -147,7 +153,7 @@ impl IndexProgress {
         }
     }
 }
-/// Restores liveness only while the suspended attempt still owns the running pass.
+/// Restores liveness only while the suspended attempt's owner still holds the pass.
 pub struct PausedPass {
     progress: Arc<IndexProgress>,
     generation: u64,
@@ -156,10 +162,9 @@ impl Drop for PausedPass {
     fn drop(&mut self) {
         let mut record =
             self.progress.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if record.generation == self.generation && record.snapshot.state == IndexPassState::Running
-        {
+        if record.generation == self.generation && !record.released {
             record.snapshot.active = true;
-            self.progress.active.store(record.snapshot.active, Ordering::Relaxed);
+            self.progress.active.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -183,9 +188,17 @@ impl IndexPassToken {
         let mut record =
             self.progress.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.generation == Some(record.generation) {
+            record.released = true;
             record.snapshot.active = false;
             self.progress.active.store(false, Ordering::Relaxed);
         }
+    }
+    /// Whether this attempt still owns a running pass. Waits for the record instead of
+    /// sampling it, so a concurrent status reader cannot make the answer false.
+    pub fn is_running(&self) -> bool {
+        let record = self.progress.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.generation == Some(record.generation)
+            && record.snapshot.state == IndexPassState::Running
     }
     pub fn phase(&self, phase: IndexPhase) {
         self.update(|s| {
@@ -285,6 +298,40 @@ mod indexing_pass_lifecycle {
         next.finish(IndexPassState::Ready);
         drop(next_pause);
         assert!(!progress.is_active());
+    }
+    #[test]
+    fn a_pause_restores_liveness_of_a_pass_a_helper_already_failed() {
+        // A helper records a terminal failure while the owning pass keeps embedding; the
+        // broker must still see the pass alive after a retry backoff inside it.
+        let progress = IndexProgress::new();
+        let mut pass = progress.begin_pass();
+        pass.token().finish(IndexPassState::Failed);
+        drop(progress.pause_pass());
+        assert!(progress.is_active());
+        assert!(progress.snapshot().unwrap().active);
+        pass.finish(IndexPassState::Ready);
+        assert!(!progress.is_active());
+        drop(progress.pause_pass());
+        assert!(!progress.is_active());
+        assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Failed);
+    }
+    #[test]
+    fn a_running_check_waits_out_a_concurrent_reader() {
+        let progress = IndexProgress::new();
+        let mut pass = progress.begin_pass();
+        let token = pass.token();
+        let reader = progress.record.lock().unwrap();
+        let check = std::thread::spawn(move || token.is_running());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(progress.snapshot().is_none(), "a sample under contention is unavailable");
+        drop(reader);
+        assert!(check.join().unwrap());
+        let stale = pass.token();
+        pass.token().finish(IndexPassState::Failed);
+        assert!(!stale.is_running());
+        pass.finish(IndexPassState::Failed);
+        let _next = progress.begin_pass();
+        assert!(!stale.is_running());
     }
     #[test]
     fn stale_callback_and_drop_cannot_finish_new_pass() {

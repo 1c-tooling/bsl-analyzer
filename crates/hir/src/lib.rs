@@ -102,12 +102,6 @@ pub mod cfg {
 pub mod dataflow {
     pub use ::dataflow::{DataflowResult, DataflowSolver, Direction, DEFAULT_MAX_ITERATIONS};
 
-    pub mod liveness {
-        pub use ::dataflow::liveness::{
-            liveness_analysis_direct, Liveness, LivenessTransfer, VariableIndex,
-        };
-    }
-
     pub mod path_terminates {
         pub use ::dataflow::path_terminates::{
             analyze_path_terminates, analyze_path_terminates_default, MayFallthrough,

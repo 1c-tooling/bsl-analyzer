@@ -745,32 +745,46 @@ impl SharedState {
                 match (self.baseline.try_external(), engine.as_ref()) {
                     (Some(baseline), Some(engine)) => match baseline {
                         Some(baseline) => {
-                            let proof = baseline.indexing_publication(
+                            // Semantic identity and coverage do not gate lexical search, so an
+                            // unverified publication still serves lexical hits.
+                            match baseline.indexing_publication(
                                 engine.embedding_model().unwrap_or(""),
                                 engine.embedding_dimension().unwrap_or(0),
                                 engine.try_workspace_overlay_baseline_identity().as_ref(),
-                            );
-                            let clean =
-                                engine.try_workspace_overlay_retry_signals().is_some_and(|s| {
-                                    s.initialized
-                                        && !s.needs_full_rescan
-                                        && s.pending_dirty_paths == 0
-                                        && s.unread_keys == 0
-                                });
-                            if matches!(
-                                proof,
+                            ) {
                                 BaselineIndexingPublication::Ready
-                                    | BaselineIndexingPublication::UnverifiedIdentity
-                                    | BaselineIndexingPublication::UnverifiedCoverage
-                            ) && clean
-                            {
-                                lexical
-                            } else {
-                                Target::new(
+                                | BaselineIndexingPublication::UnverifiedIdentity
+                                | BaselineIndexingPublication::UnverifiedCoverage => {
+                                    match engine.try_workspace_overlay_retry_signals() {
+                                        None => Target::unknown(Kind::Lexical),
+                                        Some(s)
+                                            if s.initialized
+                                                && !s.needs_full_rescan
+                                                && s.pending_dirty_paths == 0
+                                                && s.unread_keys == 0 =>
+                                        {
+                                            lexical
+                                        }
+                                        Some(_) => Target::new(
+                                            Kind::Lexical,
+                                            State::Waiting,
+                                            Some(Reason::OverlayPending),
+                                        ),
+                                    }
+                                }
+                                BaselineIndexingPublication::Stale => Target::new(
+                                    Kind::Lexical,
+                                    State::Unknown,
+                                    Some(Reason::StaleGeneration),
+                                ),
+                                BaselineIndexingPublication::SnapshotUnavailable => {
+                                    Target::unknown(Kind::Lexical)
+                                }
+                                BaselineIndexingPublication::Unavailable => Target::new(
                                     Kind::Lexical,
                                     State::Waiting,
                                     Some(Reason::BaselineUnavailable),
-                                )
+                                ),
                             }
                         }
                         None => Target::new(

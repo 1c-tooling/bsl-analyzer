@@ -26,6 +26,8 @@ pub struct Messages {
     pub help_verify: &'static str,
     pub help_use: &'static str,
     pub help_cleanup: &'static str,
+    pub help_home: &'static str,
+    pub needs_write_access: &'static str,
     pub cleanup_removed: &'static str,
     pub cleanup_error: &'static str,
     pub cleanup_done: &'static str,
@@ -57,6 +59,9 @@ const MESSAGES_RU: Messages = Messages {
     help_verify: "Проверить целостность установки",
     help_use: "Использовать указанную версию (или 'latest')",
     help_cleanup: "Удалить старые версии (--keep=N для сохранения N версий)",
+    help_home: "Каталог данных лаунчера (по умолчанию ~/.bsl-analyzer)",
+    needs_write_access:
+        "нужен доступ на запись к {}; задайте BSL_ANALYZER_HOME на каталог, доступный для записи",
     cleanup_removed: "удалён",
     cleanup_error: "ошибка удаления",
     cleanup_done: "Удалено версий: {}",
@@ -88,6 +93,9 @@ const MESSAGES_EN: Messages = Messages {
     help_verify: "Verify installation integrity",
     help_use: "Use specified version (or 'latest')",
     help_cleanup: "Remove old versions (--keep=N to keep N versions)",
+    help_home: "Launcher data directory (default ~/.bsl-analyzer)",
+    needs_write_access:
+        "write access to {} is required; set BSL_ANALYZER_HOME to a writable directory",
     cleanup_removed: "removed",
     cleanup_error: "removal error",
     cleanup_done: "Versions removed: {}",

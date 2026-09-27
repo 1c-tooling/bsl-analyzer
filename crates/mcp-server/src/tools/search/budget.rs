@@ -49,6 +49,7 @@ pub(crate) fn finalize_indexed_response(
     if bytes(&response) <= ceiling {
         return Ok(response);
     }
+    let rendered = response.clone();
     // The JSON mirror retains all semantic fields when the human rendering is too large.
     mirror(&mut response);
     if bytes(&response) <= ceiling {
@@ -64,6 +65,9 @@ pub(crate) fn finalize_indexed_response(
     if count > 0 {
         trim(floor.structured_content.as_mut().expect("hit envelope"), 0);
         mirror(&mut floor);
+    } else if bytes(&rendered) < bytes(&floor) {
+        // Without hits the rendering is already the mandatory envelope; the mirror may be larger.
+        floor = rendered;
     }
     let minimum_bytes = bytes(&floor);
     if minimum_bytes > ceiling {
@@ -121,6 +125,14 @@ mod tests {
         body.remove("shown");
         body.remove("total");
         body.insert("status".to_owned(), json!("loading"));
+        // A short human line beside a larger JSON body: mirroring would only grow the
+        // response, so the advertised minimum is the response as rendered.
+        let mut terse = fixture(vec![]);
+        terse.content = vec![ContentBlock::text("No results found.")];
+        let exact = bytes(&terse).div_ceil(4);
+        assert!(finalize_indexed_response(terse.clone(), exact).is_ok());
+        let error = finalize_indexed_response(terse, exact - 1).unwrap_err();
+        assert_eq!(error.data.unwrap()["minimum_output_tokens"], exact);
         for mut empty in [fixture(vec![]), loading] {
             mirror(&mut empty);
             let exact = bytes(&empty).div_ceil(4);
