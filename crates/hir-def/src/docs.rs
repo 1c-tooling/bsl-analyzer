@@ -7,8 +7,10 @@ use syntax::{
     SyntaxNode,
 };
 
+mod tokens;
 mod type_expr;
 
+pub use tokens::{doc_comment_tokens, DocCommentToken, DocCommentTokenKind};
 pub use type_expr::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,30 +301,9 @@ fn parse_method_docs(comments: &[String]) -> Option<MethodDocs> {
     let mut prev_blank = false;
     for (i, line) in comments.iter().enumerate() {
         let trimmed = line.trim();
-        let lower = trimmed.fold_lower();
-
-        let returns_header = returns_section_header(trimmed);
-        if is_parameters_keyword(&lower) {
-            in_parameters = true;
-            section_indices.push(SectionMarker::new(i, Section::Parameters, None));
-        } else if returns_header != ReturnsHeader::NotReturns
-            && !is_parameter_named_like_returns(in_parameters, prev_blank, &lower, trimmed)
-        {
-            in_parameters = false;
-            let inline_payload = match returns_header {
-                ReturnsHeader::WithPayload(payload) => Some(payload),
-                _ => None,
-            };
-            section_indices.push(SectionMarker::new(i, Section::Returns, inline_payload));
-        } else if is_example_keyword(&lower) {
-            in_parameters = false;
-            section_indices.push(SectionMarker::new(i, Section::Examples, None));
-        } else if is_call_options_keyword(&lower) {
-            in_parameters = false;
-            section_indices.push(SectionMarker::new(i, Section::CallOptions, None));
-        } else if is_deprecated_keyword(&lower) {
-            in_parameters = false;
-            section_indices.push(SectionMarker::new(i, Section::Deprecated, None));
+        if let Some((section, payload)) = section_header(trimmed, in_parameters, prev_blank) {
+            in_parameters = section == Section::Parameters;
+            section_indices.push(SectionMarker::new(i, section, payload));
         }
 
         prev_blank = trimmed.is_empty();
@@ -382,6 +363,35 @@ enum Section {
     Examples,
     CallOptions,
     Deprecated,
+}
+
+/// Keeps structural documentation and its source tokens on the same section rules.
+fn section_header(
+    line: &str,
+    in_parameters: bool,
+    prev_blank: bool,
+) -> Option<(Section, Option<String>)> {
+    let lower = line.fold_lower();
+    let returns_header = returns_section_header(line);
+    if is_parameters_keyword(&lower) {
+        Some((Section::Parameters, None))
+    } else if returns_header != ReturnsHeader::NotReturns
+        && !is_parameter_named_like_returns(in_parameters, prev_blank, &lower, line)
+    {
+        let payload = match returns_header {
+            ReturnsHeader::WithPayload(payload) => Some(payload),
+            _ => None,
+        };
+        Some((Section::Returns, payload))
+    } else if is_example_keyword(&lower) {
+        Some((Section::Examples, None))
+    } else if is_call_options_keyword(&lower) {
+        Some((Section::CallOptions, None))
+    } else if is_deprecated_keyword(&lower) {
+        Some((Section::Deprecated, None))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,6 +575,13 @@ fn contains_see_reference(text: &str) -> bool {
 /// plausible target; the English `see` only at line start, so the common
 /// verb mid-sentence is not matched.
 fn append_see_targets(line: &str, out: &mut Vec<String>) {
+    out.extend(see_reference_ranges(line).into_iter().map(|(_, target)| line[target].to_string()));
+}
+
+/// Byte ranges keep link detection and editor highlighting on the same boundaries.
+fn see_reference_ranges(line: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let mut out = Vec::new();
+    let offsets: Vec<_> = line.char_indices().map(|(i, _)| i).chain([line.len()]).collect();
     let chars: Vec<char> = line.chars().collect();
 
     let mut i = 0;
@@ -603,7 +620,7 @@ fn append_see_targets(line: &str, out: &mut Vec<String>) {
         let target: String = chars[start..j].iter().collect();
         let target = target.trim_end_matches('.');
         if !target.is_empty() {
-            out.push(target.to_string());
+            out.push((offsets[i]..offsets[i + 3], offsets[start]..offsets[start] + target.len()));
         }
         i = j;
     }
@@ -617,9 +634,12 @@ fn append_see_targets(line: &str, out: &mut Vec<String>) {
             .collect();
         let target = target.trim_end_matches('.');
         if target.chars().next().is_some_and(char::is_alphabetic) {
-            out.push(target.to_string());
+            let marker_start = line.len() - trimmed.len();
+            let target_start = line.len() - trimmed[4..].trim_start().len();
+            out.push((marker_start..marker_start + 3, target_start..target_start + target.len()));
         }
     }
+    out
 }
 
 fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {

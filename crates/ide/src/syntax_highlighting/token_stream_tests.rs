@@ -48,6 +48,9 @@ fn render_modifiers(modifiers: HlMod) -> String {
     if modifiers.contains(HlMod::DEFINITION) {
         parts.push("DEFINITION");
     }
+    if modifiers.contains(HlMod::DOCUMENTATION) {
+        parts.push("DOCUMENTATION");
+    }
     parts.join("+")
 }
 
@@ -259,6 +262,27 @@ fn sdbl_query_token_stream() {
             483..497 Keyword "Возврат"
             498..510 Variable "Запрос"
             512..536 Keyword "КонецФункции"
+        "#]],
+    );
+}
+
+/// Every comment byte remains covered exactly once after structural token splitting.
+#[test]
+fn documentation_token_stream() {
+    check_token_stream(
+        "// Parameters:\n// Value - String - text\nProcedure Test(Value)\nEndProcedure",
+        expect![[r#"
+            0..3 Comment "// "
+            3..14 Keyword [DOCUMENTATION] "Parameters:"
+            15..18 Comment "// "
+            18..23 Parameter [DOCUMENTATION] "Value"
+            23..26 Comment " - "
+            26..32 Type [DOCUMENTATION] "String"
+            32..39 Comment " - text"
+            40..49 Keyword "Procedure"
+            50..54 Procedure [DEFINITION] "Test"
+            55..60 Parameter [DECLARATION] "Value"
+            62..74 Keyword "EndProcedure"
         "#]],
     );
 }
