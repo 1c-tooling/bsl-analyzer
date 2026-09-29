@@ -9,7 +9,7 @@ pub enum DocTypeExpr {
     TypeRef(TypeRef),
     /// A qualified documentation cross-reference.
     See(QualifiedName),
-    /// A structure with its directly documented fields.
+    /// A structure with recursively documented fields.
     Structure {
         /// The fields declared by one-level documentation bullets.
         fields: Vec<DocField>,

@@ -3,10 +3,11 @@ use crate::{MethodId, VariableId};
 use std::sync::Arc;
 use stdx::case::CaseExt;
 use syntax::{
-    extract_leading_comments_at_offset, extract_variable_comments_at_offset, Parse, SyntaxKind,
-    SyntaxNode,
+    extract_leading_comment_lines_at_offset, extract_variable_comments_at_offset, Parse,
+    SyntaxKind, SyntaxNode,
 };
 
+mod fields;
 mod tokens;
 mod type_expr;
 
@@ -124,7 +125,7 @@ pub fn compute_method_docs(
     let source_range = tree.method(method_id.local_id)?.source_range();
 
     let offset: usize = source_range.start().into();
-    let comments = extract_leading_comments_at_offset(offset, file_text)?;
+    let comments = extract_leading_comment_lines_at_offset(offset, file_text)?;
 
     let docs = parse_method_docs(&comments)?;
 
@@ -646,19 +647,21 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
     let mut parameters = Vec::new();
     let mut current_param: Option<(String, Vec<TypeDoc>)> = None;
 
-    for line in lines {
+    let mut cursor = 0;
+    while let Some(line) = lines.get(cursor) {
         let trimmed = line.trim();
+        cursor += 1;
 
         if trimmed.is_empty() {
             continue;
         }
 
         if trimmed.starts_with('*') {
+            cursor -= 1;
+            let fields = fields::parse_fields(lines, &mut cursor);
             if let Some((_, types)) = &mut current_param {
                 if let Some(last_type) = types.last_mut() {
-                    if let Some(sub_param) = parse_sub_parameter(trimmed) {
-                        last_type.parameters.push(sub_param);
-                    }
+                    last_type.parameters.extend(fields);
                 }
             }
             continue;
@@ -695,6 +698,11 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
                 parameters.push(ParameterDoc { name, types });
             }
             current_param = Some((param_name, types));
+            continue;
+        }
+
+        if let Some((_, types)) = &mut current_param {
+            append_type_description(types, trimmed);
         }
     }
 
@@ -726,6 +734,7 @@ fn parse_parameter_line(line: &str) -> Option<(String, Vec<TypeDoc>)> {
     let types = if type_part.contains(',') {
         type_part
             .split(',')
+            .filter(|t| !t.trim().is_empty())
             .map(|t| TypeDoc::simple(t.trim().to_string(), description.clone()))
             .collect()
     } else {
@@ -756,12 +765,6 @@ pub fn is_dotted_type_reference(name: &str) -> bool {
     name.contains('.') && is_likely_type_name(name)
 }
 
-fn parse_sub_parameter(line: &str) -> Option<ParameterDoc> {
-    let without_star = line.strip_prefix('*')?.trim();
-    let (name, types) = parse_parameter_line(without_star)?;
-    Some(ParameterDoc { name, types })
-}
-
 fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
     let mut types = Vec::new();
     let mut current_type: Option<TypeDoc> = None;
@@ -777,18 +780,20 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
         break;
     }
 
-    for line in lines {
+    let mut cursor = 0;
+    while let Some(line) = lines.get(cursor) {
         let trimmed = line.trim();
+        cursor += 1;
 
         if trimmed.is_empty() {
             continue;
         }
 
         if trimmed.starts_with('*') {
+            cursor -= 1;
+            let fields = fields::parse_fields(lines, &mut cursor);
             if let Some(ref mut type_doc) = current_type {
-                if let Some(sub_param) = parse_sub_parameter(trimmed) {
-                    type_doc.parameters.push(sub_param);
-                }
+                type_doc.parameters.extend(fields);
             }
             continue;
         }
@@ -815,6 +820,8 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
             if !stripped.is_empty() && is_likely_type_name(stripped) {
                 current_type = Some(TypeDoc::simple(stripped.to_string(), None));
             }
+        } else if let Some(type_doc) = &mut current_type {
+            append_description(&mut type_doc.description, trimmed);
         }
     }
 
@@ -823,6 +830,25 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
     }
 
     types
+}
+
+/// Wrapped source lines extend the last declared alternative instead of disappearing from hover.
+fn append_type_description(types: &mut [TypeDoc], continuation: &str) {
+    if let Some(last) = types.last_mut() {
+        append_description(&mut last.description, continuation);
+    }
+}
+
+fn append_description(description: &mut Option<String>, continuation: &str) {
+    let continuation = continuation.trim().trim_start_matches('-').trim();
+    if continuation.is_empty() {
+        return;
+    }
+    let description = description.get_or_insert_with(String::new);
+    if !description.is_empty() {
+        description.push('\n');
+    }
+    description.push_str(continuation);
 }
 
 fn parse_type_line(line: &str) -> Option<(String, Option<String>)> {
@@ -1506,6 +1532,12 @@ mod tests {
             docs.returned_value
         );
         assert_eq!(docs.returned_value[0].name, "Произвольный");
+        assert_eq!(
+            docs.returned_value[0].description.as_deref(),
+            Some(
+                "если передана пустая ссылка, возвращается Неопределено.\nЕсли передана ссылка несуществующего объекта (битая ссылка),\nто возвращается Неопределено."
+            )
+        );
     }
 
     #[test]
@@ -1594,6 +1626,12 @@ mod tests {
 
         assert_eq!(docs.parameters.len(), 2);
         assert_eq!(docs.parameters[0].name, "ОтборПоИзмерениям");
+        assert_eq!(
+            docs.parameters[0].types[0].description.as_deref(),
+            Some(
+                "Ключ структуры определяет имя измерения,\nа значение структуры - искомое значение."
+            )
+        );
         assert_eq!(docs.parameters[1].name, "ИсключитьЗаказ");
     }
 

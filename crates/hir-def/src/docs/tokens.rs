@@ -62,8 +62,8 @@ pub fn doc_comment_tokens(lines: &[&str]) -> Vec<DocCommentToken> {
                 output.push(header, DocCommentTokenKind::Keyword);
             }
         } else if matches!(section, Some(Section::Parameters | Section::Returns)) {
-            if let Some(field) = line.strip_prefix('*').filter(|_| has_entry) {
-                output.entry(field.trim_start(), DocCommentTokenKind::Property);
+            if let Some(field) = field_payload(line).filter(|_| has_entry) {
+                output.entry(field, DocCommentTokenKind::Property);
             } else if section == Some(Section::Parameters) {
                 if has_entry
                     && (line.starts_with('-')
@@ -96,6 +96,12 @@ pub fn doc_comment_tokens(lines: &[&str]) -> Vec<DocCommentToken> {
         true
     });
     tokens
+}
+
+/// Every leading star is structural; the remaining payload has ordinary field syntax.
+fn field_payload(line: &str) -> Option<&str> {
+    let payload = line.trim_start_matches('*');
+    (payload.len() < line.len()).then(|| payload.trim_start())
 }
 
 struct LineTokens<'a> {

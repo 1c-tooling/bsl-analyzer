@@ -20,6 +20,8 @@ use vfs::FileId;
 
 use crate::HoverResult;
 
+mod docs;
+
 pub(crate) fn hover<DB: RootDatabase>(
     db: &DB,
     file_id: FileId,
@@ -348,67 +350,11 @@ fn definition_to_hover<DB: RootDatabase>(
     match definition {
         hir::Definition::Method(_method_id) => {
             let label = definition.label(db);
+            let label = method_hover_label(&label, definition.is_export(db));
             markup.push_str(&format!("**{}**\n\n", label));
 
-            if definition.is_export(db) {
-                markup.push_str("*Экспортная*\n\n");
-            }
-
             if let Some(docs) = definition.docs(db) {
-                if let Some(ref purpose) = docs.purpose {
-                    if !purpose.is_empty() {
-                        markup.push_str("**Назначение:**\n");
-                        markup.push_str(purpose);
-                        markup.push_str("\n\n");
-                    }
-                }
-
-                if !docs.parameters.is_empty() {
-                    markup.push_str("**Параметры:**\n");
-                    for param in &docs.parameters {
-                        markup.push_str(&format!("- **{}**", param.name));
-
-                        if !param.types.is_empty() {
-                            let type_names: Vec<_> =
-                                param.types.iter().map(|t| t.name.as_str()).collect();
-                            markup.push_str(&format!(": {}", type_names.join(", ")));
-                        }
-
-                        if let Some(first_type) = param.types.first() {
-                            if let Some(ref desc) = first_type.description {
-                                if !desc.is_empty() {
-                                    markup.push_str(&format!(" - {}", desc));
-                                }
-                            }
-                        }
-
-                        markup.push('\n');
-                    }
-                    markup.push('\n');
-                }
-
-                if !docs.returned_value.is_empty() {
-                    markup.push_str("**Возвращаемое значение:**\n");
-                    let type_names: Vec<_> =
-                        docs.returned_value.iter().map(|t| t.name.as_str()).collect();
-                    markup.push_str(&format!("Тип: {}\n", type_names.join(", ")));
-
-                    if let Some(first_type) = docs.returned_value.first() {
-                        if let Some(ref desc) = first_type.description {
-                            if !desc.is_empty() {
-                                markup.push_str(&format!("{}\n", desc));
-                            }
-                        }
-                    }
-                    markup.push('\n');
-                }
-
-                if !docs.examples.is_empty() {
-                    markup.push_str("**Примеры:**\n");
-                    for (idx, example) in docs.examples.iter().enumerate() {
-                        markup.push_str(&format!("{}. {}\n\n", idx + 1, example));
-                    }
-                }
+                docs::append_method_docs(&mut markup, &docs);
             }
         }
 
@@ -513,6 +459,21 @@ fn definition_to_hover<DB: RootDatabase>(
     }
 
     Some(HoverResult { markup, range: Some(range) })
+}
+
+/// Export visibility belongs to the method heading and should not consume a separate paragraph.
+fn method_hover_label(label: &str, is_export: bool) -> String {
+    if !is_export {
+        return label.to_owned();
+    }
+
+    if let Some(name) = label.strip_prefix("Функция ") {
+        format!("Экспортная функция {name}")
+    } else if let Some(name) = label.strip_prefix("Процедура ") {
+        format!("Экспортная процедура {name}")
+    } else {
+        label.to_owned()
+    }
 }
 
 fn render_property_hover(prop: &PlatformProperty, range: TextRange) -> HoverResult {

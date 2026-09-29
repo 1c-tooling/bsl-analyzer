@@ -116,10 +116,8 @@ fn documented_structure_parameter_completes_inside_its_own_body() {
 }
 
 #[test]
-fn second_level_of_documented_nesting_is_not_offered() {
-    // `hir-def` keeps one level of bullets: `parse_sub_parameter` strips exactly one star and a
-    // `**` line is dropped. The field is therefore a fieldless structure, and the point of this
-    // test is that reaching through it is quiet rather than wrong.
+fn second_level_of_documented_nesting_is_offered() {
+    // Each additional star documents one more structure level.
     let items = complete(
         "\n//- /test.bsl\n\
 // Параметры:\n\
@@ -131,7 +129,7 @@ fn second_level_of_documented_nesting_is_not_offered() {
 КонецПроцедуры\n",
     );
     let labels = labels(&items);
-    assert!(!labels.iter().any(|l| l == "Город"), "second level is not parsed: {labels:?}");
+    assert!(labels.iter().any(|l| l == "Город"), "second level is missing: {labels:?}");
 }
 
 #[test]

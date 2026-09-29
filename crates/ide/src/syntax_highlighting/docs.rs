@@ -207,7 +207,9 @@ EndFunction
 //   - Неопределено - отсутствует
 // Возвращаемое значение: Структура
 //   * Имя - Строка - имя
-//   * Данные - см. Модуль.Данные
+//   * Данные - Структура:
+//    ** Ключ - Строка - имя
+//    ** Значение - см. Модуль.Данные
 Функция Тест(Документ)
 КонецФункции";
         let actual = documented_tokens(code);
@@ -215,6 +217,9 @@ EndFunction
         assert!(actual.contains(&("Неопределено".into(), HlTag::Type)));
         assert!(actual.contains(&("Имя".into(), HlTag::Property)));
         assert!(actual.contains(&("Данные".into(), HlTag::Property)));
+        assert!(actual.contains(&("Ключ".into(), HlTag::Property)));
+        assert!(actual.contains(&("Значение".into(), HlTag::Property)));
+        assert!(actual.contains(&("Строка".into(), HlTag::Type)));
         assert!(actual.contains(&("Модуль.Данные".into(), HlTag::Function)));
     }
 

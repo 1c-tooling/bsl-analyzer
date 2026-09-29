@@ -29,7 +29,24 @@ pub fn extract_leading_comments(node: &SyntaxNode, source_text: &str) -> Option<
     extract_leading_comments_at_offset(node_start, source_text)
 }
 
+/// Keeps the normalized comment contract for callers that do not interpret indentation.
 pub fn extract_leading_comments_at_offset(offset: usize, source_text: &str) -> Option<Vec<String>> {
+    let comments = extract_leading_comment_lines_at_offset(offset, source_text)?;
+    Some(
+        comments
+            .into_iter()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect(),
+    )
+}
+
+/// Retains indentation and blank comment lines needed to distinguish documentation fields
+/// from their type and description continuations. The space immediately after `//` is omitted.
+pub fn extract_leading_comment_lines_at_offset(
+    offset: usize,
+    source_text: &str,
+) -> Option<Vec<String>> {
     if offset > source_text.len() {
         return None;
     }
@@ -58,16 +75,13 @@ pub fn extract_leading_comments_at_offset(offset: usize, source_text: &str) -> O
         let trimmed = line.trim();
 
         if let Some(comment_text) = trimmed.strip_prefix("//") {
-            let comment_text = comment_text.trim();
-            if !comment_text.is_empty() {
-                comments.push(comment_text.to_string());
-            }
+            comments.push(comment_text.strip_prefix(' ').unwrap_or(comment_text).to_owned());
         } else {
             break;
         }
     }
 
-    if comments.is_empty() {
+    if comments.iter().all(|line| line.trim().is_empty()) {
         return None;
     }
 
@@ -370,6 +384,34 @@ pub fn new_expr_type_name_token(new_expr: &SyntaxNode) -> Option<SyntaxToken> {
         }
         tok.kind().is_name_token()
     })
+}
+
+#[cfg(test)]
+mod leading_comment_line_tests {
+    use super::{extract_leading_comment_lines_at_offset, extract_leading_comments_at_offset};
+
+    /// Documentation needs indentation and empty comment lines even when source uses CRLF.
+    #[test]
+    fn documentation_layout_and_legacy_trimmed_comments() {
+        let source = "// Returns:\r\n//\r\n//   Structure:\r\n//     * Field - String\r\nFunction Test()\r\nEndFunction";
+        let offset = source.find("Function").unwrap();
+        assert_eq!(
+            extract_leading_comment_lines_at_offset(offset, source).unwrap(),
+            ["Returns:", "", "  Structure:", "    * Field - String"]
+        );
+        assert_eq!(
+            extract_leading_comments_at_offset(offset, source).unwrap(),
+            ["Returns:", "Structure:", "* Field - String"]
+        );
+    }
+
+    /// An actual blank source line still breaks the association with a method.
+    #[test]
+    fn blank_source_line_breaks_documentation() {
+        let source = "// Returns:\n\nFunction Test()\nEndFunction";
+        assert!(extract_leading_comment_lines_at_offset(source.find("Function").unwrap(), source)
+            .is_none());
+    }
 }
 
 #[cfg(test)]
