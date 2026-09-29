@@ -4,7 +4,7 @@ use stdx::case::find_ignore_case;
 use syntax::{TextRange, TextSize};
 
 use super::{
-    is_dotted_type_reference, is_likely_parameter_doc_name, is_likely_type_name,
+    fields, is_dotted_type_reference, is_likely_parameter_doc_name, is_likely_type_name,
     parse_collection_type, section_header, split_type_description, Section,
 };
 
@@ -35,6 +35,7 @@ pub fn doc_comment_tokens(lines: &[&str]) -> Vec<DocCommentToken> {
     let mut section = None;
     let mut prev_blank = false;
     let mut has_entry = false;
+    let mut field_stack = Vec::<FieldContext>::new();
     for (index, raw) in lines.iter().enumerate() {
         // Tabs and spaces have the same byte width; this matches the documentation
         // parser's separators without changing any source positions.
@@ -46,6 +47,7 @@ pub fn doc_comment_tokens(lines: &[&str]) -> Vec<DocCommentToken> {
         {
             section = Some(next);
             has_entry = false;
+            field_stack.clear();
             if next == Section::Deprecated {
                 for marker in ["устарела", "deprecated"] {
                     if let Some(range) = find_ignore_case(line, marker) {
@@ -61,24 +63,45 @@ pub fn doc_comment_tokens(lines: &[&str]) -> Vec<DocCommentToken> {
                 let header = line.find(':').map_or(line, |end| &line[..=end]);
                 output.push(header, DocCommentTokenKind::Keyword);
             }
-        } else if matches!(section, Some(Section::Parameters | Section::Returns)) {
-            if let Some(field) = field_payload(line).filter(|_| has_entry) {
-                output.entry(field, DocCommentTokenKind::Property);
-            } else if section == Some(Section::Parameters) {
-                if has_entry
-                    && (line.starts_with('-')
-                        || is_dotted_type_reference(
-                            split_type_description(line).map_or(line, |(ty, _)| ty),
-                        ))
+        } else if !line.is_empty()
+            && matches!(section, Some(Section::Parameters | Section::Returns))
+        {
+            let indent = fields::indentation(raw);
+            if let Some(level) = fields::marker_depth(line).filter(|_| has_entry) {
+                while field_stack.last().is_some_and(|field| field.level >= level) {
+                    field_stack.pop();
+                }
+                if output.entry(line[level..].trim_start(), DocCommentTokenKind::Property) {
+                    field_stack.push(FieldContext {
+                        level,
+                        indent,
+                        open_union: fields::field_union_is_open(line),
+                    });
+                }
+            } else {
+                while field_stack.last().is_some_and(|field| field.indent >= indent) {
+                    field_stack.pop();
+                }
+                if let Some(field) = field_stack.last_mut() {
+                    let is_type = (field.open_union || line.starts_with('-'))
+                        && output.types(line.trim_start_matches('-').trim_start());
+                    field.open_union = is_type && fields::type_union_is_open(line);
+                } else if section == Some(Section::Parameters) {
+                    if has_entry
+                        && (line.starts_with('-')
+                            || is_dotted_type_reference(
+                                split_type_description(line).map_or(line, |(ty, _)| ty),
+                            ))
+                    {
+                        output.types(line.trim_start_matches('-').trim_start());
+                    } else if output.entry(line, DocCommentTokenKind::Parameter) {
+                        has_entry = true;
+                    }
+                } else if !line.starts_with('*')
+                    && output.types(line.trim_start_matches('-').trim_start())
                 {
-                    output.types(line.trim_start_matches('-').trim_start());
-                } else if output.entry(line, DocCommentTokenKind::Parameter) {
                     has_entry = true;
                 }
-            } else if !line.starts_with('*')
-                && output.types(line.trim_start_matches('-').trim_start())
-            {
-                has_entry = true;
             }
         }
         if !matches!(section, Some(Section::Examples | Section::CallOptions)) {
@@ -98,10 +121,11 @@ pub fn doc_comment_tokens(lines: &[&str]) -> Vec<DocCommentToken> {
     tokens
 }
 
-/// Every leading star is structural; the remaining payload has ordinary field syntax.
-fn field_payload(line: &str) -> Option<&str> {
-    let payload = line.trim_start_matches('*');
-    (payload.len() < line.len()).then(|| payload.trim_start())
+/// Indented continuations belong to the active field, including when leaving a nested block.
+struct FieldContext {
+    level: usize,
+    indent: usize,
+    open_union: bool,
 }
 
 struct LineTokens<'a> {

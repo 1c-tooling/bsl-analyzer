@@ -47,11 +47,7 @@ pub fn extract_leading_comment_lines_at_offset(
     offset: usize,
     source_text: &str,
 ) -> Option<Vec<String>> {
-    if offset > source_text.len() {
-        return None;
-    }
-
-    let text_before_node = &source_text[..offset];
+    let text_before_node = source_text.get(..offset)?.trim_start_matches('\u{feff}');
 
     let mut comments = Vec::new();
 
@@ -411,6 +407,18 @@ mod leading_comment_line_tests {
         let source = "// Returns:\n\nFunction Test()\nEndFunction";
         assert!(extract_leading_comment_lines_at_offset(source.find("Function").unwrap(), source)
             .is_none());
+    }
+
+    /// A UTF-8 BOM must not hide the first documentation line from hover.
+    #[test]
+    fn bom_keeps_the_first_documentation_line() {
+        let source =
+            "\u{feff}// Parameters:\r\n// Value - String\r\nProcedure Test(Value)\r\nEndProcedure";
+        assert_eq!(
+            extract_leading_comment_lines_at_offset(source.find("Procedure").unwrap(), source)
+                .unwrap(),
+            ["Parameters:", "Value - String"]
+        );
     }
 }
 

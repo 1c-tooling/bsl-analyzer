@@ -223,6 +223,20 @@ EndFunction
         assert!(actual.contains(&("Модуль.Данные".into(), HlTag::Function)));
     }
 
+    /// A field union can wrap without a dash; wrapped prose must not become another entry.
+    #[test]
+    fn field_continuations_keep_their_roles() {
+        for section in ["Parameters:\n// Data - Structure:", "Returns: Structure"] {
+            let code = format!(
+                "// {section}\n//  * Value - String,\n//      Number - numeric value,\n//      Default - use zero\n//  * Enabled - Boolean\nProcedure Test(Data)\nEndProcedure"
+            );
+            let tokens = documented_tokens(&code);
+            assert!(tokens.contains(&("Number".into(), HlTag::Type)), "{tokens:?}");
+            assert!(!tokens.iter().any(|(text, _)| text == "Default"), "{tokens:?}");
+            assert!(tokens.contains(&("Enabled".into(), HlTag::Property)), "{tokens:?}");
+        }
+    }
+
     /// Repeated words and non-BMP text must retain distinct byte ranges.
     #[test]
     fn repeated_words_bom_and_unicode() {

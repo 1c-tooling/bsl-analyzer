@@ -114,6 +114,46 @@ impl TypeDoc {
     pub fn hyperlink(link: String) -> Self {
         Self { name: link, description: None, parameters: Vec::new(), is_hyperlink: true }
     }
+
+    /// Separates the full documented type from prose without changing the legacy representation
+    /// used by type inference, where a collection's element can be stored in `description`.
+    pub fn type_label_and_description(&self) -> (String, Option<&str>) {
+        let description = self.description.as_deref().filter(|text| !text.trim().is_empty());
+        let Some(text) = description else {
+            return (self.name.clone(), None);
+        };
+        if !matches!(
+            self.name.fold_lower().as_str(),
+            "массив"
+                | "фиксированныймассив"
+                | "соответствие"
+                | "фиксированноесоответствие"
+                | "структура"
+                | "фиксированнаяструктура"
+                | "таблицазначений"
+                | "списокзначений"
+                | "деревозначений"
+                | "array"
+                | "fixedarray"
+                | "map"
+                | "fixedmap"
+                | "structure"
+                | "fixedstructure"
+                | "valuetable"
+                | "valuelist"
+                | "valuetree"
+        ) {
+            return (self.name.clone(), description);
+        }
+        let (element, prose) = split_type_description(text)
+            .map_or((text, None), |(element, prose)| (element, Some(prose)));
+        let label = format!("{} {}", self.name, element.trim());
+        if parse_collection_type(&label).is_some() {
+            (label, prose.filter(|text| !text.is_empty()))
+        } else {
+            (self.name.clone(), description)
+        }
+    }
 }
 
 pub fn compute_method_docs(
@@ -342,10 +382,10 @@ fn parse_method_docs(comments: &[String]) -> Option<MethodDocs> {
                 docs.returned_value = parse_returns(&section_lines);
             }
             Section::Examples => {
-                docs.examples = parse_simple_section(&section_lines);
+                docs.examples = parse_code_section(&section_lines);
             }
             Section::CallOptions => {
-                docs.call_options = parse_simple_section(&section_lines);
+                docs.call_options = parse_code_section(&section_lines);
             }
             Section::Deprecated => {
                 docs.deprecation =
@@ -1058,6 +1098,32 @@ fn parse_simple_section(lines: &[String]) -> Vec<String> {
     lines.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
 }
 
+/// Only the common comment margin is layout; indentation within example code is meaningful.
+fn parse_code_section(lines: &[String]) -> Vec<String> {
+    let Some(first) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let last = lines.iter().rposition(|line| !line.trim().is_empty()).unwrap();
+    let lines = &lines[first..=last];
+    let margin = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| fields::indentation(line))
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                // Expand only the leading tabs, so tab stops remain aligned after dedenting.
+                format!("{}{}", " ".repeat(fields::indentation(line) - margin), line.trim())
+            }
+        })
+        .collect()
+}
+
 fn parse_deprecated_section(keyword_line: &str, following_lines: &[String]) -> Option<String> {
     let after_keyword = ["устарела", "deprecated"]
         .iter()
@@ -1083,6 +1149,29 @@ fn parse_deprecated_section(keyword_line: &str, following_lines: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Presentation uses the same bilingual collection syntax as return-type parsing.
+    #[test]
+    fn collection_labels_keep_element_types_separate_from_prose() {
+        for declaration in [
+            "ФиксированныйМассив из Строка",
+            "Array из Строка",
+            "Соответствие of KeyAndValue",
+            "FixedMap of KeyAndValue",
+            "ТаблицаЗначений из СтрокаТаблицыЗначений",
+        ] {
+            let comments = ["Returns:".to_owned(), format!("{declaration} - values")];
+            let docs = parse_method_docs(&comments).unwrap();
+            assert_eq!(
+                docs.returned_value[0].type_label_and_description(),
+                (declaration.to_owned(), Some("values"))
+            );
+        }
+        let prose = TypeDoc::simple("String".into(), Some("of the object".into()));
+        assert_eq!(prose.type_label_and_description(), ("String".into(), Some("of the object")));
+        let bare = TypeDoc::simple("Array".into(), Some("of String".into()));
+        assert_eq!(bare.type_label_and_description(), ("Array of String".into(), None));
+    }
 
     #[test]
     fn test_method_docs_empty() {

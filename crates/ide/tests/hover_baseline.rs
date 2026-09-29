@@ -103,6 +103,37 @@ fn hover_documented_return_structure() {
     );
 }
 
+/// Example indentation and deliberate blank lines survive the fenced Markdown block.
+#[test]
+fn hover_preserves_example_layout() {
+    check_hover(
+        "//- /test.bsl\n\
+// Example:\n\
+//   If True Then\n\
+//       Message(\"value\");\n\
+//\n\
+//       Message(\"done\");\n\
+//   EndIf;\n\
+//\n\
+Procedure Te$0st()\n\
+EndProcedure\n",
+        expect![[r#"
+            **Процедура Test()**
+
+            **Примеры:**
+
+            ```bsl
+            If True Then
+                Message("value");
+
+                Message("done");
+            EndIf;
+            ```
+
+        "#]],
+    );
+}
+
 /// Calling a documented method from another module keeps all type-specific descriptions.
 #[test]
 fn hover_documented_parameters_and_return_alternatives() {

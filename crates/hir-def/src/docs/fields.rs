@@ -1,7 +1,8 @@
 //! Field continuations belong to the documented container, not its return-type union.
 
 use super::{
-    parse_parameter_line, parse_return_type_union, parse_type_line, ParameterDoc, TypeDoc,
+    parse_parameter_line, parse_return_type_union, parse_type_line, split_type_description,
+    ParameterDoc, TypeDoc,
 };
 
 /// Consumes a field block while retaining the boundary with the next top-level declaration.
@@ -44,7 +45,7 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
                 fields.len() - 1
             });
             field_indent = indentation(line);
-            open_union = trimmed.ends_with(',');
+            open_union = field_union_is_open(trimmed);
         } else if indentation(line) > field_indent {
             if let Some(field) = current.map(|index| &mut fields[index]) {
                 let continuation = (open_union || trimmed.starts_with('-'))
@@ -52,7 +53,7 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
                     .flatten();
                 if let Some(types) = continuation {
                     field.types.extend(types);
-                    open_union = trimmed.ends_with(',');
+                    open_union = type_union_is_open(trimmed);
                 } else {
                     if let Some(last) = field.types.last_mut() {
                         let description = last.description.get_or_insert_with(String::new);
@@ -72,18 +73,20 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
     fields
 }
 
-fn marker_depth(line: &str) -> Option<usize> {
+/// The same field marker must be recognized by hover and semantic highlighting.
+pub(super) fn marker_depth(line: &str) -> Option<usize> {
     let depth = line.bytes().take_while(|byte| *byte == b'*').count();
     (depth > 0).then_some(depth)
 }
 
+/// Field names and type slots use the ordinary parameter grammar after the marker.
 fn parse_field(line: &str, level: usize) -> Option<ParameterDoc> {
     let (name, types) = parse_parameter_line(line.get(level..)?.trim())?;
     Some(ParameterDoc { name, types })
 }
 
 /// Tabs align documentation columns; comparing their visual indentation keeps fields grouped.
-fn indentation(line: &str) -> usize {
+pub(super) fn indentation(line: &str) -> usize {
     line.chars().take_while(|c| c.is_whitespace()).fold(0, |column, character| {
         if character == '\t' {
             (column / 4 + 1) * 4
@@ -95,15 +98,66 @@ fn indentation(line: &str) -> usize {
 
 /// A trailing comma keeps a field's union open without creating an empty type alternative.
 fn continuation_types(line: &str) -> Option<Vec<TypeDoc>> {
-    let line = line.trim_end_matches(',').trim_end();
+    let normalized = line.replace('\t', " ");
+    let line = normalized.as_str();
+    let line = if split_type_description(line).is_none() {
+        line.trim_end_matches(',').trim_end()
+    } else {
+        line
+    };
     parse_return_type_union(line).or_else(|| {
         parse_type_line(line).map(|(name, description)| vec![TypeDoc::simple(name, description)])
     })
 }
 
+/// A comma in prose does not introduce another type on the next line.
+pub(super) fn type_union_is_open(line: &str) -> bool {
+    let normalized = line.replace('\t', " ");
+    split_type_description(&normalized)
+        .map_or(normalized.as_str(), |(types, _)| types)
+        .trim_end()
+        .ends_with(',')
+}
+
+/// Field entries carry their type slot after the name's separator.
+pub(super) fn field_union_is_open(line: &str) -> bool {
+    let normalized = line.replace('\t', " ");
+    normalized.split_once(" - ").is_some_and(|(_, types)| type_union_is_open(types))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::parse_method_docs;
+
+    /// A wrapped description ending in a comma must not add a phantom type to the field.
+    #[test]
+    fn commas_in_field_descriptions_are_prose() {
+        let comments = [
+            "Returns: Structure",
+            " * Mode - String - allowed values,",
+            "   Default - automatic selection",
+            " * Count - Number,",
+            "   - Undefined - optional,",
+            "   Default - leave unchanged",
+        ]
+        .map(str::to_owned);
+        for separator in [" - ", "\t-\t"] {
+            let comments: Vec<_> =
+                comments.iter().map(|line| line.replace(" - ", separator)).collect();
+            let docs = parse_method_docs(&comments).unwrap();
+            let fields = &docs.returned_value[0].parameters;
+            assert_eq!(fields[0].types.len(), 1);
+            assert_eq!(
+                fields[0].types[0].description.as_deref(),
+                Some(format!("allowed values,\nDefault{separator}automatic selection").as_str())
+            );
+            assert_eq!(fields[1].types.len(), 2);
+            assert_eq!(
+                fields[1].types[1].description.as_deref(),
+                Some(format!("optional,\nDefault{separator}leave unchanged").as_str())
+            );
+        }
+    }
 
     /// Aligned continuation types must stay on their field instead of leaking into returns.
     #[test]

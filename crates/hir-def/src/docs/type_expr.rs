@@ -11,7 +11,7 @@ pub enum DocTypeExpr {
     See(QualifiedName),
     /// A structure with recursively documented fields.
     Structure {
-        /// The fields declared by one-level documentation bullets.
+        /// The fields declared at this level of the documentation bullets.
         fields: Vec<DocField>,
     },
     /// An array with a documented element expression.

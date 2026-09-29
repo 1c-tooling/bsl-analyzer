@@ -65,42 +65,16 @@ fn append_type(markup: &mut String, ty: &TypeDoc, depth: usize, list_item: bool)
         markup.push_str(&format!("{}- ", "  ".repeat(depth)));
     }
 
-    let (name, description) = display_type(ty);
+    let (name, description) = ty.type_label_and_description();
     markup.push_str(&inline_code(&name));
     if let Some(description) = description {
         markup.push_str(" — ");
-        markup.push_str(&description);
+        markup.push_str(&compact_prose(description));
     }
     markup.push('\n');
 
     if !ty.parameters.is_empty() {
         append_parameters(markup, &ty.parameters, depth + usize::from(list_item));
-    }
-}
-
-/// Collection element declarations are part of the displayed type, even though the semantic
-/// model retains them in the description for type inference.
-fn display_type(ty: &TypeDoc) -> (String, Option<String>) {
-    let Some(description) = ty.description.as_deref().filter(|text| !text.trim().is_empty()) else {
-        return (ty.name.clone(), None);
-    };
-    let description = compact_prose(description);
-    let lower_name = ty.name.to_lowercase();
-    let collection_prefix = match lower_name.as_str() {
-        "массив" | "фиксированныймассив" | "соответствие" | "структура" => {
-            "из "
-        }
-        "array" | "fixedarray" | "map" | "structure" => "of ",
-        _ => return (ty.name.clone(), Some(description)),
-    };
-    let lower_description = description.to_lowercase();
-    if !lower_description.starts_with(collection_prefix) {
-        return (ty.name.clone(), Some(description));
-    }
-
-    match description.split_once(" - ") {
-        Some((element, prose)) => (format!("{} {element}", ty.name), Some(prose.trim().to_owned())),
-        None => (format!("{} {description}", ty.name), None),
     }
 }
 
@@ -203,27 +177,5 @@ mod tests {
 
         "#]]
         .assert_eq(&markup);
-    }
-
-    /// Collection element syntax belongs to the type label while prose remains its description.
-    #[test]
-    fn collection_element_is_displayed_as_part_of_type() {
-        let ty = TypeDoc::simple(
-            "ФиксированныйМассив".into(),
-            Some("из Строка - имена реквизитов".into()),
-        );
-        assert_eq!(
-            display_type(&ty),
-            ("ФиксированныйМассив из Строка".into(), Some("имена реквизитов".into()))
-        );
-
-        let correspondence = TypeDoc::simple(
-            "Соответствие".into(),
-            Some("из КлючИЗначение - список объектов".into()),
-        );
-        assert_eq!(
-            display_type(&correspondence),
-            ("Соответствие из КлючИЗначение".into(), Some("список объектов".into()))
-        );
     }
 }
