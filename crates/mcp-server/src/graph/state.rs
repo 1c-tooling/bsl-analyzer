@@ -14,7 +14,7 @@ use crate::change_hub::{SinkCursor, WorkspaceChangeHub};
 use super::debt::{BuildKind, BuildStart, Facts, FailureKind, GraphDebt, HookDebt};
 
 use super::build::PublishAttemptOutcome;
-use super::snapshot::{FpMapState, ScanCache, SnapshotPool};
+use super::snapshot::{FpMapState, GraphStore, ScanCache};
 use super::types::{
     Freshness, FusedStartup, GraphPublishOutcome, GraphPublishSignal, GraphStatus,
     GraphStatusReport, SUPERSEDED_GRAPH_ERROR,
@@ -286,12 +286,11 @@ pub(crate) struct GraphState {
     /// outside the watched roots), so the walk stays the periodic source of truth.
     /// Dropped to `None` (next check walks) on hub overflow or a subtree removal.
     pub(super) fp_map: Arc<Mutex<FpMapState>>,
-    /// Idle read handles onto the CURRENT published graph file, tagged with the
-    /// freshness token they were opened under. Opening the multi-GB SQLite file costs
-    /// ~a second on a large configuration; a pooled handle keeps serving the same
-    /// coherent snapshot for free. Entries for superseded generations are discarded
-    /// lazily at checkout (the tag no longer matches the published generation).
-    pub(super) snapshot_pool: Arc<Mutex<SnapshotPool>>,
+    /// The owner of every read handle onto the CURRENT published graph file. Opening the
+    /// multi-GB SQLite file costs ~a second on a large configuration; a pooled handle keeps
+    /// serving the same coherent snapshot for free, and a handle of a superseded generation
+    /// is discarded instead of served.
+    pub(super) store: GraphStore,
     #[cfg(test)]
     pub(super) background_snapshot_failure: Arc<AtomicU8>,
     /// Parks the building thread between the ACCEPTED CLAIM and the pre-scan that follows it,
@@ -513,7 +512,7 @@ impl GraphState {
             debt: Arc::new(Mutex::new(GraphDebt::default())),
             publication_gate: Arc::new(Mutex::new(())),
             fp_map: Arc::new(Mutex::new(FpMapState::default())),
-            snapshot_pool: Arc::new(Mutex::new(SnapshotPool::default())),
+            store: GraphStore::default(),
             #[cfg(test)]
             background_snapshot_failure: Arc::new(AtomicU8::new(0)),
             #[cfg(test)]
@@ -1265,6 +1264,12 @@ impl GraphState {
         self.cache.as_ref()
     }
 
+    /// The owner of this graph's read handles, for a consumer that reads the published graph
+    /// long after this call — the search context provider.
+    pub(crate) fn store(&self) -> &GraphStore {
+        &self.store
+    }
+
     pub(crate) fn graph_db_path(&self) -> Option<PathBuf> {
         self.cache().map(crate::cache::WorkspaceCacheLayout::graph_db_path)
     }
@@ -1975,11 +1980,10 @@ impl GraphState {
         };
         let debt_stale = self.debt.try_lock().ok().map(|debt| debt.stale());
         let snapshot_stale = inner.published.as_ref().and_then(|published| {
-            self.snapshot_pool.try_lock().ok().and_then(|pool| {
-                pool.iter()
-                    .find(|entry| entry.generation == published.generation)
-                    .map(|entry| entry.force_stale)
-            })
+            self.store
+                .status()
+                .filter(|status| status.generation == Some(published.generation))
+                .and_then(|status| status.idle_force_stale)
         });
         let target = self.indexing_from_inner(
             &inner,

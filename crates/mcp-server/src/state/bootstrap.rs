@@ -524,10 +524,11 @@ impl SharedState {
         // validation→apply window without making an unrelated watched file reject the plan.
         let embed_flight = EmbedFlight::new();
         let root_drift_epoch = Arc::new(AtomicU64::new(0));
+        let graph = GraphState::for_workspace_with_cache(source_dir.clone(), cache.clone());
         let publish_hook = Self::build_publish_hook(
             Arc::clone(&search_engine),
             owners.clone(),
-            cache.clone(),
+            graph.store().clone(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),
@@ -536,7 +537,7 @@ impl SharedState {
             workspace_lease.clone(),
             embedding_publish_retry_budget,
         );
-        let graph = GraphState::for_workspace_with_cache(source_dir.clone(), cache.clone())
+        let graph = graph
             .with_change_hub(change_hub.clone())
             .with_publish_hook(publish_hook)
             .with_lease(workspace_lease.clone())
@@ -1745,29 +1746,32 @@ impl SharedState {
         // already built; if absent (still building) the embeddings are graph-free this
         // run and pick up context on a later reindex.
         if engine.has_semantic() {
-            let graph_path = cache.graph_db_path();
             // Load the project snapshot once and keep its roots paired with the graph
             // validation below. Loading topology and roots separately leaves a window in
             // which a config/root move can make the provider read a different generation
             // from the one that passed the check.
             let graph_project =
                 crate::graph::ProjectSnapshot::load_excluding(workspace_root, &excluded);
-            match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
-                Ok(graph_db)
-                    if !crate::graph::scan::graph_matches_live_project_strict(
-                        &graph_db,
+            let current =
+                graph.store().read(None, crate::graph::BACKGROUND_READ_WAIT, |snapshot| {
+                    crate::graph::scan::graph_matches_live_project_strict(
+                        &snapshot.graph,
                         &graph_project,
-                    ) =>
-                {
+                    )
+                    .then(|| snapshot.generation())
+                });
+            match current {
+                Ok(None) => {
                     tracing::warn!(
                         "graph database is not current for the live project; \
                          embeddings without graph context"
                     );
                 }
-                Ok(graph_db) => {
+                Ok(Some(generation)) => {
                     engine.set_graph_context_provider(Arc::new(
                         crate::graph_query::GraphDbContextProvider::new(
-                            graph_db,
+                            graph.store().clone(),
+                            generation,
                             graph_project.search_roots.as_ref(),
                         ),
                     ));

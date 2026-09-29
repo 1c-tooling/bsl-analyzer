@@ -9,6 +9,7 @@ use bsl_search::SearchEngine;
 
 #[cfg(test)]
 use crate::cache::graph_db_path;
+#[cfg(test)]
 use crate::graph_query::GraphDb;
 use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
@@ -459,7 +460,14 @@ impl GraphState {
         observed_through: u64,
     ) -> PublishAttemptOutcome {
         let db_path = self.graph_db_path().expect("workspace graph has cache layout");
-        let stored_fp = read_stored_fingerprints_with_roots(&db_path);
+        // Every read of the published build below names the generation this first one saw,
+        // and none holds a handle across the scans and analysis between them.
+        let wait = super::BACKGROUND_READ_WAIT;
+        let Ok((base, stored_fp)) = self.store.read(None, wait, |snapshot| {
+            (snapshot.generation, snapshot.graph.stored_fingerprints())
+        }) else {
+            return self.note_incremental("published graph unavailable");
+        };
         if stored_fp.is_empty() {
             return self.note_incremental("no stored fingerprints"); // older build → full rebuild
         }
@@ -471,8 +479,9 @@ impl GraphState {
             crate::graph::ProjectSnapshot::load_excluding(workspace_root, &self.cache_exclusions());
         // A topology change re-shapes visibility for ANY module even when only
         // `.bsl` bodies drifted on disk — never body-patch across it.
-        match GraphDb::open(&db_path).and_then(|g| g.freshness_token()) {
-            Ok((_, stored_token, _)) if stored_token.topology == project.portable_topology => {}
+        match self.store.read(Some(base), wait, |snapshot| snapshot.graph.freshness_token()) {
+            Ok(Ok((_, stored_token, _))) if stored_token.topology == project.portable_topology => {}
+            Err(_) => return self.note_incremental("published graph moved"),
             _ => return self.note_incremental("topology moved"),
         }
         let pre = crate::graph::universe::ScannedUniverse::scan_excluding(
@@ -528,7 +537,11 @@ impl GraphState {
                     return self.note_incremental("profile recompute failed");
                 }
             };
-        let stored_sig = read_stored_sig_hashes(&db_path);
+        let Ok(stored_sig) =
+            self.store.read(Some(base), wait, |snapshot| snapshot.graph.stored_sig_hashes())
+        else {
+            return self.note_incremental("published graph moved");
+        };
         let mut sig_changed: Vec<(String, &crate::graph_db::ModuleProfile)> = Vec::new();
         for p in &modified_paths {
             let key = p.to_string_lossy().into_owned();
@@ -554,8 +567,14 @@ impl GraphState {
         if !sig_changed.is_empty() {
             let refs: Vec<(&str, &crate::graph_db::ModuleProfile)> =
                 sig_changed.iter().map(|(f, p)| (f.as_str(), *p)).collect();
-            match crate::graph_db::caller_delta_plan(&db_path, &refs, project.search_roots.as_ref())
-            {
+            let plan = self
+                .store
+                .read(Some(base), wait, |snapshot| {
+                    snapshot.graph.caller_delta_plan(&refs, project.search_roots.as_ref())
+                })
+                .map_err(anyhow::Error::from)
+                .and_then(|plan| plan);
+            match plan {
                 Ok(Some(callers)) => {
                     for c in callers {
                         if !changed_paths.contains(&c) {
@@ -754,9 +773,10 @@ impl GraphState {
                 super::types::SUPERSEDED_GRAPH_ERROR,
             ));
         }
-        let path = self.graph_db_path().expect("workspace graph has cache layout");
-        let graph = match GraphDb::open(&path) {
-            Ok(graph) => graph,
+        let inspected = match self
+            .inspect_unpublished(|graph| (graph.freshness_token(), graph.files().unwrap_or(0)))
+        {
+            Ok(inspected) => inspected,
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -765,9 +785,9 @@ impl GraphState {
                 return PublishAttemptOutcome::FallBack;
             }
         };
-        let (revision, fingerprint, force_stale) = match graph.freshness_token() {
-            Ok(token) => token,
-            Err(error) => {
+        let ((revision, fingerprint, force_stale), files) = match inspected {
+            (Ok(token), files) => (token, files),
+            (Err(error), _) => {
                 tracing::warn!(
                     error = %error,
                     "cached graph database has no valid freshness token; rebuilding"
@@ -780,7 +800,11 @@ impl GraphState {
         // The cached graph remembers which stat identity each of its hashes was read under; a
         // file whose identity has not moved since then is not read again to prove it.
         if let Some(roots) = project.search_roots.as_ref() {
-            super::content_hash::seed(crate::graph_db::read_stored_observations(&path, roots));
+            if let Ok(observations) =
+                self.inspect_unpublished(|graph| graph.stored_observations(roots))
+            {
+                super::content_hash::seed(observations);
+            }
         }
         let now = crate::graph::universe::ScannedUniverse::scan_excluding(
             &project.scan_roots,
@@ -824,8 +848,6 @@ impl GraphState {
             tracing::warn!("cached graph database freshness check failed; rebuilding");
             return PublishAttemptOutcome::FallBack;
         }
-        let files = graph.files().unwrap_or(0);
-        drop(graph);
         let prepared = match self.prepare_snapshot_pool(revision, fingerprint, force_stale) {
             Ok(prepared) => prepared,
             Err(SnapshotPrepareError::Open(error)) => {
@@ -908,18 +930,23 @@ impl GraphState {
                 super::types::SUPERSEDED_GRAPH_ERROR,
             ));
         }
-        let path = self.graph_db_path().expect("workspace graph has cache layout");
-        let Ok(graph) = GraphDb::open(&path) else {
+        let project =
+            crate::graph::ProjectSnapshot::load_excluding(workspace_root, &self.cache_exclusions());
+        // One look at the file answers the token, the topology and the size together.
+        let Ok(inspected) = self.inspect_unpublished(|graph| {
+            graph.freshness_token().map(|token| {
+                (token, super::scan::graph_matches_live_project(graph, &project), graph.files())
+            })
+        }) else {
             return PublishAttemptOutcome::FallBack; // missing, truncated, or stale-schema → full rebuild
         };
-        let Ok((revision, fingerprint, force_stale)) = graph.freshness_token() else {
+        let Ok(((revision, fingerprint, force_stale), matches_live_project, files)) = inspected
+        else {
             return PublishAttemptOutcome::FallBack;
         };
         if force_stale {
             return PublishAttemptOutcome::FallBack;
         }
-        let project =
-            crate::graph::ProjectSnapshot::load_excluding(workspace_root, &self.cache_exclusions());
         // Stale on FILES is what this path exists to serve — stale on TOPOLOGY is not. A build
         // made under a different extension topology resolves names differently, so publishing it
         // would answer questions about a project shape this workspace no longer has, and every
@@ -932,7 +959,7 @@ impl GraphState {
         // differing from its own, and refusing to publish leaves nothing to differ from. The
         // difference is visible right here — cached file versus live configuration — so the
         // request is raised directly and the rebuild's publish carries it.
-        if !super::scan::graph_matches_live_project(&graph, &project) {
+        if !matches_live_project {
             tracing::info!(
                 "cached graph database was built for another extension topology; \
                  rebuilding instead of serving it stale, and re-rendering search contexts"
@@ -941,8 +968,7 @@ impl GraphState {
                 .record_hook(super::debt::HookDebt { topology: true, roots: false });
             return PublishAttemptOutcome::FallBack;
         }
-        let files = graph.files().unwrap_or(0);
-        drop(graph);
+        let files = files.unwrap_or(0);
         let prepared = match self.prepare_snapshot_pool(revision, fingerprint, force_stale) {
             Ok(prepared) => prepared,
             Err(SnapshotPrepareError::Open(error)) => {
@@ -1542,61 +1568,17 @@ fn bsl_module_total_filekeys(
         .count()
 }
 
+/// [`stored_fingerprints_in`] over a file opened by path, for a test inspecting a database
+/// it built by hand.
+#[cfg(test)]
 pub(crate) fn read_stored_fingerprints_with_roots(
     db_path: &Path,
 ) -> std::collections::HashMap<bsl_search::FileKey, [u8; 32]> {
-    let mut map = std::collections::HashMap::new();
-    let Ok(conn) =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return map;
-    };
-    let Ok(mut stmt) = conn.prepare("SELECT root_id, path, content_hash FROM files") else {
-        return map;
-    };
-    let Ok(rows) = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?))
-    }) else {
-        return map;
-    };
-    for row in rows {
-        let Ok((root_id, path, bytes)) = row else { return std::collections::HashMap::new() };
-        let bytes: [u8; 32] = match bytes.as_slice().try_into() {
-            Ok(bytes) => bytes,
-            Err(_) => return std::collections::HashMap::new(),
-        };
-        map.insert(bsl_search::FileKey::new(root_id, path), bytes);
+    match rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    {
+        Ok(conn) => crate::graph_db::stored_fingerprints_in(&conn),
+        Err(_) => std::collections::HashMap::new(),
     }
-    map
-}
-
-/// Read the stored per-file signature hashes (`None` for `.xml`, and for `.bsl` built
-/// before signature persistence). Read-only open; an open/query failure yields an
-/// empty map → the body-only fast path treats every module as ineligible (full
-/// rebuild). Keep the durable key: resolving it to a declared path can differ
-/// from the canonical path used by the current scan, especially on Windows.
-pub(crate) fn read_stored_sig_hashes(
-    db_path: &Path,
-) -> std::collections::HashMap<bsl_search::FileKey, Option<u64>> {
-    let mut map = std::collections::HashMap::new();
-    let Ok(conn) =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return map;
-    };
-    let Ok(mut stmt) = conn.prepare("SELECT root_id, path, sig_hash FROM files") else {
-        return map;
-    };
-    let Ok(rows) = stmt.query_map([], |r| {
-        Ok((
-            bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?),
-            r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-        ))
-    }) else {
-        return map;
-    };
-    map.extend(rows.flatten());
-    map
 }
 
 #[cfg(test)]
@@ -4083,7 +4065,11 @@ mod tests {
         assert_eq!(gdb.graph_context("mdo/Catalog/Контрагенты", Some(&roots)).unwrap(), None);
 
         // The graph-DB-backed provider resolves a chunk (path, symbol) to the same text.
-        let provider = crate::graph_query::GraphDbContextProvider::new(gdb, Some(&roots));
+        let generation = gdb.freshness_token().unwrap().0;
+        drop(gdb);
+        let store = crate::graph::GraphStore::serving_file_for_test(&out, None).unwrap();
+        let provider =
+            crate::graph_query::GraphDbContextProvider::new(store, generation, Some(&roots));
         let via_provider = bsl_search::GraphContextProvider::graph_context(
             &provider,
             "CommonModules/Вызыватель/Ext/Module.bsl",

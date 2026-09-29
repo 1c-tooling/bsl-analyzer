@@ -540,19 +540,78 @@ fn observation_columns(
     ]
 }
 
-/// The content hashes the graph at `db_path` recorded together with the stat identity they
-/// were read under, addressed through the current roots. A row whose file was not read, or
-/// whose stat columns are incomplete, carries nothing to reuse.
+/// The content hash stored for every indexed file, by durable key. Empty when the rows will
+/// not read: the body-only fast path then rebuilds in full.
+pub(crate) fn stored_fingerprints_in(
+    conn: &Connection,
+) -> std::collections::HashMap<bsl_search::FileKey, [u8; 32]> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare("SELECT root_id, path, content_hash FROM files") else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?))
+    }) else {
+        return map;
+    };
+    for row in rows {
+        let Ok((root_id, path, bytes)) = row else { return std::collections::HashMap::new() };
+        let bytes: [u8; 32] = match bytes.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+        map.insert(bsl_search::FileKey::new(root_id, path), bytes);
+    }
+    map
+}
+
+/// Read the stored per-file signature hashes (`None` for `.xml`, and for `.bsl` built
+/// before signature persistence). A query failure yields an empty map → the body-only
+/// fast path treats every module as ineligible (full rebuild). Keep the durable key:
+/// resolving it to a declared path can differ from the canonical path used by the
+/// current scan, especially on Windows.
+pub(crate) fn stored_sig_hashes_in(
+    conn: &Connection,
+) -> std::collections::HashMap<bsl_search::FileKey, Option<u64>> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare("SELECT root_id, path, sig_hash FROM files") else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+            r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+        ))
+    }) else {
+        return map;
+    };
+    map.extend(rows.flatten());
+    map
+}
+
+/// [`read_stored_observations_in`] over a file opened by path, for a test inspecting a
+/// database it built by hand.
+#[cfg(test)]
 pub(crate) fn read_stored_observations(
     db_path: &Path,
     roots: &bsl_search::WorkspaceRoots,
 ) -> Vec<(PathBuf, crate::graph::content_hash::Observation)> {
-    use crate::graph::content_hash::{ChangeIdentity, Observation, StatIdentity};
     let Ok(conn) =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return Vec::new();
     };
+    read_stored_observations_in(&conn, roots)
+}
+
+/// The content hashes the graph recorded together with the stat identity they were read
+/// under, addressed through the current roots. A row whose file was not read, or whose stat
+/// columns are incomplete, carries nothing to reuse.
+pub(crate) fn read_stored_observations_in(
+    conn: &Connection,
+    roots: &bsl_search::WorkspaceRoots,
+) -> Vec<(PathBuf, crate::graph::content_hash::Observation)> {
+    use crate::graph::content_hash::{ChangeIdentity, Observation, StatIdentity};
     let Ok(mut stmt) = conn.prepare(
         "SELECT root_id, path, content_hash, stat_len, stat_mtime_ns, stat_ctime_ns, stat_ino, \
                 stat_dev, stat_observed_ns \
@@ -639,8 +698,10 @@ fn install_changed_file_keys(
     changed_files: &[String],
     roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> anyhow::Result<()> {
+    // A pooled read handle outlives one plan; the table from the last plan on it is dropped.
     conn.execute_batch(
-        "CREATE TEMP TABLE changed_file_keys (
+        "DROP TABLE IF EXISTS temp.changed_file_keys;
+         CREATE TEMP TABLE changed_file_keys (
              root_id TEXT NOT NULL,
              path TEXT NOT NULL,
              PRIMARY KEY (root_id, path)
@@ -1760,15 +1821,39 @@ pub fn recompute_module_profiles(
 ///
 /// `sig_changed` pairs each changed module's normalised `(file_root_id, file_path)` key with its
 /// freshly-recomputed [`ModuleProfile`].
+pub(crate) fn caller_delta_plan_in(
+    conn: &Connection,
+    sig_changed: &[(&str, &ModuleProfile)],
+    roots: Option<&bsl_search::WorkspaceRoots>,
+) -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let plan = plan_caller_delta(conn, sig_changed, roots);
+    // The handle goes back to its pool; the keys of this plan must not ride along.
+    let dropped = conn.execute_batch("DROP TABLE IF EXISTS temp.changed_file_keys;");
+    let plan = plan?;
+    dropped?;
+    Ok(plan)
+}
+
+/// [`caller_delta_plan_in`] over a file opened by path, for a test planning against a
+/// database it built by hand.
+#[cfg(test)]
 pub fn caller_delta_plan(
     db_path: &Path,
     sig_changed: &[(&str, &ModuleProfile)],
     roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> anyhow::Result<Option<Vec<PathBuf>>> {
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    caller_delta_plan_in(&conn, sig_changed, roots)
+}
+
+fn plan_caller_delta(
+    conn: &Connection,
+    sig_changed: &[(&str, &ModuleProfile)],
+    roots: Option<&bsl_search::WorkspaceRoots>,
+) -> anyhow::Result<Option<Vec<PathBuf>>> {
     let changed_file_names: Vec<String> =
         sig_changed.iter().map(|(file, _)| (*file).to_owned()).collect();
-    install_changed_file_keys(&conn, &changed_file_names, roots)?;
+    install_changed_file_keys(conn, &changed_file_names, roots)?;
 
     // What the stored artefact recorded as unreadable. Compared verbatim: both this and
     // the keys of `sig_changed` are the raw canonical spelling of the same scanned
@@ -1776,7 +1861,7 @@ pub fn caller_delta_plan(
     // `files.path`. Normalising either side would break the match on the one platform
     // where the two spellings could differ at all.
     let was_unread: std::collections::HashSet<bsl_search::FileKey> =
-        read_unread_keys_strict(&conn)?.into_iter().collect();
+        read_unread_keys_strict(conn)?.into_iter().collect();
 
     let mut index_callers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (file, profile) in sig_changed {

@@ -474,6 +474,26 @@ fn fence_callers_are_exactly_classified() {
     }
 }
 
+/// The published graph file is opened only by the graph module that lends its handles: a
+/// consumer opening it itself keeps a handle no publication can account for.
+#[test]
+fn only_the_graph_module_opens_graph_databases() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let owners = [root.join("graph"), root.join("graph_query.rs")];
+    for path in production_sources() {
+        if owners.iter().any(|owner| path.starts_with(owner)) {
+            continue;
+        }
+        let source =
+            production_source(&std::fs::read_to_string(&path).expect("Rust source is readable"));
+        assert!(
+            !source.contains("GraphDb::open"),
+            "{} opens a graph database past the graph store",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn request_paths_do_not_call_lease_or_mutation_helpers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -489,6 +509,7 @@ fn request_paths_do_not_call_lease_or_mutation_helpers() {
         "capture_point_refresh(",
         "publish_point_refresh(",
         "snapshot_blocking(",
+        "read_blocking(",
     ];
     for path in
         production_sources().into_iter().filter(|path| path == &lib || path.starts_with(&tools))
@@ -639,6 +660,8 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ),
     // The build watchdog holds a stop of its own and goes with the build.
     ("graph_db.rs", "spawn_build_watchdog", ".wait_timeout(", Waiting::OwnProtocol),
+    // A read waiting for a pooled graph handle to come back: bounded by the caller's wait.
+    ("graph/snapshot.rs", "checkout", ".wait_timeout(", Waiting::Bounded),
     // The boot's publication takes the engine for one attempt at a time; the pause between
     // lease attempts is not held under it, which is why this wait is the owner's and bounded
     // by the attempt rather than by a foreign lease holder.
@@ -649,7 +672,7 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("state/embed.rs", "kick_context_reembed", "acquire_for_owner(", Waiting::Owner),
     (
         "state/embed.rs",
-        "refresh_search_contexts_after_graph_with_cache",
+        "refresh_search_contexts_after_graph_with_store",
         "acquire_for_owner(",
         Waiting::Owner,
     ),

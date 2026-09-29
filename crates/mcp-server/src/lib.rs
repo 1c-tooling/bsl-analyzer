@@ -181,7 +181,6 @@ pub use cache::WorkspaceCacheLayout;
 pub use graph_db::{
     read_source_root_scoped_sqlite_method_call_digest, read_sqlite_method_call_digest,
 };
-pub use graph_query::{GraphDb, GraphDbContextProvider};
 pub use http::{serve_http, wildcard_allowed_hosts, MAX_HTTP_REQUEST_BODY_BYTES};
 pub use state::WorkspaceInitError;
 use state::WorkspaceSearchMode;
@@ -936,6 +935,23 @@ fn graph_provider_state(status: &GraphStatus, has_snapshot: bool) -> ide::Provid
         }
         GraphStatus::Failed(_) => ide::ProviderState::Failed,
         GraphStatus::Disabled => ide::ProviderState::Unavailable,
+    }
+}
+
+/// The graph as a name source for one answer: answering from the lent handle and its root
+/// table, or absent for the reason the graph's lifecycle gives.
+fn graph_name_source<'a>(
+    graph: &crate::graph::GraphState,
+    snapshot: Option<&'a crate::graph::GraphSnapshot>,
+) -> crate::graph_query::GraphNameSource<'a> {
+    match (snapshot, graph_provider_state(&graph.status(), snapshot.is_some())) {
+        (Some(snapshot), ide::ProviderState::Answered) => {
+            crate::graph_query::GraphNameSource::answering(
+                &snapshot.graph,
+                snapshot.workspace_roots(),
+            )
+        }
+        (_, state) => crate::graph_query::GraphNameSource::absent(state),
     }
 }
 
@@ -1820,8 +1836,6 @@ impl McpServer {
         use crate::diagnostics_state::{resident_call, ResidentOutcome};
 
         let graph = self.state.graph().clone();
-        let snapshot = graph.snapshot();
-        let graph_state = graph_provider_state(&graph.status(), snapshot.is_some());
 
         let diag = self.state.diagnostics().clone();
         diag.ensure_loading();
@@ -1831,68 +1845,63 @@ impl McpServer {
         let started = std::time::Instant::now();
         let retry_diag = diag.clone();
         let outcome = resident_call(diag, ct, move |session| {
-            let source = match (&snapshot, graph_state) {
-                (Some(snapshot), ide::ProviderState::Answered) => {
-                    crate::graph_query::GraphNameSource::answering(
-                        &snapshot.graph,
-                        snapshot.workspace_roots(),
-                    )
-                }
-                (_, state) => crate::graph_query::GraphNameSource::absent(state),
-            };
+            graph.read_optional(|snapshot| {
+                let source = graph_name_source(&graph, snapshot);
 
-            let served = |db: &ide::RootDatabaseImpl,
-                          workspace: ide::ProviderState,
-                          roots: Option<&bsl_search::WorkspaceRoots>| {
-                tools::graph::resolve(db, workspace, &source, roots, &query, limit)
-            };
+                let served =
+                    |db: &ide::RootDatabaseImpl,
+                     workspace: ide::ProviderState,
+                     roots: Option<&bsl_search::WorkspaceRoots>| {
+                        tools::graph::resolve(db, workspace, &source, roots, &query, limit)
+                    };
 
-            let outcome = resident_ready.then(|| {
-                session.read(|resident, analysis, _generation| {
-                    let (value, completeness) = served(
-                        analysis.database(),
-                        ide::ProviderState::Answered,
-                        Some(resident.workspace_roots()),
-                    );
-                    (value, completeness, resident.unread_count())
-                })
-            });
+                let outcome = resident_ready.then(|| {
+                    session.read(|resident, analysis, _generation| {
+                        let (value, completeness) = served(
+                            analysis.database(),
+                            ide::ProviderState::Answered,
+                            Some(resident.workspace_roots()),
+                        );
+                        (value, completeness, resident.unread_count())
+                    })
+                });
 
-            // Decided from the read that actually happened, while the outcome is
-            // still in hand.
-            let workspace = fallback_workspace_state(resident_state, outcome.as_ref());
+                // Decided from the read that actually happened, while the outcome is
+                // still in hand.
+                let workspace = fallback_workspace_state(resident_state, outcome.as_ref());
 
-            let answer = match outcome {
-                Some(ResidentOutcome::Ready((value, completeness, unread), _)) => {
-                    // Modules that could not be read hold members this search
-                    // would have matched.
-                    Some((
-                        value,
-                        completeness.when(
-                            unread > 0,
-                            tools::location::ReasonCode::UnreadableFiles,
-                            "some workspace files could not be read, so the search was \
-                             not exhaustive",
-                        ),
-                    ))
-                }
-                _ => None,
-            };
+                let answer = match outcome {
+                    Some(ResidentOutcome::Ready((value, completeness, unread), _)) => {
+                        // Modules that could not be read hold members this search
+                        // would have matched.
+                        Some((
+                            value,
+                            completeness.when(
+                                unread > 0,
+                                tools::location::ReasonCode::UnreadableFiles,
+                                "some workspace files could not be read, so the search was \
+                                 not exhaustive",
+                            ),
+                        ))
+                    }
+                    _ => None,
+                };
 
-            // No resident: an empty database under the verdict decided above, so
-            // its three providers report what is actually true of it — building,
-            // failed, or absent from this profile. The platform still answers,
-            // which is the whole point of serving this action ahead of the gate.
-            let (value, completeness) = answer.unwrap_or_else(|| {
-                session.read_detached(|empty| served(empty.database(), workspace, None))
-            });
+                // No resident: an empty database under the verdict decided above, so
+                // its three providers report what is actually true of it — building,
+                // failed, or absent from this profile. The platform still answers,
+                // which is the whole point of serving this action ahead of the gate.
+                let (value, completeness) = answer.unwrap_or_else(|| {
+                    session.read_detached(|empty| served(empty.database(), workspace, None))
+                });
 
-            // Not `graph::envelope`: that one stamps the graph's revision and
-            // drift verdict, and this answer is not the graph's.
-            Ok(tools::response::structured(serde_json::json!({
-                "freshness": tools::name_answer::NameAnswer::freshness(completeness).to_value(),
-                "result": value,
-            })))
+                // Not `graph::envelope`: that one stamps the graph's revision and
+                // drift verdict, and this answer is not the graph's.
+                Ok(tools::response::structured(serde_json::json!({
+                    "freshness": tools::name_answer::NameAnswer::freshness(completeness).to_value(),
+                    "result": value,
+                })))
+            })
         })
         .await;
         cancellable_answer(outcome, "graph resolve", started, || {
@@ -1996,89 +2005,93 @@ impl McpServer {
             GraphStatus::Ready { .. } => {}
         }
 
-        let Some(snapshot) = graph.snapshot() else {
-            if graph.superseded_latched() {
-                return Err(McpError::internal_error(crate::graph::SUPERSEDED_GRAPH_ERROR, None));
-            }
-            return finish_loading(tools::graph::loading(None));
-        };
-
-        tokio::task::spawn_blocking(move || {
-            let gdb = &snapshot.graph;
-            // The table of the publication that is answering — every node this call serves
-            // is placed against it, or says why it could not be.
-            let roots = snapshot.workspace_roots();
-            let (value, completeness) = match p.action.as_str() {
-                "overview" => tools::graph::overview(gdb, p.top.unwrap_or(20), roots),
-                "node" => {
-                    let id = require(p.id, "id", "node")?;
-                    let detail = tools::graph::detail_from(p.detail.as_deref())
-                        .map_err(|e| McpError::invalid_params(e, None))?;
-                    let budget =
-                        p.max_output_tokens.unwrap_or(tools::graph::DEFAULT_BODY_BUDGET_TOKENS);
-                    tools::graph::node(gdb, &id, detail, budget, roots)
-                }
-                "source" => {
-                    if p.ids.is_empty() {
-                        return Err(McpError::invalid_params(
-                            "'ids' is required (non-empty) for action 'source'",
-                            None,
-                        ));
+        let reading = graph.clone();
+        let served = tokio::task::spawn_blocking(move || {
+            let graph = reading;
+            graph.read(|snapshot| {
+                let gdb = &snapshot.graph;
+                // The table of the publication that is answering — every node this call serves
+                // is placed against it, or says why it could not be.
+                let roots = snapshot.workspace_roots();
+                let (value, completeness) = match p.action.as_str() {
+                    "overview" => tools::graph::overview(gdb, p.top.unwrap_or(20), roots),
+                    "node" => {
+                        let id = require(p.id, "id", "node")?;
+                        let detail = tools::graph::detail_from(p.detail.as_deref())
+                            .map_err(|e| McpError::invalid_params(e, None))?;
+                        let budget =
+                            p.max_output_tokens.unwrap_or(tools::graph::DEFAULT_BODY_BUDGET_TOKENS);
+                        tools::graph::node(gdb, &id, detail, budget, roots)
                     }
-                    let budget = p.max_output_tokens.unwrap_or(4000);
-                    tools::graph::source(gdb, &p.ids, budget, roots)
-                }
-                action @ ("neighbors" | "callers" | "callees") => {
-                    let id = require(p.id, "id", action)?;
-                    let dir = match action {
-                        "callers" => ide::Direction::In,
-                        "callees" => ide::Direction::Out,
-                        _ => tools::graph::direction_from(p.dir.as_deref())
-                            .map_err(|e| McpError::invalid_params(e, None))?,
-                    };
-                    let detail = tools::graph::detail_from(p.detail.as_deref())
-                        .map_err(|e| McpError::invalid_params(e, None))?;
-                    tools::graph::validate_edge_kinds(&p.edge_kinds)
-                        .map_err(|e| McpError::invalid_params(e, None))?;
-                    let max_call_sites = tools::graph::call_site_cap(p.max_call_sites)
-                        .map_err(|e| McpError::invalid_params(e, None))?;
-                    let neighbors = ide::NeighborsParams {
-                        id: &id,
-                        dir,
-                        depth: p.depth.unwrap_or(1),
-                        max_nodes: p.max_nodes.unwrap_or(50),
-                        detail,
-                        provenance_filter: p.provenance.clone(),
-                        edge_kind_filter: p.edge_kinds.clone(),
-                        call_sites: p.call_sites.unwrap_or(false),
-                        max_call_sites,
-                    };
-                    let budget =
-                        p.max_output_tokens.unwrap_or(tools::graph::DEFAULT_BODY_BUDGET_TOKENS);
-                    tools::graph::neighbors(gdb, &neighbors, budget, roots)
-                }
-                other => {
-                    return Err(contract::unknown_action(McpProfile::Workspace, "graph", other))
-                }
-            };
-            // Request reads report the publication already paired with this descriptor;
-            // background owners detect drift and schedule reloads.
-            // A request may ask the graph to look again sooner — nothing more. It reads no
-            // disk itself: all it does is move the watcher's probe forward, so a workspace in
-            // use notices a healed subtree at the cadence a request path used to walk at.
-            graph.note_request();
-            let freshness = graph.cached_freshness(&snapshot);
-            // Modules the artefact could not read are missing nodes and edges: that is
-            // incompleteness of the answer, not merely drift.
-            let completeness = completeness.when(
-                snapshot.unread_files() > 0,
-                tools::location::ReasonCode::UnreadableFiles,
-                "some workspace modules could not be read when the graph was built",
-            );
-            Ok(tools::graph::envelope(freshness, completeness, value))
+                    "source" => {
+                        if p.ids.is_empty() {
+                            return Err(McpError::invalid_params(
+                                "'ids' is required (non-empty) for action 'source'",
+                                None,
+                            ));
+                        }
+                        let budget = p.max_output_tokens.unwrap_or(4000);
+                        tools::graph::source(gdb, &p.ids, budget, roots)
+                    }
+                    action @ ("neighbors" | "callers" | "callees") => {
+                        let id = require(p.id, "id", action)?;
+                        let dir = match action {
+                            "callers" => ide::Direction::In,
+                            "callees" => ide::Direction::Out,
+                            _ => tools::graph::direction_from(p.dir.as_deref())
+                                .map_err(|e| McpError::invalid_params(e, None))?,
+                        };
+                        let detail = tools::graph::detail_from(p.detail.as_deref())
+                            .map_err(|e| McpError::invalid_params(e, None))?;
+                        tools::graph::validate_edge_kinds(&p.edge_kinds)
+                            .map_err(|e| McpError::invalid_params(e, None))?;
+                        let max_call_sites = tools::graph::call_site_cap(p.max_call_sites)
+                            .map_err(|e| McpError::invalid_params(e, None))?;
+                        let neighbors = ide::NeighborsParams {
+                            id: &id,
+                            dir,
+                            depth: p.depth.unwrap_or(1),
+                            max_nodes: p.max_nodes.unwrap_or(50),
+                            detail,
+                            provenance_filter: p.provenance.clone(),
+                            edge_kind_filter: p.edge_kinds.clone(),
+                            call_sites: p.call_sites.unwrap_or(false),
+                            max_call_sites,
+                        };
+                        let budget =
+                            p.max_output_tokens.unwrap_or(tools::graph::DEFAULT_BODY_BUDGET_TOKENS);
+                        tools::graph::neighbors(gdb, &neighbors, budget, roots)
+                    }
+                    other => {
+                        return Err(contract::unknown_action(McpProfile::Workspace, "graph", other))
+                    }
+                };
+                // Request reads report the publication already paired with this descriptor;
+                // background owners detect drift and schedule reloads.
+                // A request may ask the graph to look again sooner — nothing more. It reads no
+                // disk itself: all it does is move the watcher's probe forward, so a workspace in
+                // use notices a healed subtree at the cadence a request path used to walk at.
+                graph.note_request();
+                let freshness = graph.cached_freshness(snapshot);
+                // Modules the artefact could not read are missing nodes and edges: that is
+                // incompleteness of the answer, not merely drift.
+                let completeness = completeness.when(
+                    snapshot.unread_files() > 0,
+                    tools::location::ReasonCode::UnreadableFiles,
+                    "some workspace modules could not be read when the graph was built",
+                );
+                Ok(tools::graph::envelope(freshness, completeness, value))
+            })
         })
         .await
-        .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?;
+        match served {
+            Ok(response) => response,
+            Err(_) if graph.superseded_latched() => {
+                Err(McpError::internal_error(crate::graph::SUPERSEDED_GRAPH_ERROR, None))
+            }
+            Err(_) => finish_loading(tools::graph::loading(None)),
+        }
     }
 
     /// One symbol's consolidated card: kind, signature, type, doc, definition site, and a
@@ -2211,72 +2224,64 @@ impl McpServer {
                     }
                 };
 
-                let snapshot = graph.snapshot();
-                let graph_state = graph_provider_state(&graph.status(), snapshot.is_some());
-                let gdb = snapshot.as_ref().map(|s| &*s.graph);
+                graph.read_optional(|snapshot| {
+                    let gdb = snapshot.map(|s| &*s.graph);
 
-                let stamp = tools::symbol_info::ResidentStamp {
-                    roots: Some(&roots),
-                    revision: freshness.revision,
-                    topology: freshness.topology,
-                    stale: freshness.stale,
-                    unread_files,
-                };
+                    let stamp = tools::symbol_info::ResidentStamp {
+                        roots: Some(&roots),
+                        revision: freshness.revision,
+                        topology: freshness.topology,
+                        stale: freshness.stale,
+                        unread_files,
+                    };
 
-                match card {
-                    Some(mut card) => {
-                        tools::symbol_info::filter_members(
-                            &mut card,
-                            member_kind,
-                            member_name.as_deref(),
-                        );
-                        Ok(tools::symbol_info::render_card(
-                            &card,
-                            gdb,
-                            tools::symbol_info::DEFAULT_TOP_MODULES,
-                            max_output_tokens,
-                            &stamp,
-                        ))
-                    }
-                    None => {
-                        // Resident miss: offer the name dictionary's candidates for an
-                        // imprecise name. The lookup runs under the resident lock — it
-                        // reads that database's tables, and placing a candidate needs
-                        // the same file set that produced it.
-                        let symbol = symbol.as_deref().unwrap_or_default();
-                        let source = match (&snapshot, graph_state) {
-                            (Some(snapshot), ide::ProviderState::Answered) => {
-                                crate::graph_query::GraphNameSource::answering(
-                                    &snapshot.graph,
-                                    snapshot.workspace_roots(),
-                                )
-                            }
-                            (_, state) => crate::graph_query::GraphNameSource::absent(state),
-                        };
-                        let answer = session.read(|resident, analysis, _generation| {
-                            let db = analysis.database();
-                            let query = ide::NameQuery::new(
-                                symbol,
-                                tools::symbol_info::DEFAULT_CANDIDATE_LIMIT,
+                    match card {
+                        Some(mut card) => {
+                            tools::symbol_info::filter_members(
+                                &mut card,
+                                member_kind,
+                                member_name.as_deref(),
                             );
-                            let found = ide::lookup_names(db, &query, &[&source]);
-                            tools::name_answer::NameAnswer::render(
-                                db,
-                                Some(resident.workspace_roots()),
-                                &found,
-                            )
-                        });
-                        match answer {
-                            ResidentOutcome::Ready(answer, _) => {
-                                Ok(tools::symbol_info::render_not_found(symbol, answer, &stamp))
+                            Ok(tools::symbol_info::render_card(
+                                &card,
+                                gdb,
+                                tools::symbol_info::DEFAULT_TOP_MODULES,
+                                max_output_tokens,
+                                &stamp,
+                            ))
+                        }
+                        None => {
+                            // Resident miss: offer the name dictionary's candidates for an
+                            // imprecise name. The lookup runs under the resident lock — it
+                            // reads that database's tables, and placing a candidate needs
+                            // the same file set that produced it.
+                            let symbol = symbol.as_deref().unwrap_or_default();
+                            let source = graph_name_source(&graph, snapshot);
+                            let answer = session.read(|resident, analysis, _generation| {
+                                let db = analysis.database();
+                                let query = ide::NameQuery::new(
+                                    symbol,
+                                    tools::symbol_info::DEFAULT_CANDIDATE_LIMIT,
+                                );
+                                let found = ide::lookup_names(db, &query, &[&source]);
+                                tools::name_answer::NameAnswer::render(
+                                    db,
+                                    Some(resident.workspace_roots()),
+                                    &found,
+                                )
+                            });
+                            match answer {
+                                ResidentOutcome::Ready(answer, _) => {
+                                    Ok(tools::symbol_info::render_not_found(symbol, answer, &stamp))
+                                }
+                                // The resident was evicted between the card read and this
+                                // one; a retry envelope is the honest answer, not a miss
+                                // with no candidates.
+                                _ => Ok(tools::symbol_info::loading(&session.status_report())),
                             }
-                            // The resident was evicted between the card read and this
-                            // one; a retry envelope is the honest answer, not a miss
-                            // with no candidates.
-                            _ => Ok(tools::symbol_info::loading(&session.status_report())),
                         }
                     }
-                }
+                })
             },
             move || tools::symbol_info::loading(&retry_diag.status_report()),
         )
@@ -2353,74 +2358,67 @@ impl McpServer {
             "references",
             ct,
             move |session| {
-                let snapshot = graph.snapshot();
-                let graph_state = graph_provider_state(&graph.status(), snapshot.is_some());
-                let graph_source = match (&snapshot, graph_state) {
-                    (Some(snapshot), ide::ProviderState::Answered) => {
-                        crate::graph_query::GraphNameSource::answering(
-                            &snapshot.graph,
-                            snapshot.workspace_roots(),
-                        )
-                    }
-                    (_, state) => crate::graph_query::GraphNameSource::absent(state),
-                };
+                graph.read_optional(|snapshot| {
+                    let graph_source = graph_name_source(&graph, snapshot);
 
-                // The whole answer is assembled under the resident read lock: the hits, the
-                // paths they are published under and the root table that names them all
-                // describe ONE revision, and taking any of them afterwards would stamp the
-                // envelope of a resident that no longer produced the body.
-                let read = || {
-                    session.read(|resident, analysis, _generation| {
-                        let params = tools::references::Params {
-                            symbol: p.symbol.as_deref(),
-                            anchor_root_id: p.anchor_root_id.as_deref(),
-                            root_id: p.root_id.as_deref(),
-                            path: p.path.as_deref(),
-                            line: p.line,
-                            column: p.column,
-                            line_content: p.line_content.as_deref(),
-                            area_root_id: p.area_root_id.as_deref(),
-                            area_path_prefix: p.area_path_prefix.as_deref(),
-                            kinds: &p.kinds,
-                            include_declaration: p.include_declaration,
-                            limit: p.limit,
-                            max_files: p.max_files,
-                            include_preview: p.include_preview,
-                        };
-                        tools::references::answer(
-                            resident,
-                            analysis.database(),
-                            &params,
-                            max_output_tokens,
-                            &[&graph_source],
-                        )
-                    })
-                };
+                    // The whole answer is assembled under the resident read lock: the hits, the
+                    // paths they are published under and the root table that names them all
+                    // describe ONE revision, and taking any of them afterwards would stamp the
+                    // envelope of a resident that no longer produced the body.
+                    let read = || {
+                        session.read(|resident, analysis, _generation| {
+                            let params = tools::references::Params {
+                                symbol: p.symbol.as_deref(),
+                                anchor_root_id: p.anchor_root_id.as_deref(),
+                                root_id: p.root_id.as_deref(),
+                                path: p.path.as_deref(),
+                                line: p.line,
+                                column: p.column,
+                                line_content: p.line_content.as_deref(),
+                                area_root_id: p.area_root_id.as_deref(),
+                                area_path_prefix: p.area_path_prefix.as_deref(),
+                                kinds: &p.kinds,
+                                include_declaration: p.include_declaration,
+                                limit: p.limit,
+                                max_files: p.max_files,
+                                include_preview: p.include_preview,
+                            };
+                            tools::references::answer(
+                                resident,
+                                analysis.database(),
+                                &params,
+                                max_output_tokens,
+                                &[&graph_source],
+                            )
+                        })
+                    };
 
-                // This tool's miss is decided by the answer itself, not by the shape of the
-                // request — see `warrants_rescan`.
-                let outcome = session.read_retrying_a_stale_miss(read, |answer| {
+                    // This tool's miss is decided by the answer itself, not by the shape of the
+                    // request — see `warrants_rescan`.
+                    let outcome = session.read_retrying_a_stale_miss(read, |answer| {
                     matches!(answer, Ok(answer) if tools::references::warrants_rescan(answer))
                 });
 
-                match outcome {
-                    ResidentOutcome::Ready(answer, freshness) => Ok(tools::references::finish(
-                        answer?,
-                        freshness.revision,
-                        freshness.topology,
-                        freshness.stale,
-                    )),
-                    ResidentOutcome::Loading => {
-                        Ok(tools::references::loading(&session.status_report()))
+                    match outcome {
+                        ResidentOutcome::Ready(answer, freshness) => Ok(tools::references::finish(
+                            answer?,
+                            freshness.revision,
+                            freshness.topology,
+                            freshness.stale,
+                        )),
+                        ResidentOutcome::Loading => {
+                            Ok(tools::references::loading(&session.status_report()))
+                        }
+                        ResidentOutcome::Disabled => Err(McpError::invalid_params(
+                            "references is only available in the workspace profile",
+                            None,
+                        )),
+                        ResidentOutcome::Failed(msg) => Err(McpError::internal_error(
+                            format!("references database: {msg}"),
+                            None,
+                        )),
                     }
-                    ResidentOutcome::Disabled => Err(McpError::invalid_params(
-                        "references is only available in the workspace profile",
-                        None,
-                    )),
-                    ResidentOutcome::Failed(msg) => {
-                        Err(McpError::internal_error(format!("references database: {msg}"), None))
-                    }
-                }
+                })
             },
             move || tools::references::loading(&retry_diag.status_report()),
         )

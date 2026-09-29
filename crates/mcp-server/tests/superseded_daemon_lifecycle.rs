@@ -3,7 +3,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, UNIX_EPOCH};
 
-use mcp_server::{serve_stream, GraphDb, McpProfile, McpServer, SharedState, WorkspaceCacheLayout};
+use mcp_server::{serve_stream, McpProfile, McpServer, SharedState, WorkspaceCacheLayout};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
@@ -117,7 +117,13 @@ async fn superseded_daemon_lifecycle() {
         .expect("old daemon primes its descriptor pool");
     let old_file = std::fs::File::open(cache.graph_db_path()).unwrap();
     let old_inode = old_file.metadata().unwrap().ino();
-    let old_db = GraphDb::open(&cache.graph_db_path()).unwrap();
+    // A connection opened past the daemon's graph store: what an outside reader of the file
+    // keeps across the replacement.
+    let old_db = rusqlite::Connection::open_with_flags(
+        cache.graph_db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
 
     write_workspace(&root, 2);
     let new_server = McpServer::new(
@@ -133,8 +139,12 @@ async fn superseded_daemon_lifecycle() {
     assert_ne!(new_revision, old_revision);
     assert_ne!(stamp(&cache.graph_db_path()).inode, old_inode, "publish atomically replaced inode");
     assert_eq!(old_file.metadata().unwrap().ino(), old_inode, "the old inode stays open");
-    assert_eq!(old_db.freshness_token().unwrap().0, old_revision);
-    assert!(old_db.overview(5, None).is_ok(), "the pre-replacement SQLite handle remains readable");
+    let revision: String = old_db
+        .query_row("SELECT value FROM meta WHERE key = 'revision'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(revision.parse::<u64>().unwrap(), old_revision);
+    let nodes: i64 = old_db.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
+    assert!(nodes > 0, "the pre-replacement SQLite handle remains readable");
 
     for _ in 0..200 {
         if cache.search_db_path().exists() {

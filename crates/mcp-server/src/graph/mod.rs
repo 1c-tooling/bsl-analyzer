@@ -33,11 +33,6 @@ pub(crate) mod watcher;
     unused_imports,
     reason = "the stable graph facade preserves crate::graph helper paths while leaf consumers import directly"
 )]
-pub(crate) use build::{read_stored_fingerprints_with_roots, read_stored_sig_hashes};
-#[allow(
-    unused_imports,
-    reason = "the stable graph facade preserves crate::graph helper paths while leaf consumers import directly"
-)]
 pub(crate) use input::{
     build_source_root, db_for_files, db_for_files_lazy, ProjectSnapshot, GRAPH_SOURCE_ROOT,
 };
@@ -50,7 +45,10 @@ pub(crate) use scan::{classify_changes, file_fingerprint, FileStat, WorkspaceDif
     unused_imports,
     reason = "the stable graph facade preserves crate::graph snapshot paths while implementation stays private"
 )]
-pub(crate) use snapshot::{BackgroundSnapshotError, GraphSnapshot, PooledGraphDb};
+pub(crate) use snapshot::{
+    BackgroundSnapshotError, GraphReadError, GraphSnapshot, GraphStore, PooledGraphDb,
+    BACKGROUND_READ_WAIT,
+};
 pub(crate) use state::GraphState;
 #[allow(
     unused_imports,

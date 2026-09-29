@@ -1058,7 +1058,7 @@ impl SharedState {
     /// deliberate answer: a rendering fits several roots at once, and a key guessed from it
     /// would name a file that did not change.
     ///
-    /// Queries the CURRENTLY PUBLISHED graph via [`GraphState::snapshot`], which gates on a
+    /// Queries the CURRENTLY PUBLISHED graph via [`GraphState::read_blocking`], which gates on a
     /// published build and opens the read-only db off the graph's inner lock. Pre-drift edges
     /// are exactly right here: the set of referencing modules is defined by OTHER modules'
     /// bodies, which this `.xml` edit did not touch — the follow-up rebuild only re-renders the
@@ -1083,48 +1083,46 @@ impl SharedState {
         if mdo_ids.is_empty() {
             return ReferencingFilesOutcome::Applied(files);
         }
-        let snapshot = match graph.snapshot_blocking() {
-            LeaseOperationOutcome::Applied(Some(snapshot)) => snapshot,
-            LeaseOperationOutcome::Applied(None) => return ReferencingFilesOutcome::Applied(files),
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
-                crate::graph::BackgroundSnapshotError::Changed,
-            )) => {
-                return ReferencingFilesOutcome::OperationError(
-                    "background graph snapshot changed during preparation".to_owned(),
-                );
-            }
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
-                crate::graph::BackgroundSnapshotError::Operation(error),
-            )) => {
-                return ReferencingFilesOutcome::OperationError(format!(
-                    "background graph snapshot failed: {error}"
-                ));
-            }
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
-                return ReferencingFilesOutcome::OperationError(format!(
-                    "background graph snapshot lease failed: {error}"
-                ));
-            }
-            LeaseOperationOutcome::TransientRefusal => {
-                return ReferencingFilesOutcome::TransientRefusal
-            }
-            LeaseOperationOutcome::Superseded => return ReferencingFilesOutcome::Superseded,
-            LeaseOperationOutcome::Released => return ReferencingFilesOutcome::Released,
-        };
-        let Some(roots) = snapshot.workspace_roots().or(fallback_roots) else {
-            return ReferencingFilesOutcome::TransientRefusal;
-        };
-        for mdo_id in mdo_ids {
-            match snapshot.graph.referencing_files(&mdo_id, Some(roots)) {
-                Ok(found) => files.extend(found.into_iter().map(PathBuf::from)),
-                Err(error) => {
-                    return ReferencingFilesOutcome::OperationError(format!(
-                        "referencing-files lookup failed for {mdo_id}: {error}"
-                    ))
+        let referencing = graph.read_blocking(|snapshot| {
+            let Some(roots) = snapshot.workspace_roots().or(fallback_roots) else {
+                return ReferencingFilesOutcome::TransientRefusal;
+            };
+            for mdo_id in mdo_ids {
+                match snapshot.graph.referencing_files(&mdo_id, Some(roots)) {
+                    Ok(found) => files.extend(found.into_iter().map(PathBuf::from)),
+                    Err(error) => {
+                        return ReferencingFilesOutcome::OperationError(format!(
+                            "referencing-files lookup failed for {mdo_id}: {error}"
+                        ))
+                    }
                 }
             }
+            ReferencingFilesOutcome::Applied(files)
+        });
+        match referencing {
+            LeaseOperationOutcome::Applied(Some(outcome)) => outcome,
+            LeaseOperationOutcome::Applied(None) => {
+                ReferencingFilesOutcome::Applied(std::collections::HashSet::new())
+            }
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                crate::graph::BackgroundSnapshotError::Changed,
+            )) => ReferencingFilesOutcome::OperationError(
+                "background graph snapshot changed during preparation".to_owned(),
+            ),
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                crate::graph::BackgroundSnapshotError::Operation(error),
+            )) => ReferencingFilesOutcome::OperationError(format!(
+                "background graph snapshot failed: {error}"
+            )),
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+                ReferencingFilesOutcome::OperationError(format!(
+                    "background graph snapshot lease failed: {error}"
+                ))
+            }
+            LeaseOperationOutcome::TransientRefusal => ReferencingFilesOutcome::TransientRefusal,
+            LeaseOperationOutcome::Superseded => ReferencingFilesOutcome::Superseded,
+            LeaseOperationOutcome::Released => ReferencingFilesOutcome::Released,
         }
-        ReferencingFilesOutcome::Applied(files)
     }
 
     /// Re-mark every workspace `.bsl` dirty for the search overlay, then reconcile the
