@@ -113,7 +113,11 @@ impl Run {
     }
 
     fn file_event_at(&self, tail: &str) -> Option<&Value> {
-        self.files.iter().find(|e| e["path"].as_str().is_some_and(|p| p.ends_with(tail)))
+        let tail = Path::new(tail);
+        let tail = if tail.is_absolute() { tail.canonicalize().ok()? } else { tail.to_path_buf() };
+        self.files
+            .iter()
+            .find(|e| e["path"].as_str().is_some_and(|p| Path::new(p).ends_with(&tail)))
     }
 
     /// The module's file event, having established that it was actually
@@ -680,6 +684,444 @@ const EPF_FORM_MODULE: &str = "АРМ/Forms/Форма/Ext/Form/Module.bsl";
 
 fn write_external(root: &Path, rel: &str, name: &str, body: &str) {
     write_external_with_attribute(root, rel, name, body, None);
+}
+
+const VALID_EXTERNAL_BODY: &str =
+    "Процедура Проверить() Экспорт\n    Значение = 1;\nКонецПроцедуры\n";
+const BROKEN_EXTERNAL_BODY: &str =
+    "Процедура Проверить() Экспорт\n    Значение = ;\nКонецПроцедуры\n";
+
+/// Both kinds, including an ordinary form with an available textual module.
+/// `managed` is a container, not an export root that discovery may recurse into.
+fn nested_external_modules(root: &Path) -> Vec<PathBuf> {
+    workspace_calling_main_configuration(root);
+    let mut modules = Vec::new();
+    let mut declarations = Vec::new();
+    for (folder, name, kind) in
+        [("epf", "Обработка", "ExternalDataProcessor"), ("erf", "Отчёт", "ExternalReport")]
+    {
+        let relative = format!("src/{folder}/managed/{name}");
+        let dir = root.join(&relative);
+        write_external(root, &relative, name, BROKEN_EXTERNAL_BODY);
+        std::fs::write(dir.join(format!("{name}.xml")), processor_xml(kind, name, None)).unwrap();
+        let object = dir.join(name).join("Ext/ObjectModule.bsl");
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, BROKEN_EXTERNAL_BODY).unwrap();
+        let ordinary = dir.join(name).join("Forms/Обычная/Ext/Form/Module.bsl");
+        std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+        std::fs::write(&ordinary, BROKEN_EXTERNAL_BODY).unwrap();
+        let form_xml = std::fs::read_to_string(dir.join(name).join("Forms/Форма.xml")).unwrap();
+        std::fs::write(
+            dir.join(name).join("Forms/Обычная.xml"),
+            form_xml
+                .replace("<Name>Форма</Name>", "<Name>Обычная</Name>")
+                .replace("<FormType>Managed</FormType>", "<FormType>Ordinary</FormType>"),
+        )
+        .unwrap();
+        let xml = processor_xml(kind, name, None)
+            .replace("<Form>Форма</Form>", "<Form>Форма</Form><Form>Обычная</Form>");
+        std::fs::write(dir.join(format!("{name}.xml")), xml).unwrap();
+        modules.extend([object, dir.join(name).join("Forms/Форма/Ext/Form/Module.bsl"), ordinary]);
+        declarations.push(format!("{{ name = \"{name}\", path = \"{relative}\" }}"));
+    }
+    std::fs::write(
+        root.join("bsl-analyzer.toml"),
+        format!(
+            "[source]\nroot = \"{MAIN}\"\nextensions = []\nexternals = [{}]\n",
+            declarations.join(",")
+        ),
+    )
+    .unwrap();
+    modules.into_iter().map(|module| module.canonicalize().unwrap()).collect()
+}
+
+fn external_diagnostics(session: &mut McpSession, path: &Path) -> Value {
+    session.diagnostics(serde_json::json!({"action": "file", "path": path,
+        "codes": ["ParseError"]}))["result"]["structuredContent"]
+        .clone()
+}
+
+fn wait_external_diagnostics(
+    session: &mut McpSession,
+    path: &Path,
+    accept: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let body = external_diagnostics(session, path);
+        if body["stale"] == false && accept(&body) {
+            return body;
+        }
+        assert!(std::time::Instant::now() < deadline, "{} never settled: {body}", path.display());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn wait_file_diagnostics(
+    session: &mut McpSession,
+    path: &Path,
+    accept: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let body = session.diagnostics(serde_json::json!({
+            "action": "file",
+            "path": path.display().to_string(),
+            "codes": ["UnknownFieldInQuery"]
+        }))["result"]["structuredContent"]
+            .clone();
+        if body["stale"] == false && accept(&body) {
+            return body;
+        }
+        assert!(std::time::Instant::now() < deadline, "{} never settled: {body}", path.display());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn wait_query_semantics(session: &mut McpSession, query: &str, root_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let reply = session.call(
+            "query",
+            serde_json::json!({"action": "validate", "query": query, "root_id": root_id}),
+        );
+        assert!(reply["error"].is_null(), "query validate failed: {reply}");
+        let answer = reply["result"]["structuredContent"].clone();
+        if answer["results"][0]["backend"] == "workspace_semantics" {
+            return answer;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query semantics never became ready: {answer}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn document_configuration_xml(name: &str, extension: bool) -> String {
+    let purpose = if extension {
+        "<ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>"
+    } else {
+        ""
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Configuration uuid="11111111-0000-0000-0000-000000000001"><Properties><Name>{name}</Name>{purpose}</Properties><ChildObjects><Document>Документ1</Document></ChildObjects></Configuration></MetaDataObject>"#
+    )
+}
+
+fn effective_document_xml(extension: bool, base_attribute: &str) -> String {
+    let identity = if extension {
+        "<ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>11111111-1111-1111-1111-111111111111</ExtendedConfigurationObject>"
+    } else {
+        ""
+    };
+    let uuid = if extension {
+        "22222222-2222-2222-2222-222222222222"
+    } else {
+        "11111111-1111-1111-1111-111111111111"
+    };
+    let attribute = if extension { "ДобавленноеПоле" } else { base_attribute };
+    let attribute_uuid = if extension {
+        "66666666-6666-6666-6666-666666666666"
+    } else {
+        "44444444-4444-4444-4444-444444444444"
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+<Document uuid="{uuid}"><Properties><Name>Документ1</Name>{identity}</Properties><ChildObjects>
+<TabularSection uuid="33333333-3333-3333-3333-333333333333"><Properties><Name>Товары</Name></Properties><ChildObjects>
+<Attribute uuid="{attribute_uuid}"><Properties><Name>{attribute}</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute>
+</ChildObjects></TabularSection></ChildObjects></Document></MetaDataObject>"#
+    )
+}
+
+/// Editing a base attribute while the resident is open must refresh both its file
+/// diagnostics and query validation. The adopted extension keeps its own added field
+/// through the drift and after the base is restored.
+#[test]
+fn adopted_document_base_attribute_drift_reaches_resident_diagnostics_and_query_validate() {
+    let dir = workspace();
+    let base = path(dir.path(), MAIN);
+    let extension = path(dir.path(), EXT);
+    for (root, config_name, is_extension) in
+        [(&base, "ОсновнаяКонфигурация", false), (&extension, "Расширение", true)]
+    {
+        std::fs::create_dir_all(root.join("Documents")).unwrap();
+        std::fs::write(
+            root.join("Configuration.xml"),
+            document_configuration_xml(config_name, is_extension),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Documents/Документ1.xml"),
+            effective_document_xml(is_extension, "БазовоеПоле"),
+        )
+        .unwrap();
+    }
+    let module = extension.join("Documents/Документ1/Ext/ManagerModule.bsl");
+    std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+    let query = "ВЫБРАТЬ Т.БазовоеПоле, Т.ДобавленноеПоле ИЗ Документ.Документ1.Товары КАК Т";
+    let source = format!(
+        "Процедура Проверить() Экспорт\n    Запрос = Новый Запрос;\n    Запрос.Текст = \"{query}\";\n    Запрос.Выполнить();\nКонецПроцедуры\n"
+    );
+    std::fs::write(&module, source).unwrap();
+    std::fs::write(
+        dir.path().join("bsl-analyzer.toml"),
+        format!(
+            "[source]\nroot = \"{MAIN}\"\nextensions = [{{ name = \"EXT\", path = \"{EXT}\" }}]\n"
+        ),
+    )
+    .unwrap();
+
+    let flags = ["--configuration-root", MAIN, "--extension", "EXT=a/b/ext"];
+    let mut session = McpSession::start(dir.path(), &flags);
+    session.wait_ready("diagnostics");
+
+    let initial = wait_file_diagnostics(&mut session, &module, |answer| {
+        answer["result"]["kind"] == "full"
+            && answer["result"]["findings"].as_array().is_some_and(Vec::is_empty)
+    });
+    session.wait_ready("search");
+    let search_reply = session.call(
+        "search",
+        serde_json::json!({"action": "search_code", "query": "БазовоеПоле", "limit": 50}),
+    );
+    assert!(search_reply["error"].is_null(), "search_code failed: {search_reply}");
+    let hits = search_reply["result"]["structuredContent"]["hits"]
+        .as_array()
+        .expect("search_code returns structured hits");
+    let module_root_ids: Vec<_> = hits
+        .iter()
+        .filter(|hit| {
+            hit["path"].as_str().is_some_and(|path| {
+                Path::new(path).ends_with("Documents/Документ1/Ext/ManagerModule.bsl")
+            })
+        })
+        .map(|hit| hit["root_id"].as_str().expect("code hit names its source root"))
+        .collect();
+    assert!(!module_root_ids.is_empty(), "search finds the module's indexed query text: {hits:?}");
+    assert!(
+        module_root_ids.iter().all(|root_id| *root_id == module_root_ids[0]),
+        "all module hits name the same source root: {module_root_ids:?}"
+    );
+    let extension_root_id = module_root_ids[0].to_owned();
+    let initial_query = wait_query_semantics(&mut session, query, &extension_root_id);
+    assert!(
+        initial_query["results"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["code"] != "UnknownFieldInQuery"),
+        "base and adopted fields should both resolve: {initial_query}"
+    );
+    assert_eq!(initial_query["context"]["asserted_root_id"], extension_root_id);
+    let missing_query = "ВЫБРАТЬ Т.НетТакогоПоля ИЗ Документ.Документ1.Товары КАК Т";
+    let negative = wait_query_semantics(&mut session, missing_query, &extension_root_id);
+    assert!(
+        negative["results"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "UnknownFieldInQuery"),
+        "negative control proves workspace metadata semantics are active: {negative}"
+    );
+
+    let base_xml = base.join("Documents/Документ1.xml");
+    let base_before = std::fs::read_to_string(&base_xml).unwrap();
+    let drifted = base_before.replace("БазовоеПоле", "ПереименованноеПоле");
+    std::fs::write(&base_xml, drifted).unwrap();
+    let drift_diagnostics = wait_file_diagnostics(&mut session, &module, |answer| {
+        answer["revision"].as_u64() > initial["revision"].as_u64()
+            && answer["result"]["findings"].as_array().is_some_and(|findings| {
+                findings.iter().any(|finding| finding["code"] == "UnknownFieldInQuery")
+            })
+    });
+    let drift_query = wait_query_semantics(&mut session, query, &extension_root_id);
+    assert!(
+        drift_query["results"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "UnknownFieldInQuery"),
+        "query validation must agree with fresh diagnostics after base drift: {drift_query}"
+    );
+    assert!(drift_diagnostics["revision"].as_u64() > initial["revision"].as_u64());
+
+    std::fs::write(&base_xml, base_before).unwrap();
+    let restored = wait_file_diagnostics(&mut session, &module, |answer| {
+        answer["revision"].as_u64() > drift_diagnostics["revision"].as_u64()
+            && answer["result"]["findings"].as_array().is_some_and(Vec::is_empty)
+    });
+    let restored_query = wait_query_semantics(&mut session, query, &extension_root_id);
+    assert!(
+        restored_query["results"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["code"] != "UnknownFieldInQuery"),
+        "restoring the base field must restore the effective query schema: {restored_query}"
+    );
+    assert!(restored["revision"].as_u64() > drift_diagnostics["revision"].as_u64());
+}
+
+#[test]
+fn nested_external_text_modules_have_cli_and_mcp_parse_errors_and_recover() {
+    let dir = workspace();
+    let modules = nested_external_modules(dir.path());
+    let config_path = dir.path().join("bsl-analyzer.toml");
+    let explicit_config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!("[source]\nroot = \"{MAIN}\"\nextensions = []\n"))
+        .unwrap();
+    let undiscovered = analyze(dir.path(), &[]);
+    for module in &modules {
+        assert!(undiscovered.file_event_at(module.to_str().unwrap()).is_none());
+    }
+    assert!(undiscovered.stderr.contains("managed"), "{}", undiscovered.stderr);
+    std::fs::write(config_path, explicit_config).unwrap();
+    let disabled = analyze(dir.path(), &["--no-externals"]);
+    for module in &modules {
+        assert!(disabled.file_event_at(module.to_str().unwrap()).is_none());
+    }
+
+    let broken = analyze(dir.path(), &[]);
+    let mut session = McpSession::start(dir.path(), &[]);
+    session.wait_ready("diagnostics");
+    let mut initial = Vec::new();
+    for module in &modules {
+        assert!(!broken.messages_at(module.to_str().unwrap(), "ParseError").is_empty());
+        let answer = external_diagnostics(&mut session, module);
+        assert_eq!(answer["stale"], false, "{answer}");
+        assert_eq!(answer["result"]["kind"], "full", "{answer}");
+        assert_eq!(answer["result"]["truncated"], false, "{answer}");
+        let findings =
+            answer["result"]["findings"].as_array().expect("findings, not not_in_workspace");
+        assert!(!findings.is_empty(), "{answer}");
+        let cli_findings: Vec<_> = broken.analyzed_at(module.to_str().unwrap())["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["code"] == "ParseError")
+            .collect();
+        assert_eq!(findings.len(), cli_findings.len());
+        for (finding, cli) in findings.iter().zip(cli_findings) {
+            assert_eq!(finding["code"], "ParseError", "{finding}");
+            assert!(finding["location"]["root_id"].is_string(), "{finding}");
+            for coordinate in ["start_line", "start_column", "end_line", "end_column"] {
+                assert_eq!(finding["range"][coordinate], cli[coordinate]);
+            }
+        }
+        let rooted = session.diagnostics(serde_json::json!({
+            "action": "file", "root_id": findings[0]["location"]["root_id"],
+            "path": findings[0]["location"]["path"], "codes": ["ParseError"]
+        }));
+        assert_eq!(
+            rooted["result"]["structuredContent"]["result"]["result_id"],
+            answer["result"]["result_id"],
+            "the published root/path must name this module"
+        );
+        initial.push(answer);
+    }
+    for module in &modules {
+        std::fs::write(module, VALID_EXTERNAL_BODY).unwrap();
+    }
+    let corrected = analyze(dir.path(), &[]);
+    for (module, before) in modules.iter().zip(initial) {
+        assert!(corrected.messages_at(module.to_str().unwrap(), "ParseError").is_empty());
+        wait_external_diagnostics(&mut session, module, |answer| {
+            answer["revision"].as_u64() > before["revision"].as_u64()
+                && answer["result"]["kind"] == "full"
+                && answer["result"]["result_id"] != before["result"]["result_id"]
+                && answer["result"]["findings"].as_array().is_some_and(Vec::is_empty)
+        });
+    }
+}
+
+#[test]
+fn nested_external_module_addition_and_removal_reach_the_resident() {
+    let dir = workspace();
+    let modules = nested_external_modules(dir.path());
+    let module = modules.last().unwrap();
+    std::fs::remove_file(module).unwrap();
+    let mut session = McpSession::start(dir.path(), &[]);
+    session.wait_ready("diagnostics");
+    let missing = external_diagnostics(&mut session, module);
+    assert_eq!(missing["result"]["error"], "not_in_workspace", "{missing}");
+    std::fs::write(module, BROKEN_EXTERNAL_BODY).unwrap();
+    let added = wait_external_diagnostics(&mut session, module, |answer| {
+        answer["result"]["kind"] == "full"
+            && answer["result"]["findings"].as_array().is_some_and(|v| !v.is_empty())
+    });
+    std::fs::remove_file(module).unwrap();
+    wait_external_diagnostics(&mut session, module, |answer| {
+        answer["revision"].as_u64() > added["revision"].as_u64()
+            && answer["result"]["error"] == "not_in_workspace"
+    });
+}
+
+#[test]
+fn a_binary_external_is_refused_instead_of_reported_clean() {
+    let dir = workspace();
+    std::fs::write(dir.path().join("Binary.epf"), [0u8, 1, 2, 3]).unwrap();
+    let error = analyze_refuses(dir.path(), &["--external", "Binary=Binary.epf"]);
+    assert!(error.contains("Binary"), "the refused input must be named: {error}");
+}
+
+#[test]
+fn native_syntax_regressions_have_matching_cli_and_mcp_ranges() {
+    let dir = workspace();
+    let modules = nested_external_modules(dir.path());
+    for module in &modules {
+        std::fs::write(module, VALID_EXTERNAL_BODY).unwrap();
+    }
+    let module = &modules[0];
+    let mut session = McpSession::start(dir.path(), &[]);
+    session.wait_ready("diagnostics");
+    let mut before = external_diagnostics(&mut session, module);
+    // These fragment pairs were checked on platform 8.3.27.1989 in demo.
+    for (bad, good) in [
+        ("Если Истина Тогда\nКонецЕслли;", "Если Истина Тогда\nКонецЕсли;"),
+        (
+            "ПолныйПуть = Новый Файл(\"a\").ПолноеИмя;",
+            "Файл = Новый Файл(\"a\");\nПолныйПуть = Файл.ПолноеИмя;",
+        ),
+        (
+            "Если Новый Файл(\"a\").Существует() Тогда\nКонецЕсли;",
+            "Файл = Новый Файл(\"a\");\nЕсли Файл.Существует() Тогда\nКонецЕсли;",
+        ),
+    ] {
+        for (body, broken) in [(bad, true), (good, false)] {
+            std::fs::write(
+                module,
+                format!("Процедура Проверить() Экспорт\n{body}\nКонецПроцедуры\n"),
+            )
+            .unwrap();
+            let answer = wait_external_diagnostics(&mut session, module, |answer| {
+                answer["revision"].as_u64() > before["revision"].as_u64()
+                    && answer["result"]["kind"] == "full"
+                    && answer["result"]["findings"]
+                        .as_array()
+                        .is_some_and(|findings| findings.is_empty() != broken)
+            });
+            let cli = analyze(dir.path(), &[]);
+            let cli_findings: Vec<_> = cli.analyzed_at(module.to_str().unwrap())["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["code"] == "ParseError")
+                .collect();
+            let findings = answer["result"]["findings"].as_array().unwrap();
+            assert_eq!(findings.len(), cli_findings.len(), "{body}");
+            assert_eq!(answer["result"]["truncated"], false);
+            for (finding, cli) in findings.iter().zip(cli_findings) {
+                for coordinate in ["start_line", "start_column", "end_line", "end_column"] {
+                    assert_eq!(finding["range"][coordinate], cli[coordinate], "{body}");
+                }
+            }
+            before = answer;
+        }
+    }
 }
 
 /// The processor's XML, internal or external: `element` is the object element and

@@ -119,7 +119,8 @@ fn new_query_with_literal_text_types_as_query_with_projection() {
 fn new_query_chain_propagates_projection_through_execute_select() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Х = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя").Выполнить().Выбрать().Имя;
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя");
+    Х = ЗапросОбъект.Выполнить().Выбрать().Имя;
     Возврат Х;
 КонецФункции
 "#;
@@ -127,7 +128,7 @@ fn new_query_chain_propagates_projection_through_execute_select() {
     assert_eq!(
         var_ty(&db, file_id, "х"),
         Some(db.string(None, false)),
-        "`Новый Запрос(\"...Имя\").Выполнить().Выбрать().Имя` must resolve to Ty::String",
+        "query.Execute().Select().Имя must resolve to Ty::String",
     );
 }
 
@@ -151,7 +152,8 @@ fn new_query_with_parse_error_literal_falls_back_to_no_projection() {
 fn execute_batch_literal_zero_index_yields_first_subquery_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Х = Новый Запрос("ВЫБРАТЬ 1 КАК ПерваяКолонка; ВЫБРАТЬ ""abc"" КАК ВтораяКолонка").ВыполнитьПакет()[0];
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ 1 КАК ПерваяКолонка; ВЫБРАТЬ ""abc"" КАК ВтораяКолонка");
+    Х = ЗапросОбъект.ВыполнитьПакет()[0];
     Возврат Х;
 КонецФункции
 "#;
@@ -171,7 +173,8 @@ fn execute_batch_literal_zero_index_yields_first_subquery_projection() {
 fn execute_batch_literal_one_index_yields_second_subquery_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Х = Новый Запрос("ВЫБРАТЬ 1 КАК ПерваяКолонка; ВЫБРАТЬ ""abc"" КАК ВтораяКолонка").ВыполнитьПакет()[1];
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ 1 КАК ПерваяКолонка; ВЫБРАТЬ ""abc"" КАК ВтораяКолонка");
+    Х = ЗапросОбъект.ВыполнитьПакет()[1];
     Возврат Х;
 КонецФункции
 "#;
@@ -190,7 +193,8 @@ fn execute_batch_literal_one_index_yields_second_subquery_projection() {
 fn execute_batch_out_of_range_index_yields_no_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Х = Новый Запрос("ВЫБРАТЬ 1 КАК А").ВыполнитьПакет()[5];
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ 1 КАК А");
+    Х = ЗапросОбъект.ВыполнитьПакет()[5];
     Возврат Х;
 КонецФункции
 "#;
@@ -208,7 +212,8 @@ fn execute_batch_dynamic_index_yields_no_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
     Индекс = 0;
-    Х = Новый Запрос("ВЫБРАТЬ 1 КАК А").ВыполнитьПакет()[Индекс];
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ 1 КАК А");
+    Х = ЗапросОбъект.ВыполнитьПакет()[Индекс];
     Возврат Х;
 КонецФункции
 "#;
@@ -225,7 +230,8 @@ fn execute_batch_dynamic_index_yields_no_projection() {
 fn execute_batch_chain_propagates_through_select() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Х = Новый Запрос("ВЫБРАТЬ 1 КАК А; ВЫБРАТЬ ""abc"" КАК Имя").ВыполнитьПакет()[1].Выбрать().Имя;
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ 1 КАК А; ВЫБРАТЬ ""abc"" КАК Имя");
+    Х = ЗапросОбъект.ВыполнитьПакет()[1].Выбрать().Имя;
     Возврат Х;
 КонецФункции
 "#;

@@ -3,8 +3,10 @@ use bsl_platform::{
     StandardAttrSpec, StandardKind,
 };
 
+use crate::enums::ObjectBelonging;
 use crate::metadata_object::{Attribute, AttributeType, MdoType};
 use crate::register::RegisterAttribute;
+use uuid::Uuid;
 
 use super::helpers::{
     child_bool, child_text, child_u32, create_register_standard_attribute, find_child,
@@ -23,6 +25,8 @@ pub(crate) struct MdoProperties {
     pub check_unique: bool,
     pub code_series: Option<String>,
     pub dependence_on_calculation_types: Option<String>,
+    pub object_belonging: ObjectBelonging,
+    pub extended_configuration_object: Option<Uuid>,
 }
 
 impl MdoProperties {
@@ -40,6 +44,13 @@ impl MdoProperties {
         let code_series = child_text(props_node, "CodeSeries").map(|s| s.to_string());
         let dependence_on_calculation_types =
             child_text(props_node, "DependenceOnCalculationTypes").map(|s| s.to_string());
+        let object_belonging = match child_text(props_node, "ObjectBelonging") {
+            Some("Adopted") => ObjectBelonging::Adopted,
+            Some("Own") => ObjectBelonging::Own,
+            _ => ObjectBelonging::Unknown,
+        };
+        let extended_configuration_object = child_text(props_node, "ExtendedConfigurationObject")
+            .and_then(|raw| Uuid::parse_str(raw).ok());
 
         let owners = find_child(props_node, "Owners")
             .map(|owners_node| {
@@ -65,6 +76,8 @@ impl MdoProperties {
             check_unique,
             code_series,
             dependence_on_calculation_types,
+            object_belonging,
+            extended_configuration_object,
         }
     }
 

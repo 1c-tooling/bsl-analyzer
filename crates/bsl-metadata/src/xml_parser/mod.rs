@@ -135,6 +135,10 @@ mod tests {
         assert_eq!(register.name(), "РегистрСведений1");
         assert_eq!(register.uuid().to_string(), "59f8d329-f39c-4999-b470-ae9fc74511ac");
         assert!(register.is_information_register());
+        assert!(
+            !register.is_recorder_subordinate(),
+            "ordinary non-periodic register has no Recorder key"
+        );
         assert_eq!(register.dimensions().len(), 1);
 
         let dimension = &register.dimensions()[0];
@@ -143,6 +147,17 @@ mod tests {
         assert!(!dimension.is_deny_incomplete_values());
         assert!(!dimension.is_master());
         assert_eq!(dimension.indexing(), "DontIndex");
+    }
+
+    #[test]
+    fn information_register_write_mode_sets_recorder_subordinate_metadata() {
+        let xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<InformationRegister uuid="59f8d329-f39c-4999-b470-ae9fc74511ad">
+<Properties><Name>ПодчиненныйРегистр</Name><WriteMode>RecorderSubordinate</WriteMode></Properties>
+</InformationRegister></MetaDataObject>"#;
+
+        let register = parse_information_register_xml(xml).unwrap();
+        assert!(register.is_recorder_subordinate());
     }
 
     #[test]

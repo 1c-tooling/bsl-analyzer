@@ -68,6 +68,9 @@ pub trait RootDatabase:
         module_file_id: FileId,
     ) -> Option<Arc<bsl_metadata::CommonModule>>;
 
+    /// EventSubscription names owned by the main configuration only.
+    fn main_event_subscription_names_for_file(&self, file_id: FileId) -> Vec<String>;
+
     fn http_service_for_file_id(
         &self,
         module_file_id: FileId,

@@ -138,24 +138,23 @@ pub(crate) fn parse_type_xml(type_node: roxmltree::Node<'_, '_>) -> Result<Attri
         all_types.push(parsed_type);
     }
 
-    if let Some(type_set) = type_set_strs.first() {
+    for type_set in &type_set_strs {
         tracing::debug!(
             type_set = %type_set,
             concrete_types_count = type_strs.len(),
             "parse_type_xml: found TypeSet"
         );
 
-        if let Some(parsed) = parse_type_set(type_set) {
-            tracing::debug!(type_set = %type_set, "adding TypeSet to types list");
-            all_types.push(parsed);
-        }
+        let parsed = parse_type_set(type_set)
+            .unwrap_or_else(|| AttributeType::UnknownNamed((*type_set).to_string()));
+        tracing::debug!(type_set = %type_set, "adding TypeSet to types list");
+        all_types.push(parsed);
     }
 
     match all_types.len() {
         0 => {
-            // A `<Type/>` with no resolvable entries is an ordinary, frequent shape in
-            // metadata XML (e.g. an attribute typed only by a type set we don't model),
-            // not an error — log at debug so it does not flood a whole-config scan.
+            // A `<Type/>` with no entries is an ordinary shape in metadata XML, not
+            // an error — log at debug so it does not flood a whole-config scan.
             tracing::debug!(
                 types = ?type_strs,
                 type_sets = ?type_set_strs,
@@ -240,7 +239,7 @@ fn parse_single_type(type_str: &str, qualifiers: &TypeQualifiers) -> Result<Attr
                 Some(resolved) => Ok(resolved),
                 None => {
                     tracing::warn!(type_str = %type_str, "unknown type");
-                    Ok(AttributeType::Unknown)
+                    Ok(AttributeType::UnknownNamed(type_str.to_string()))
                 }
             },
         },
@@ -310,7 +309,7 @@ fn parse_reference_type(type_str: &str) -> Result<AttributeType> {
     let parts: Vec<&str> = type_str.split('.').collect();
     if parts.len() != 2 {
         tracing::warn!(type_str = %type_str, "invalid reference type format");
-        return Ok(AttributeType::Unknown);
+        return Ok(AttributeType::UnknownNamed(type_str.to_string()));
     }
 
     let ref_type = parts[0];
@@ -322,7 +321,7 @@ fn parse_reference_type(type_str: &str) -> Result<AttributeType> {
 
     if ref_type.ends_with("RecordManager") {
         tracing::debug!(type_str = %type_str, "record-manager type not modelled yet; treated as Unknown");
-        return Ok(AttributeType::Unknown);
+        return Ok(AttributeType::UnknownNamed(type_str.to_string()));
     }
 
     tracing::warn!(
@@ -330,7 +329,7 @@ fn parse_reference_type(type_str: &str) -> Result<AttributeType> {
         full_type_str = %type_str,
         "unsupported reference type"
     );
-    Ok(AttributeType::Unknown)
+    Ok(AttributeType::UnknownNamed(type_str.to_string()))
 }
 
 #[cfg(test)]
@@ -430,10 +429,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_namespaced_token_stays_unknown() {
+    fn unknown_namespaced_token_keeps_its_presentation() {
         assert_eq!(
             parse_single_type("zzz:DefinitelyNotAType", &qualifiers()).unwrap(),
-            AttributeType::Unknown,
+            AttributeType::UnknownNamed("zzz:DefinitelyNotAType".to_string()),
         );
     }
 
@@ -454,10 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn record_manager_token_is_silently_unknown() {
+    fn record_manager_token_keeps_its_presentation() {
         assert_eq!(
             parse_single_type("cfg:InformationRegisterRecordManager.Курсы", &qualifiers()).unwrap(),
-            AttributeType::Unknown,
+            AttributeType::UnknownNamed("cfg:InformationRegisterRecordManager.Курсы".to_string()),
         );
     }
 
@@ -484,11 +483,29 @@ mod tests {
     }
 
     #[test]
-    fn truly_unknown_token_stays_unknown() {
+    fn truly_unknown_token_keeps_its_presentation() {
         assert_eq!(parse_platform_value_type("v8:Nonsense"), None);
         assert_eq!(
             parse_single_type("v8:Nonsense", &qualifiers()).unwrap(),
-            AttributeType::Unknown
+            AttributeType::UnknownNamed("v8:Nonsense".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_type_set_is_kept_beside_resolved_types() {
+        let doc = roxmltree::Document::parse(
+            "<Type><Type>xs:string</Type><TypeSet>cfg:FutureTypeSet</TypeSet><TypeSet>cfg:AnotherFutureTypeSet</TypeSet></Type>",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_type_xml(doc.root_element()).unwrap(),
+            AttributeType::Composite {
+                types: vec![
+                    AttributeType::String { length: None },
+                    AttributeType::UnknownNamed("cfg:FutureTypeSet".to_string()),
+                    AttributeType::UnknownNamed("cfg:AnotherFutureTypeSet".to_string()),
+                ],
+            }
         );
     }
 }

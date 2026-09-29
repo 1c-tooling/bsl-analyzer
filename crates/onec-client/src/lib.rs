@@ -258,7 +258,17 @@ pub struct MetadataStructureResult {
     #[serde(rename = "Ресурсы", default)]
     pub resources: Vec<MetadataStructureItem>,
     #[serde(rename = "ТабличныеЧасти", default)]
-    pub tabular_sections: Vec<MetadataStructureItem>,
+    pub tabular_sections: Vec<MetadataTabularSection>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MetadataTabularSection {
+    pub name: String,
+    pub synonym: String,
+    /// `None` is a legacy producer that did not return the section's fields;
+    /// `Some([])` is a confirmed empty section.
+    #[serde(default)]
+    pub attributes: Option<Vec<MetadataStructureItem>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,6 +446,17 @@ mod tests {
             assert!(future.technical_name.is_none());
             assert_eq!(future.resolution, "unresolved");
             assert_eq!(future.reason, Some("unknown_technical_name"));
+
+            let normalized = serde_json::to_value(&result).unwrap();
+            let sections = normalized["ТабличныеЧасти"].as_array().unwrap();
+            let rows = sections.iter().find(|item| item["name"] == "Rows").unwrap();
+            let fields =
+                rows["attributes"].as_array().expect("new producer attributes survive DTO");
+            assert_eq!(fields[0]["type_variants"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                sections.iter().find(|item| item["name"] == "EmptyRows").unwrap()["attributes"],
+                serde_json::json!([])
+            );
         }
     }
 
@@ -447,6 +468,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.attributes.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["ТабличныеЧасти"][0]["attributes"],
+            serde_json::Value::Null,
+            "missing legacy tabular attributes must not become a confirmed empty list"
+        );
         assert_eq!(
             result.attributes[0].type_variants[0].presentation,
             result.attributes[1].type_variants[0].presentation
@@ -474,6 +500,13 @@ mod tests {
         ))
         .unwrap();
         let new = new_fixture["ru"].clone();
+
+        assert_eq!(
+            new_fixture["_fixture"]["producer_contract"],
+            "typeVariants-tabularAttributes-v1"
+        );
+        assert_eq!(new_fixture["_fixture"]["producer_http_version"], "1.2.0");
+        assert_eq!(new_fixture["_fixture"]["producer_extension_version"], "1.1.0");
 
         for fixture in [&old, &new_fixture] {
             assert_eq!(fixture["_fixture"]["version"], "1");

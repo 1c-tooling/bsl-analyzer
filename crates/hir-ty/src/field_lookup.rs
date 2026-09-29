@@ -1058,6 +1058,47 @@ mod tests {
     }
 
     #[test]
+    fn recorder_subordinate_information_register_exposes_recorder_filter_only_when_enabled() {
+        let receiver = metadata_ref(MetadataKind::InformationRegisterRecordSet, "Регистр");
+        let filter = metadata_ref(
+            MetadataKind::RegisterFilter { parent: MdoType::InformationRegister },
+            "Регистр",
+        );
+
+        let mut subordinate_config = Configuration::new("Subordinate");
+        subordinate_config.add_register(
+            bsl_metadata::Register::builder()
+                .name("Регистр")
+                .mdo_type(MdoType::InformationRegister)
+                .recorder_subordinate(true)
+                .build(),
+        );
+        let subordinate = wrap(subordinate_config);
+        let filter_field = lookup_field(&subordinate, &receiver, &Name::new("Отбор"))
+            .expect("record set must expose its filter");
+        assert_eq!(filter_field.ty, filter);
+        assert_eq!(
+            lookup_field(&subordinate, &filter, &Name::new("Регистратор"))
+                .expect("RecorderSubordinate enables the filter key")
+                .ty,
+            platform_object("ЭлементОтбора"),
+        );
+
+        let mut ordinary_config = Configuration::new("Ordinary");
+        ordinary_config.add_register(
+            bsl_metadata::Register::builder()
+                .name("Регистр")
+                .mdo_type(MdoType::InformationRegister)
+                .build(),
+        );
+        let ordinary = wrap(ordinary_config);
+        assert!(
+            lookup_field(&ordinary, &filter, &Name::new("Регистратор")).is_none(),
+            "an ordinary non-periodic information register has no Recorder filter key"
+        );
+    }
+
+    #[test]
     fn field_lookup_register_filter_dimension_resolves_as_filter_item() {
         let mut config = Configuration::new("Test");
         config.add_register(register_with(

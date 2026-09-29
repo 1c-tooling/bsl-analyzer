@@ -144,6 +144,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::FormDataToValue => &[409],
         DiagnosticCode::GetFormMethod => &[404],
         DiagnosticCode::GlobalContextMethodCollision8312 => &[],
+        DiagnosticCode::GlobalContextMethodConflict => &[],
         DiagnosticCode::InternetAccess => &[],
         // Проверяемое требование — std737 «Проверка прав доступа»; остальные поясняют контекст.
         DiagnosticCode::IsInRoleMethod => &[737, 689],

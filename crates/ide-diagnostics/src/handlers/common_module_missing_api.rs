@@ -1,6 +1,7 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+use hir::AnnotationKind;
 use stdx::case::CaseExt;
 use syntax::ast::{AstNode, FunctionDef, PreRegionDir, ProcedureDef};
 
@@ -50,6 +51,21 @@ fn check_for_module_type(
 
     let has_methods = has_any_methods(&root);
     if !has_methods {
+        return Vec::new();
+    }
+
+    let item_tree = ctx.item_tree();
+    let methods = item_tree.methods().collect::<Vec<_>>();
+    if !methods.is_empty()
+        && methods.iter().all(|method| {
+            method.annotations().iter().any(|annotation| {
+                matches!(
+                    annotation.kind,
+                    AnnotationKind::Before | AnnotationKind::After | AnnotationKind::Instead
+                )
+            })
+        })
+    {
         return Vec::new();
     }
 
@@ -140,6 +156,25 @@ mod tests {
 Процедура Тест() Экспорт
 КонецПроцедуры
 #КонецОбласти
+"#;
+        let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn interception_only_module_does_not_need_an_exported_api() {
+        let code = r#"&После("ОбработкаЗаполнения")
+Процедура Перехват()
+КонецПроцедуры
+"#;
+        let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn non_interception_method_still_needs_an_exported_api() {
+        let code = r#"Процедура СлужебныйМетод()
+КонецПроцедуры
 "#;
         let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
         assert_eq!(diagnostics.len(), 1);

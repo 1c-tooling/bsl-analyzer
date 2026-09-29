@@ -112,6 +112,7 @@ impl SdblType {
             }
             AttributeType::Platform(_) => Self::Unknown,
             AttributeType::PlatformNamed(_) => Self::Unknown,
+            AttributeType::UnknownNamed(_) => Self::Unknown,
             AttributeType::Unknown => Self::Unknown,
         }
     }

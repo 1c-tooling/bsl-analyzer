@@ -30,7 +30,7 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "3.1",
+  "contract_version": "3.2",
   "build_version": "0.2.80",
   "mcp": {
     "profiles": {
@@ -103,7 +103,9 @@ uri: bsl-analyzer://contract
 
 Пояснения к полям:
 
-- В контракте `3.1` `search` публикует `output_schema_version="7"` в workspace и `"6"` в reference,
+- В контракте `3.2` `metadata` сохраняет прежние поля live object, добавляет `completeness` и `truncated`
+  в `schema_version="2"`; live `tree` и `object` учитывают `max_output_tokens` для `content` и
+  `structuredContent` вместе. `search` публикует `output_schema_version="7"` в workspace и `"6"` в reference,
   `syntax_help` — `"2"`, `symbol_info` — `"1"`. `syntax_help` и справочные
   действия `search(action=find_docs|search_docs|list_platform|status)` доступны
   не только в `reference`, но и в `workspace`; отдельный профиль `reference`
@@ -207,13 +209,13 @@ uri: bsl-analyzer://contract
 
 ```python
 major, minor = contract["contract_version"].split(".")
-assert major == "3" and int(minor) >= 1
+assert major == "3" and int(minor) >= 2
 ```
 
 `build_version` остаётся в документе, но для feature-detection он не нужен —
 именно ради этого и введена отдельная версия.
 
-В контракте `3.1` инструмент `search` публикует `outputSchema` версии `7` в workspace и `6` в reference:
+В контракте `3.2` инструмент `search` публикует `outputSchema` версии `7` в workspace и `6` в reference:
 hits и `not_ready` используют `schema_version="7"` для `search_code` и `"6"` для справки, `status` обоих профилей —
 `"3"`, `list_platform` сохраняет `"1"`. Добавлен необязательный закрытый объект
 `semantic_failure` с кодом embedding-ошибки; отсутствие поля не доказывает

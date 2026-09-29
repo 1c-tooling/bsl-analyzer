@@ -167,6 +167,7 @@ fn postfix_expr(p: &mut Parser) {
 ///
 /// Provenance: `docs/legal/bsl-clean-room-slice-b3.md`, finding D10.
 fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
+    let mut postfix_after_constructor = p.at(T![KwNew]);
     let Some(mut lhs) = primary_expr(p) else {
         return false;
     };
@@ -178,7 +179,16 @@ fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
         match p.current() {
             Some(T![Dot]) => {
                 let m = lhs.precede(p);
-                p.bump();
+                if postfix_after_constructor {
+                    let dot = p.start();
+                    p.bump();
+                    p.error_custom_at_marker(
+                        dot,
+                        "после конструктора нельзя обращаться к свойству или методу напрямую",
+                    );
+                } else {
+                    p.bump();
+                }
                 let crossed_newline = p.a_line_break_precedes();
                 let is_orphaned_declaration = crossed_newline && p.at_declaration_start();
                 // On the same line `expr.keyword` is unambiguously a member access —
@@ -201,9 +211,11 @@ fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
                     m.complete(p, NodeKind::FieldExpr);
                     break;
                 }
+                postfix_after_constructor = false;
             }
             Some(T![LBracket]) => {
                 let m = lhs.precede(p);
+                postfix_after_constructor = false;
                 p.bump();
                 p.within_boundary(super::at_closing_bracket, |p| {
                     expression(p);
@@ -214,6 +226,7 @@ fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
             }
             Some(T![LParen]) => {
                 let m = lhs.precede(p);
+                postfix_after_constructor = false;
                 arg_list(p);
                 lhs = m.complete(p, NodeKind::CallExpr);
                 is_valid_statement = true;
