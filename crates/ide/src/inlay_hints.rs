@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use hir::{CandidateCallBinding, Semantics};
 use ide_db::RootDatabase;
 use stdx::case::CaseExt;
-use symbol_info::{build_signature_from_resolution, selected_signature_index, SymbolSignature};
+use symbol_info::{
+    build_signature_from_resolution, parameter_name_for_argument, selected_signature_index,
+    SymbolSignature,
+};
 use syntax::{NodeOrToken, SyntaxKind, SyntaxNode, TextRange, TextSize};
 use vfs::FileId;
 
@@ -124,8 +127,8 @@ fn parameter_hints_for_arg_list<DB: RootDatabase>(
                 }
             }
             NodeOrToken::Node(arg) => {
-                if let Some(param) = signature.params.get(slot) {
-                    maybe_push_param_hint(&arg, param.name.as_str(), range, hints);
+                if let Some(name) = parameter_name_for_argument(&signature.params, slot) {
+                    maybe_push_param_hint(&arg, &name, range, hints);
                 }
             }
         }
@@ -281,6 +284,132 @@ mod tests {
                 ("Второе:".to_string(), "2".to_string()),
                 ("Второе:".to_string(), "3".to_string()),
             ],
+        );
+    }
+
+    /// A compact range labels each outer argument while nested calls retain their own labels.
+    #[test]
+    fn strtemplate_numbers_arguments_around_a_nested_call() {
+        let source = "Процедура Тест()\n    Текст = СтрШаблон(\"%1 %2 %3\", 11, Формат(22, \"ЧДЦ=0\"), 33);\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let mut hints = inlay_hints(&db, file_id, whole_range(source));
+        hints.sort_by_key(|hint| hint.position);
+        assert_eq!(
+            labels_at(source, &hints),
+            vec![
+                ("Шаблон:".into(), "".into()),
+                ("Значение1:".into(), "11".into()),
+                ("Значение2:".into(), "Формат".into()),
+                ("Значение:".into(), "22".into()),
+                ("ФорматнаяСтрока:".into(), "".into()),
+                ("Значение3:".into(), "33".into()),
+            ],
+        );
+    }
+
+    /// Extra arguments outside a bounded platform range have no invented parameter name.
+    #[test]
+    fn strtemplate_labels_stop_at_the_tenth_value() {
+        let values = (1..=11).map(|value| value.to_string()).collect::<Vec<_>>().join(", ");
+        let source =
+            format!("Процедура Тест()\n    СтрШаблон(\"%1\", {values});\nКонецПроцедуры\n");
+        let (db, file_id) = single_file(&source);
+        let hints = inlay_hints(&db, file_id, whole_range(&source));
+        let mut expected = vec![("Шаблон:".into(), "".into())];
+        expected.extend((1..=10).map(|value| (format!("Значение{value}:"), value.to_string())));
+        assert_eq!(labels_at(&source, &hints), expected);
+    }
+
+    /// Empty positional slots still consume their number in the repeated parameter family.
+    #[test]
+    fn skipped_variadic_arguments_preserve_numbering() {
+        let source = "Процедура Тест()\n    СтрШаблон(\"%2 %4\", , 22, , 44);\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let hints = inlay_hints(&db, file_id, whole_range(source));
+        assert_eq!(
+            labels_at(source, &hints),
+            vec![
+                ("Шаблон:".into(), "".into()),
+                ("Значение2:".into(), "22".into()),
+                ("Значение4:".into(), "44".into()),
+            ],
+        );
+    }
+
+    /// Russian and English aliases use the same platform parameter family.
+    #[test]
+    fn unbounded_global_functions_label_every_argument() {
+        for function in ["Мин", "Макс", "ПродолжитьВызов", "Min", "Max", "ProceedWithCall"]
+        {
+            let source = format!("Процедура Тест()\n    {function}(11, 22, 33);\nКонецПроцедуры\n");
+            let (db, file_id) = single_file(&source);
+            let hints = inlay_hints(&db, file_id, whole_range(&source));
+            assert_eq!(
+                labels_at(&source, &hints),
+                vec![
+                    ("Значение1:".into(), "11".into()),
+                    ("Значение2:".into(), "22".into()),
+                    ("Значение3:".into(), "33".into()),
+                ],
+                "{function}",
+            );
+        }
+    }
+
+    /// Constructors with a numbered slot repeat only when their metadata declares repetition.
+    #[test]
+    fn variadic_constructors_label_each_argument() {
+        for constructor in ["Массив", "Array"] {
+            let source = format!("Процедура Тест()\n    Значение = Новый {constructor}(11, 22, 33);\nКонецПроцедуры\n");
+            let (db, file_id) = single_file(&source);
+            let hints = inlay_hints(&db, file_id, whole_range(&source));
+            assert_eq!(
+                labels_at(&source, &hints),
+                vec![
+                    ("КоличествоЭлементов1:".into(), "11".into()),
+                    ("КоличествоЭлементов2:".into(), "22".into()),
+                    ("КоличествоЭлементов3:".into(), "33".into()),
+                ],
+                "{constructor}",
+            );
+        }
+    }
+
+    /// String arguments select the repeated-content overload rather than formatting attributes.
+    #[test]
+    fn formatted_string_labels_the_selected_variadic_overload() {
+        let source = "Процедура Тест()\n    Значение = Новый ФорматированнаяСтрока(\"Первое\", \"Второе\", \"Третье\");\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let hints = inlay_hints(&db, file_id, whole_range(source));
+        let labels: Vec<_> = hints.iter().map(|hint| hint.label.as_str()).collect();
+        assert_eq!(labels, ["Содержимое1:", "Содержимое2:", "Содержимое3:"]);
+    }
+
+    /// An unnumbered repeated slot uses its documented name on every supplied value.
+    #[test]
+    fn structure_constructor_repeats_the_value_label() {
+        let source = "Процедура Тест()\n    Значение = Новый Структура(\"Первое, Второе\", 11, 22);\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let hints = inlay_hints(&db, file_id, whole_range(source));
+        assert_eq!(
+            labels_at(source, &hints),
+            vec![
+                ("Ключи:".into(), "".into()),
+                ("Значения:".into(), "11".into()),
+                ("Значения:".into(), "22".into()),
+            ],
+        );
+    }
+
+    /// Echo suppression compares against each expanded name, using BSL identifier folding.
+    #[test]
+    fn skips_hints_echoing_individual_variadic_names() {
+        let source = "Процедура Тест(Значение1, значение2)\n    StrTemplate(\"%1 %2 %3\", Значение1, значение2, 33);\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let hints = inlay_hints(&db, file_id, whole_range(source));
+        assert_eq!(
+            labels_at(source, &hints),
+            vec![("Шаблон:".into(), "".into()), ("Значение3:".into(), "33".into())],
         );
     }
 }

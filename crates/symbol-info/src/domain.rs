@@ -27,6 +27,8 @@ pub struct SignatureParam {
     pub name: SmolStr,
     pub types: Vec<TypeRef>,
     pub is_optional: bool,
+    /// Later arguments reuse this slot; numbered ranges may also encode repetition in the name.
+    pub is_variadic: bool,
     pub default_value: Option<SmolStr>,
     pub description: Option<String>,
     pub is_val: bool,
