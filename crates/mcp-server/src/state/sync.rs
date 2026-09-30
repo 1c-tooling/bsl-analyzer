@@ -1109,11 +1109,6 @@ impl SharedState {
             )) => ReferencingFilesOutcome::OperationError(
                 "background graph snapshot changed during preparation".to_owned(),
             ),
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
-                crate::graph::BackgroundSnapshotError::Operation(error),
-            )) => ReferencingFilesOutcome::OperationError(format!(
-                "background graph snapshot failed: {error}"
-            )),
             LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
                 ReferencingFilesOutcome::OperationError(format!(
                     "background graph snapshot lease failed: {error}"
@@ -3710,11 +3705,10 @@ mod tests {
             .map(|_| graph.snapshot().expect("published descriptor"))
             .collect();
 
-        for failure in [
-            crate::graph::BackgroundSnapshotFailure::Changed,
-            crate::graph::BackgroundSnapshotFailure::Open,
-        ] {
-            graph.set_background_snapshot_failure_for_test(Some(failure));
+        {
+            graph.set_background_snapshot_failure_for_test(Some(
+                crate::graph::BackgroundSnapshotFailure::Changed,
+            ));
             let mut plan = SharedState::prepare_search_drift(
                 &engine,
                 &crate::state::OwnerStop::default(),

@@ -136,6 +136,57 @@ pub struct GraphMeta {
     pub publication_id: String,
 }
 
+/// Full copies of a graph database made by this process, and the full replacements it wrote.
+///
+/// The one copy left is the point patch's working copy of the published file; reads and the
+/// preparation of a full replacement copy nothing. Counted here, at the only place a graph
+/// file is copied, so an audit can set the figures against the process's disk writes.
+static PATCH_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PATCH_COPY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CANDIDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CANDIDATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`copy_audit`] has counted so far in this process.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CopyAudit {
+    pub(crate) patch_copies: u64,
+    pub(crate) patch_copy_bytes: u64,
+    pub(crate) candidates: u64,
+    pub(crate) candidate_bytes: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn copy_audit() -> CopyAudit {
+    use std::sync::atomic::Ordering::SeqCst;
+    CopyAudit {
+        patch_copies: PATCH_COPIES.load(SeqCst),
+        patch_copy_bytes: PATCH_COPY_BYTES.load(SeqCst),
+        candidates: CANDIDATES.load(SeqCst),
+        candidate_bytes: CANDIDATE_BYTES.load(SeqCst),
+    }
+}
+
+/// Copy the graph database at `src` to `dst` for a point patch — the one full copy of a graph
+/// file this program still makes — and count it.
+fn copy_graph_database(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let bytes = std::fs::copy(src, dst)?;
+    let copies = PATCH_COPIES.fetch_add(1, SeqCst) + 1;
+    let total = PATCH_COPY_BYTES.fetch_add(bytes, SeqCst) + bytes;
+    tracing::info!(bytes, copies, total, "full graph database copy for a point patch");
+    Ok(bytes)
+}
+
+/// Count a full replacement database written for installation. It is new content, not a copy
+/// of the published one.
+pub(crate) fn record_candidate(bytes: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let candidates = CANDIDATES.fetch_add(1, SeqCst) + 1;
+    let total = CANDIDATE_BYTES.fetch_add(bytes, SeqCst) + bytes;
+    tracing::info!(bytes, candidates, total, "full graph replacement written");
+}
+
 /// Read the canonical method-call digest from an existing bounded-build SQLite graph.
 ///
 /// `SetAction` registrations are intentionally excluded: the call hierarchy only
@@ -1487,7 +1538,7 @@ pub(crate) fn update_graph_database_bodies(
 
     // Patch a copy, never the published file (a reader keeps its snapshot until the
     // caller renames `out_path` into place).
-    std::fs::copy(src_path, out_path).with_context(|| {
+    copy_graph_database(src_path, out_path).with_context(|| {
         format!("copying graph db {} → {}", src_path.display(), out_path.display())
     })?;
 

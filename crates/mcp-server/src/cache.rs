@@ -102,6 +102,12 @@ impl WorkspaceCacheLayout {
         self.root.join(LEASE_LOCK_FILE)
     }
 
+    /// The one replacement a full build prepares next to the published graph, on the same
+    /// volume, kept until it is installed or proven stale.
+    pub(crate) fn graph_candidate_path(&self) -> PathBuf {
+        self.root.join("bsl-graph.pending.db")
+    }
+
     /// The file whose exclusive lock a process holds for as long as it may open the published
     /// graph. Never removed or renamed while in use.
     pub(crate) fn graph_access_lock_path(&self) -> PathBuf {

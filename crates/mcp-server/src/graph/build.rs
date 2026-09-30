@@ -9,7 +9,6 @@ use bsl_search::SearchEngine;
 
 #[cfg(test)]
 use crate::cache::graph_db_path;
-#[cfg(test)]
 use crate::graph_query::GraphDb;
 use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
@@ -264,7 +263,7 @@ impl GraphState {
         let Some(workspace_root) = self.workspace_root.clone() else {
             return;
         };
-        if let Some(reason) = self.unavailable_reason() {
+        if let Some(reason) = self.ownership_refusal() {
             self.record_load_failure(
                 is_reload,
                 LoadFailure::new(LoadFailureReason::TransientRefusal, reason),
@@ -282,6 +281,22 @@ impl GraphState {
                 ),
             );
             return;
+        }
+        // An interrupted writer's journal is finished by the new holder of the file before any
+        // read-only handle opens it: the process that left it may have crashed mid-write.
+        if let Some(path) = self.graph_db_path() {
+            if let Err(error) = super::snapshot::recover_hot_journal(&path) {
+                self.record_load_failure(
+                    is_reload,
+                    LoadFailure::new(
+                        LoadFailureReason::OperationError,
+                        format!(
+                            "the graph file's interrupted journal could not be recovered: {error}"
+                        ),
+                    ),
+                );
+                return;
+            }
         }
         // The generation this build will carry. Only one load runs at a time (the
         // initial load, then at most one reload via the claim guard), so peeking the
@@ -371,6 +386,7 @@ impl GraphState {
         match outcome {
             Ok(Ok(built)) => {
                 let PublishedBuild {
+                    generation,
                     files,
                     fp_pre,
                     force_stale,
@@ -708,10 +724,24 @@ impl GraphState {
                 )
                 .map_err(LoadFailure::operation)?;
             }
-            publish_or_discard(self, &tmp_path, &db_path, base_publication.as_deref())?;
-            let prepared = self
-                .prepare_snapshot_pool(generation, fp_pre, force_stale)
-                .map_err(prepare_failure)?;
+            let pause = match publish_or_discard(
+                self,
+                &tmp_path,
+                &db_path,
+                base_publication.as_deref(),
+                false,
+            )? {
+                Replaced::Done(pause) => pause,
+                Replaced::ReadersBusy => {
+                    return Err(LoadFailure::new(
+                        LoadFailureReason::TransientRefusal,
+                        "a graph read outlasted the installation wait; the patch is prepared \
+                         again on the next reload",
+                    ))
+                }
+            };
+            let prepared =
+                open_installed_replacement(self, generation, fp_pre, force_stale, &db_path, pause)?;
             // A point patch re-projected exactly what it was given. It proves nothing about
             // absence and nothing about the rest of the tree: it never looked there.
             let rewritten: std::collections::HashSet<bsl_search::FileKey> = project
@@ -1177,11 +1207,214 @@ fn build_and_publish_scanned_inner(
             .map_err(|error| LoadFailure::new(LoadFailureReason::Superseded, error.to_string()))?;
         publication_base(&out_path)?
     };
-    let tmp_path = graph_build_path(&out_path);
-    let _tmp_cleanup = TempBuildFile(tmp_path.clone());
+    let candidate = graph.cache().expect("workspace graph has cache layout").graph_candidate_path();
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(LoadFailure::operation)?;
     }
+    // A fused build streams the search chunks from its own parse pass, so only a build that
+    // streams nothing may take a candidate prepared earlier instead of building.
+    let reusable = match inspect_candidate(&candidate, base.as_deref(), fp_pre) {
+        CandidateState::Blocked(reason) => {
+            tracing::error!(path = %candidate.display(), "{reason}");
+            return Err(LoadFailure::new(LoadFailureReason::OperationError, reason));
+        }
+        CandidateState::Reusable { modules, revision } if chunk_sink.is_none() => {
+            Some((modules, revision))
+        }
+        CandidateState::Reusable { .. } | CandidateState::Stale | CandidateState::Absent => None,
+    };
+    let (modules, force_stale, generation) = match reusable {
+        Some((modules, revision)) => {
+            tracing::info!(
+                path = %candidate.display(),
+                "installing the replacement prepared earlier from the same publication and \
+                 sources; not building it again"
+            );
+            (modules, false, revision)
+        }
+        None => {
+            let (modules, force_stale) = build_candidate(
+                workspace_root,
+                project,
+                pre,
+                generation,
+                graph,
+                chunk_sink,
+                &candidate,
+                base.as_deref(),
+                fp_pre,
+            )?;
+            (modules, force_stale, generation)
+        }
+    };
+    let mut delays =
+        INSTALL_RETRY_DELAYS.iter().copied().chain(std::iter::repeat(INSTALL_RETRY_LAST));
+    let pause = loop {
+        match publish_or_discard(graph, &candidate, &out_path, base.as_deref(), true)? {
+            Replaced::Done(pause) => break pause,
+            Replaced::ReadersBusy => {
+                let delay = delays.next().expect("the retry schedule never ends");
+                tracing::info!(
+                    retry_in_secs = delay.as_secs(),
+                    "a graph read outlasted the installation wait; the published graph serves \
+                     on, and the prepared replacement is installed again without rebuilding it"
+                );
+                if graph.stop.sleep(delay) || graph.lease_is_terminal() {
+                    return Err(LoadFailure::new(
+                        LoadFailureReason::TransientRefusal,
+                        "the prepared graph replacement was not installed before this daemon left",
+                    ));
+                }
+            }
+        }
+    };
+    let _ = std::fs::remove_file(candidate_marker_path(&candidate));
+    let prepared =
+        open_installed_replacement(graph, generation, fp_pre, force_stale, &out_path, pause)?;
+    let summary = GraphBuildModules { modules };
+    // Borrowed from the walk, not cloned out of it: what the coverage needs is membership, and
+    // the universe already holds every address it listed.
+    let enumerated: std::collections::HashSet<bsl_search::FileKey> = project
+        .search_roots
+        .as_ref()
+        .map(|roots| pre.stats.iter().filter_map(|stat| stat.key(roots)).collect())
+        .unwrap_or_default();
+    let recovery = graph.recovery_proof_with_roots(
+        generation,
+        prepared.declared_unread(),
+        crate::graph::snapshot::RecoveryCoverage::WalkedKeys {
+            scope: crate::graph::snapshot::recovery_scope_of(project),
+            enumerated: &enumerated,
+            complete: pre.clean(),
+            straddled: force_stale,
+        },
+        project.search_roots.as_ref(),
+    );
+    Ok(PublishedBuild {
+        generation,
+        files: summary.modules,
+        fp_pre,
+        force_stale,
+        scan_roots: project.scan_roots.clone(),
+        physical_topology: super::scan::topology_u64(&project.configs),
+        search_roots: project.search_roots.clone(),
+        prepared,
+        recovery,
+    })
+}
+
+/// The module count a full publication covers, whether it was built now or earlier.
+struct GraphBuildModules {
+    modules: usize,
+}
+
+/// How long an installation waits for the reads in flight before it lets the old graph serve on.
+const INSTALL_READERS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// When a replacement whose installation found readers is tried again, without being rebuilt.
+const INSTALL_RETRY_DELAYS: [std::time::Duration; 4] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+];
+const INSTALL_RETRY_LAST: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Who a replacement next to the graph belongs to and what it was prepared from, written before
+/// the replacement itself: a candidate without one is not this program's to overwrite.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CandidateMarker {
+    format: u32,
+    base: Option<String>,
+}
+
+fn candidate_marker_path(candidate: &Path) -> PathBuf {
+    candidate.with_extension("db.owner")
+}
+
+/// What a replacement found next to the graph may be used for.
+enum CandidateState {
+    Absent,
+    /// This program's own, complete, prepared from the publication and sources a build would
+    /// start from now: installed instead of rebuilt.
+    Reusable {
+        modules: usize,
+        revision: u64,
+    },
+    /// This program's own, but prepared from another publication, other sources or never
+    /// finished: the next build writes over it.
+    Stale,
+    /// Not provably this program's, or of a format it does not write: nothing is built over it.
+    Blocked(String),
+}
+
+fn inspect_candidate(
+    candidate: &Path,
+    base: Option<&str>,
+    fp_now: crate::graph_db::GraphFp,
+) -> CandidateState {
+    if !candidate.exists() {
+        return CandidateState::Absent;
+    }
+    let marker = std::fs::read_to_string(candidate_marker_path(candidate))
+        .ok()
+        .and_then(|text| serde_json::from_str::<CandidateMarker>(&text).ok());
+    let Some(marker) = marker else {
+        return CandidateState::Blocked(format!(
+            "a graph replacement of unknown origin is at {}; it is neither used nor overwritten — \
+             move it away to let the graph be built",
+            candidate.display()
+        ));
+    };
+    let newer = super::snapshot::on_disk_identity(candidate)
+        .ok()
+        .flatten()
+        .and_then(|identity| identity.schema_version)
+        .is_some_and(|version| version > crate::graph_db::SCHEMA_VERSION);
+    if marker.format > crate::graph_db::SCHEMA_VERSION || newer {
+        return CandidateState::Blocked(format!(
+            "the graph replacement at {} was prepared by a newer program; it is neither used nor \
+             overwritten",
+            candidate.display()
+        ));
+    }
+    if marker.format != crate::graph_db::SCHEMA_VERSION || marker.base.as_deref() != base {
+        return CandidateState::Stale;
+    }
+    match GraphDb::open(candidate).and_then(|db| {
+        let (revision, fingerprint, force_stale) = db.freshness_token()?;
+        Ok((revision, fingerprint, force_stale, db.files()?))
+    }) {
+        Ok((revision, fingerprint, false, modules)) if fingerprint == fp_now => {
+            CandidateState::Reusable { modules, revision }
+        }
+        _ => CandidateState::Stale,
+    }
+}
+
+/// Build the replacement into `candidate`, stamp what the post-scan found, and make it
+/// ready to install — checked, closed and on disk — before anything waits on it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the build's own inputs, handed through from the one caller that prepares them"
+)]
+fn build_candidate(
+    workspace_root: &Path,
+    project: &crate::graph::ProjectSnapshot,
+    pre: &crate::graph::universe::ScannedUniverse,
+    generation: u64,
+    graph: &GraphState,
+    chunk_sink: Option<&mut dyn ide::FusedChunkSink>,
+    candidate: &Path,
+    base: Option<&str>,
+    fp_pre: crate::graph_db::GraphFp,
+) -> Result<(usize, bool), LoadFailure> {
+    let marker =
+        CandidateMarker { format: crate::graph_db::SCHEMA_VERSION, base: base.map(str::to_owned) };
+    std::fs::write(
+        candidate_marker_path(candidate),
+        serde_json::to_string(&marker).map_err(LoadFailure::operation)?,
+    )
+    .map_err(LoadFailure::operation)?;
     let built_at = chrono::Utc::now().to_rfc3339();
     let meta = crate::graph_db::GraphMeta {
         revision: generation,
@@ -1201,13 +1434,13 @@ fn build_and_publish_scanned_inner(
         Some(sink) => crate::graph_db::build_graph_database_fused(
             project,
             pre,
-            &tmp_path,
+            candidate,
             GRAPH_BUILD_BATCH,
             &meta,
             sink,
         ),
         None => {
-            crate::graph_db::build_graph_database(project, pre, &tmp_path, GRAPH_BUILD_BATCH, &meta)
+            crate::graph_db::build_graph_database(project, pre, candidate, GRAPH_BUILD_BATCH, &meta)
         }
     } {
         Ok(summary) => summary,
@@ -1237,8 +1470,8 @@ fn build_and_publish_scanned_inner(
     let force_stale = publish_force_stale(fp_pre, fp_post, pre.clean(), post.clean())
         || hub_moved
         || hub_unhealthy;
-    let stamped = (|| -> Result<(), LoadFailure> {
-        let conn = rusqlite::Connection::open(&tmp_path).map_err(LoadFailure::operation)?;
+    {
+        let conn = rusqlite::Connection::open(candidate).map_err(LoadFailure::operation)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_stale', ?1)",
             rusqlite::params![if force_stale { "1" } else { "0" }],
@@ -1249,41 +1482,54 @@ fn build_and_publish_scanned_inner(
             rusqlite::params![summary.modules.to_string()],
         )
         .map_err(LoadFailure::operation)?;
-        Ok(())
-    })();
-    stamped?;
-    publish_or_discard(graph, &tmp_path, &out_path, base.as_deref())?;
-    let prepared =
-        graph.prepare_snapshot_pool(generation, fp_pre, force_stale).map_err(prepare_failure)?;
-    // Borrowed from the walk, not cloned out of it: what the coverage needs is membership, and
-    // the universe already holds every address it listed.
-    let enumerated: std::collections::HashSet<bsl_search::FileKey> = project
-        .search_roots
-        .as_ref()
-        .map(|roots| pre.stats.iter().filter_map(|stat| stat.key(roots)).collect())
-        .unwrap_or_default();
-    let recovery = graph.recovery_proof_with_roots(
-        generation,
-        prepared.declared_unread(),
-        crate::graph::snapshot::RecoveryCoverage::WalkedKeys {
-            scope: crate::graph::snapshot::recovery_scope_of(project),
-            enumerated: &enumerated,
-            complete: pre.clean(),
-            straddled: force_stale,
-        },
-        project.search_roots.as_ref(),
-    );
-    Ok(PublishedBuild {
-        files: summary.modules,
-        fp_pre,
-        force_stale,
-        scan_roots: project.scan_roots.clone(),
-        physical_topology: super::scan::topology_u64(&project.configs),
-        search_roots: project.search_roots.clone(),
-        prepared,
-        recovery,
-    })
+    }
+    // Checked, closed and synced here, before any read is held back for it.
+    GraphDb::open(candidate).and_then(|db| db.quick_check()).map_err(|error| {
+        LoadFailure::operation(format!("the built graph failed its check: {error}"))
+    })?;
+    let file = std::fs::File::open(candidate).map_err(LoadFailure::operation)?;
+    file.sync_all().map_err(LoadFailure::operation)?;
+    crate::graph_db::record_candidate(file.metadata().map_err(LoadFailure::operation)?.len());
+    Ok((summary.modules, force_stale))
 }
+
+/// Open the replacement just renamed in and check it is the publication that was built. A
+/// replacement already in place is not replaced again: an open that fails is retried, and one
+/// that keeps failing leaves the graph unavailable rather than served from a guess.
+fn open_installed_replacement(
+    graph: &GraphState,
+    generation: u64,
+    fp_pre: crate::graph_db::GraphFp,
+    force_stale: bool,
+    out_path: &Path,
+    pause: super::snapshot::ReplacementPause,
+) -> Result<PreparedSnapshotPool, LoadFailure> {
+    let mut last = None;
+    for attempt in 0..OPEN_ATTEMPTS {
+        if attempt > 0 && graph.stop.sleep(std::time::Duration::from_secs(1)) {
+            break;
+        }
+        match graph.prepare_snapshot_pool(generation, fp_pre, force_stale) {
+            Ok(mut prepared) => {
+                prepared.hold_reads(pause);
+                return Ok(prepared);
+            }
+            Err(error) => last = Some(prepare_failure(error)),
+        }
+    }
+    let failure = last.unwrap_or_else(|| LoadFailure::operation("the daemon is stopping"));
+    graph.store.mark_unusable(format!(
+        "graph unavailable: the replacement renamed into {} could not be opened ({}); it is \
+         rebuilt, not served from a guess",
+        out_path.display(),
+        failure.message
+    ));
+    Err(failure)
+}
+
+/// How many times a replacement already renamed into place is opened before the graph is
+/// declared unavailable.
+const OPEN_ATTEMPTS: usize = 3;
 
 /// Whether a finished build must be marked `force_stale` — never served as a
 /// coherent snapshot. Two ways to lose the claim: the tree moved while the build
@@ -1314,23 +1560,65 @@ fn cache_is_reusable(
     !force_stale && scan_clean && stored == fp_now
 }
 
-/// Rename a finished build into the shared path, or throw it away.
+/// What an attempt to rename a finished build over the shared database came to.
+enum Replaced {
+    /// The file is in place. Reads stay held until its pool is installed.
+    Done(super::snapshot::ReplacementPause),
+    /// A read outlasted [`INSTALL_READERS_WAIT`]: nothing was renamed, and the old file serves on.
+    ReadersBusy,
+}
+
+impl std::fmt::Debug for Replaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Done(_) => "Done",
+            Self::ReadersBusy => "ReadersBusy",
+        })
+    }
+}
+
+/// Rename a finished build into the shared path, or refuse to.
 ///
 /// A build takes minutes, and a newer daemon generation can claim the workspace's derived
 /// caches at any point during one (see [`crate::workspace_lease`]). The rename runs with
 /// ownership HELD rather than merely checked: a claim landing between a check and the rename
-/// would let this build clobber what the new owner just published, and "we owned it a moment
-/// ago" is exactly the guarantee a minutes-long build cannot rely on. A rename that cannot go
-/// ahead discards the build, temp file and all, so nothing is left behind.
+/// would let this build clobber what the new owner just published.
 ///
-/// The caller decides whether a classified refusal is retryable. This function owns only the
-/// fenced rename and cleanup; it never mutates the load lifecycle as a side effect.
+/// No handle of this process is open on the shared file when it is replaced: new reads are held
+/// back, the reads in flight get [`INSTALL_READERS_WAIT`] to finish, and the idle handles close.
+/// A read that outlasts the wait keeps the old file serving, and nothing is renamed. A rename
+/// that fails is not taken for "nothing happened": the file in place is identified, and one
+/// that is neither the replacement nor what it replaces leaves the graph unavailable.
+///
+/// A refused build is removed, unless `keep` — the prepared replacement of a full build, which
+/// is kept to be installed again or proven stale.
 fn publish_or_discard(
     graph: &GraphState,
     tmp_path: &Path,
     out_path: &Path,
     base: Option<&str>,
-) -> Result<(), LoadFailure> {
+    keep: bool,
+) -> Result<Replaced, LoadFailure> {
+    let discard = || {
+        if !keep {
+            let _ = std::fs::remove_file(tmp_path);
+        }
+    };
+    if graph.lease.is_superseded() || graph.lease.is_released() {
+        discard();
+        return Err(lost_workspace_failure(graph));
+    }
+    let Some(pause) = graph.store.pause_for_replacement(INSTALL_READERS_WAIT) else {
+        if graph.lease.is_superseded() || graph.lease.is_released() {
+            discard();
+            return Err(lost_workspace_failure(graph));
+        }
+        return Ok(Replaced::ReadersBusy);
+    };
+    let replacement = super::snapshot::on_disk_identity(tmp_path)
+        .ok()
+        .flatten()
+        .and_then(|identity| identity.publication_id);
     let outcome = graph.lease.publish_short(&mut (), |_| {
         // Re-read under the fence: the database this build replaces must still be the one it
         // was prepared from, and a newer format is not replaced at all.
@@ -1341,25 +1629,29 @@ fn publish_or_discard(
         if current.and_then(|identity| identity.publication_id).as_deref() != base {
             return Err(PublishRefusal::StaleBase);
         }
+        // What an interrupted writer left is finished before the file is replaced, never carried
+        // over to the new one or deleted by hand.
+        super::snapshot::recover_hot_journal(out_path)
+            .map_err(|error| PublishRefusal::Io(std::io::Error::other(error)))?;
         std::fs::rename(tmp_path, out_path).map_err(PublishRefusal::Io)
     });
     match outcome {
-        LeaseOperationOutcome::Applied(()) => Ok(()),
+        LeaseOperationOutcome::Applied(()) => Ok(Replaced::Done(pause)),
         LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
             PublishRefusal::NewerFormat(version),
         )) => {
-            let _ = std::fs::remove_file(tmp_path);
+            discard();
             Err(newer_format_failure(out_path, version))
         }
         LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
             PublishRefusal::StaleBase,
         )) => {
-            let _ = std::fs::remove_file(tmp_path);
+            discard();
             Err(LoadFailure::new(
                 LoadFailureReason::TransientRefusal,
                 format!(
                     "graph database {} was replaced while this build was prepared from an \
-                     earlier one; the build was discarded and is prepared again",
+                     earlier one; the build is prepared again",
                     out_path.display()
                 ),
             ))
@@ -1374,7 +1666,23 @@ fn publish_or_discard(
                 error.kind(),
                 error.raw_os_error()
             );
-            let _ = std::fs::remove_file(tmp_path);
+            let in_place = super::snapshot::on_disk_identity(out_path)
+                .ok()
+                .flatten()
+                .and_then(|identity| identity.publication_id);
+            if replacement.is_some() && in_place == replacement {
+                tracing::warn!("{message}; the replacement is in place all the same");
+                return Ok(Replaced::Done(pause));
+            }
+            if in_place.as_deref() == base {
+                // Confirmed untouched: the old file serves on once the pause is let go.
+                discard();
+                return Err(LoadFailure::new(LoadFailureReason::OperationError, message));
+            }
+            graph.store.mark_unusable(format!(
+                "graph unavailable: after a failed replacement ({message}) the file in place is \
+                 neither the publication it replaced nor the replacement"
+            ));
             Err(LoadFailure::new(LoadFailureReason::OperationError, message))
         }
         LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
@@ -1385,31 +1693,36 @@ fn publish_or_discard(
                 error.kind(),
                 error.raw_os_error()
             );
-            let _ = std::fs::remove_file(tmp_path);
+            discard();
             Err(LoadFailure::new(LoadFailureReason::OperationError, message))
         }
         LeaseOperationOutcome::TransientRefusal => {
-            let _ = std::fs::remove_file(tmp_path);
+            discard();
             Err(LoadFailure::new(
                 LoadFailureReason::TransientRefusal,
                 "this daemon could not establish ownership of the workspace's derived caches \
-                 when the graph build finished; the build was discarded instead of published",
+                 when the graph build finished; the build was not published",
             ))
         }
-        LeaseOperationOutcome::Superseded => {
-            let _ = std::fs::remove_file(tmp_path);
-            Err(LoadFailure::new(
-                LoadFailureReason::Superseded,
-                "workspace cache ownership was superseded before the graph build could be published",
-            ))
+        LeaseOperationOutcome::Superseded | LeaseOperationOutcome::Released => {
+            discard();
+            Err(lost_workspace_failure(graph))
         }
-        LeaseOperationOutcome::Released => {
-            let _ = std::fs::remove_file(tmp_path);
-            Err(LoadFailure::new(
-                LoadFailureReason::Released,
-                "workspace cache ownership was released before the graph build could be published",
-            ))
-        }
+    }
+}
+
+/// The refusal of a publication by a process whose workspace was taken over or handed back.
+fn lost_workspace_failure(graph: &GraphState) -> LoadFailure {
+    if graph.lease.is_released() {
+        LoadFailure::new(
+            LoadFailureReason::Released,
+            "workspace cache ownership was released before the graph build could be published",
+        )
+    } else {
+        LoadFailure::new(
+            LoadFailureReason::Superseded,
+            "workspace cache ownership was superseded before the graph build could be published",
+        )
     }
 }
 
@@ -1462,6 +1775,9 @@ fn newer_format_failure(out_path: &Path, version: u32) -> LoadFailure {
 /// was published under, and the scan roots of the snapshot that built it (for the
 /// post-publish hub re-arm).
 struct PublishedBuild {
+    /// The revision the publication carries: the one this build was given, or that of a
+    /// replacement prepared earlier and installed as it was built.
+    generation: u64,
     files: usize,
     fp_pre: crate::graph_db::GraphFp,
     force_stale: bool,
@@ -1757,6 +2073,198 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
     use walkdir::WalkDir;
 
+    /// A copy of the published graph restamped as the next publication, for a stand that
+    /// installs a replacement without building one.
+    fn next_publication_beside(path: &Path) -> (PathBuf, crate::graph_db::GraphFp) {
+        let candidate = path.with_file_name("bsl-graph.pending.db");
+        fs::copy(path, &candidate).unwrap();
+        let conn = Connection::open(&candidate).unwrap();
+        conn.execute_batch(
+            "UPDATE meta SET value = '8' WHERE key = 'revision';
+             UPDATE meta SET value = 'test-2' WHERE key = 'publication_id';",
+        )
+        .unwrap();
+        drop(conn);
+        let fingerprint = GraphDb::open(&candidate).unwrap().freshness_token().unwrap().1;
+        (candidate, fingerprint)
+    }
+
+    /// A replacement waits for the read in flight: that read keeps answering its own
+    /// generation, new reads are held back meanwhile, and once it returns the file is replaced
+    /// and the next generation is served — from the file itself, with no copy for the reads.
+    #[test]
+    fn a_replacement_waits_for_a_held_read_then_serves_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let path = graph_db_path(root);
+        let (candidate, fingerprint) = next_publication_beside(&path);
+
+        let held = graph.snapshot().expect("a read in flight");
+        let publisher = {
+            let (graph, candidate, path) = (graph.clone(), candidate.clone(), path.clone());
+            std::thread::spawn(move || {
+                publish_or_discard(&graph, &candidate, &path, Some("test-1"), true)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!publisher.is_finished(), "the replacement waits for the read in flight");
+        assert_eq!(
+            graph.store.read(None, Duration::from_millis(50), |_| ()),
+            Err(crate::graph::GraphReadError::Busy),
+            "a new read is held back meanwhile"
+        );
+        assert_eq!(held.graph.freshness_token().unwrap().0, 7, "the old read stays whole");
+        drop(held);
+
+        let Replaced::Done(pause) = publisher.join().unwrap().unwrap() else {
+            panic!("the returned read let the replacement through");
+        };
+        let prepared =
+            open_installed_replacement(&graph, 8, fingerprint, false, &path, pause).unwrap();
+        assert!(matches!(
+            graph.install_prepared_snapshot(
+                prepared,
+                Published {
+                    generation: 8,
+                    fingerprint,
+                    stale: false,
+                    reload: ReloadState::Idle,
+                    force_stale: false,
+                    search_roots: None,
+                    observed_through: Some(0),
+                },
+                GraphStatus::Ready { files: 0 },
+                None,
+                None,
+                crate::graph::debt::RecoveryPublicationProof::without_coverage(8),
+            ),
+            LeaseOperationOutcome::Applied(())
+        ));
+        assert_eq!(graph.read(|snapshot| snapshot.generation()), Ok(8));
+        assert!(!candidate.exists(), "the replacement was renamed, not copied");
+    }
+
+    /// A read that outlasts the installation wait keeps the old graph serving: nothing is
+    /// renamed, the prepared replacement stays for the next attempt, and lending resumes.
+    #[test]
+    fn a_read_outlasting_the_wait_keeps_the_old_graph_and_the_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let path = graph_db_path(root);
+        let (candidate, _) = next_publication_beside(&path);
+
+        let held = graph.snapshot().expect("a read that will not finish in time");
+        let started = std::time::Instant::now();
+        let outcome = publish_or_discard(&graph, &candidate, &path, Some("test-1"), true).unwrap();
+        assert!(matches!(outcome, Replaced::ReadersBusy), "{outcome:?}");
+        assert!(started.elapsed() >= INSTALL_READERS_WAIT, "it waited out the whole bound");
+        assert!(candidate.exists(), "the replacement is kept, not rebuilt later");
+        assert_eq!(meta_string(&path, "revision"), "7", "nothing was renamed");
+        drop(held);
+        assert_eq!(graph.read(|snapshot| snapshot.generation()), Ok(7), "the old graph serves on");
+    }
+
+    /// A full build writes one replacement next to the graph and renames it in: it is counted
+    /// as written, nothing is copied for it, and neither it nor its marker nor a temporary
+    /// file is left behind.
+    #[test]
+    fn a_full_build_writes_one_counted_replacement_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let before = crate::graph_db::copy_audit();
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let after = crate::graph_db::copy_audit();
+        assert!(after.candidates > before.candidates, "the replacement was counted");
+        let size = fs::metadata(graph_db_path(root)).unwrap().len();
+        assert!(after.candidate_bytes >= before.candidate_bytes + size);
+        let leftovers: Vec<_> = fs::read_dir(graph_db_path(root).parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("pending") || name.contains(".building."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Put the seeded graph where a build would have left its replacement before installing
+    /// it, with a marker naming what it was prepared from.
+    fn leave_a_candidate(root: &Path, marker: Option<&str>) -> PathBuf {
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let path = graph_db_path(root);
+        let candidate = path.with_file_name("bsl-graph.pending.db");
+        fs::rename(&path, &candidate).unwrap();
+        if let Some(marker) = marker {
+            fs::write(candidate_marker_path(&candidate), marker).unwrap();
+        }
+        candidate
+    }
+
+    /// A replacement prepared from the same publication and sources, left when the process
+    /// stopped before installing it, is installed instead of built again.
+    #[test]
+    fn a_replacement_left_before_installation_is_installed_without_rebuilding() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let format = crate::graph_db::SCHEMA_VERSION;
+        leave_a_candidate(root, Some(&format!(r#"{{"format":{format},"base":null}}"#)));
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0, "nothing was built");
+        assert_eq!(graph.read(|snapshot| snapshot.generation()), Ok(7), "the one left is served");
+    }
+
+    /// A replacement of this program's, prepared from another publication, is written over by
+    /// the next build rather than installed.
+    #[test]
+    fn a_stale_replacement_of_this_program_is_rebuilt_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let format = crate::graph_db::SCHEMA_VERSION;
+        leave_a_candidate(root, Some(&format!(r#"{{"format":{format},"base":"elsewhere-1"}}"#)));
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1, "it was built again");
+    }
+
+    /// A file at the replacement's place that cannot be shown to be this program's is neither
+    /// used nor written over: the build stops and says where it is.
+    #[test]
+    fn a_replacement_of_unknown_origin_blocks_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let candidate = leave_a_candidate(root, None);
+        let before = fs::read(&candidate).unwrap();
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_until(&graph, "the build to be refused", || {
+            matches!(graph.status(), GraphStatus::Failed(_))
+        });
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(message) if message.contains("unknown origin")),
+            "{:?}",
+            graph.status()
+        );
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&candidate).unwrap(), before, "it is left as it was");
+    }
+
     /// A database of a newer format belongs to a newer program: this one neither reads it, nor
     /// spends a build on replacing it, nor renames anything over it.
     #[test]
@@ -1790,7 +2298,7 @@ mod tests {
 
         let temp = graph_build_path(&path);
         fs::write(&temp, b"candidate").unwrap();
-        let error = publish_or_discard(&graph, &temp, &path, None).unwrap_err();
+        let error = publish_or_discard(&graph, &temp, &path, None, false).unwrap_err();
         assert_eq!(error.reason, LoadFailureReason::OperationError);
         assert!(!temp.exists(), "the refused build is discarded");
         assert_eq!(fs::read(&path).unwrap(), before, "and nothing is renamed over it");
@@ -1810,13 +2318,13 @@ mod tests {
         let temp = graph_build_path(&path);
 
         fs::write(&temp, b"candidate").unwrap();
-        let error = publish_or_discard(&graph, &temp, &path, Some("another-1")).unwrap_err();
+        let error = publish_or_discard(&graph, &temp, &path, Some("another-1"), false).unwrap_err();
         assert_eq!(error.reason, LoadFailureReason::TransientRefusal, "{}", error.message);
         assert!(!temp.exists());
         assert_eq!(fs::read(&path).unwrap(), before);
 
         fs::write(&temp, b"candidate").unwrap();
-        publish_or_discard(&graph, &temp, &path, Some("test-1")).unwrap();
+        publish_or_discard(&graph, &temp, &path, Some("test-1"), false).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"candidate", "its own base is replaced");
     }
 
@@ -2212,7 +2720,7 @@ mod tests {
         assert!(old.is_superseded());
         newer.release();
 
-        publish_or_discard(&graph, &temp, &canonical, None).unwrap_err();
+        publish_or_discard(&graph, &temp, &canonical, None, false).unwrap_err();
         assert_eq!(fs::read(&canonical).unwrap(), b"new-owner-graph");
         assert!(!temp.exists(), "normal refusal removes only this build's temp file");
         assert_eq!(fs::read(&other_temp).unwrap(), b"other-build-in-progress");
@@ -2279,7 +2787,7 @@ mod tests {
         fs::write(&temp, b"candidate").unwrap();
 
         let held = lease.hold_file_lock_for_test();
-        let error = publish_or_discard(&graph, &temp, &canonical, None).unwrap_err();
+        let error = publish_or_discard(&graph, &temp, &canonical, None, false).unwrap_err();
         drop(held);
 
         assert_eq!(error.reason, LoadFailureReason::TransientRefusal);
@@ -2319,6 +2827,7 @@ mod tests {
             &released_temp,
             &released_cache.root().join("released.db"),
             None,
+            false,
         )
         .unwrap_err();
         assert_eq!(released_error.reason, LoadFailureReason::Released);
@@ -2343,6 +2852,7 @@ mod tests {
             &superseded_temp,
             &superseded_cache.root().join("superseded.db"),
             None,
+            false,
         )
         .unwrap_err();
         assert_eq!(superseded_error.reason, LoadFailureReason::Superseded);
@@ -2364,8 +2874,9 @@ mod tests {
         let prepared = cache.root().join("prepared.building");
         fs::write(&prepared, b"candidate").unwrap();
         lease.fail_next_restamp_for_test();
-        let error = publish_or_discard(&graph, &prepared, &cache.root().join("output.db"), None)
-            .expect_err("a lease restamp failure is a real operation error");
+        let error =
+            publish_or_discard(&graph, &prepared, &cache.root().join("output.db"), None, false)
+                .expect_err("a lease restamp failure is a real operation error");
         assert_eq!(error.reason, LoadFailureReason::OperationError);
 
         let held = lease.hold_file_lock_for_test();
@@ -2510,8 +3021,8 @@ mod tests {
         ));
         assert_eq!(
             graph.snapshot().map(|snapshot| snapshot.generation),
-            Some(1),
-            "failed reload keeps serving its old pool"
+            None,
+            "the replaced file is not served under the generation it no longer holds"
         );
     }
 
@@ -2533,7 +3044,7 @@ mod tests {
     }
 
     #[test]
-    fn full_reload_changed_install_keeps_the_old_snapshot_and_retries() {
+    fn full_reload_changed_install_serves_no_stale_generation_and_retries() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
@@ -2545,7 +3056,11 @@ mod tests {
 
         graph.run_load(true);
 
-        assert_eq!(graph.snapshot().map(|snapshot| snapshot.generation), Some(1));
+        assert_eq!(
+            graph.snapshot().map(|snapshot| snapshot.generation),
+            None,
+            "the replaced file is not served under the generation it no longer holds"
+        );
         assert!(graph.owes_failed());
         assert!(matches!(
             lock_recover(&graph.inner).published.as_ref().unwrap().reload,
@@ -7211,6 +7726,8 @@ mod tests {
         );
         let drifted = graph.freshness(&snap1);
         assert!(drifted.stale, "removal drifts the workspace");
+        // Returned, so the reload's installation need not wait for it.
+        drop(snap1);
 
         // The caller-delta reload publishes generation 2 with the method gone.
         wait_until_within(

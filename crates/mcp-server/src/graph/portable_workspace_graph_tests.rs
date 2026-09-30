@@ -229,11 +229,11 @@ fn seed_ready_search(cache: &WorkspaceCacheLayout, workspace_root: &Path, vector
         .expect("seed ready server search vector");
 }
 
-/// Exercise the exact replacement used by the publisher with a closed-connection control first,
-/// then keep the old detached snapshot open. The old generation must remain readable while the
-/// canonical path is replaced by generation 8.
+/// The replacement the publisher makes is a plain rename, which goes through once no handle is
+/// open on the file. The negative control opens the file past the graph store, as the old
+/// readers did: on Windows, where SQLite shares no delete access, that handle blocks the rename.
 #[test]
-fn replacing_graph_db_preserves_the_old_snapshot_generation() {
+fn replacing_graph_db_needs_every_handle_closed_first() {
     let dir = tempfile::tempdir().expect("graph replacement probe tempdir");
     let root = dir.path();
     sample_workspace(root);
@@ -247,55 +247,32 @@ fn replacing_graph_db_preserves_the_old_snapshot_generation() {
     seed_cache(root, fingerprint);
 
     let canonical = WorkspaceCacheLayout::for_workspace(root).graph_db_path();
-    let control = canonical.with_file_name("bsl-graph.db.control");
-    let control_replacement = canonical.with_file_name("bsl-graph.db.control.replacement");
-    fs::copy(&canonical, &control).expect("copy closed control graph");
-    fs::copy(&canonical, &control_replacement).expect("copy closed control replacement");
-    {
-        let connection = rusqlite::Connection::open(&control_replacement)
-            .expect("open closed control replacement");
-        connection
+    let stamped_copy = |name: &str| {
+        let replacement = canonical.with_file_name(name);
+        fs::copy(&canonical, &replacement).expect("copy replacement graph");
+        rusqlite::Connection::open(&replacement)
+            .expect("open replacement graph")
             .execute("UPDATE meta SET value = '8' WHERE key = 'revision'", [])
-            .expect("stamp closed control replacement");
-    }
-    fs::rename(&control_replacement, &control).unwrap_or_else(|error| {
+            .expect("stamp replacement graph");
+        replacement
+    };
+
+    let bypass = crate::graph_query::GraphDb::open(&canonical).expect("open past the store");
+    let blocked = fs::rename(stamped_copy("bsl-graph.db.blocked"), &canonical);
+    #[cfg(windows)]
+    assert!(blocked.is_err(), "an open SQLite handle keeps Windows from replacing the file");
+    #[cfg(not(windows))]
+    assert!(blocked.is_ok());
+    assert_eq!(bypass.freshness_token().expect("read the bypassing handle").0, 7);
+    drop(bypass);
+
+    fs::rename(stamped_copy("bsl-graph.db.closed"), &canonical).unwrap_or_else(|error| {
         panic!(
-            "closed GraphDb replacement {} -> {} failed: kind={:?}, raw_os_error={:?}: {error}",
-            control_replacement.display(),
-            control.display(),
+            "replacing the graph with no handle open failed: kind={:?}, raw_os_error={:?}: {error}",
             error.kind(),
             error.raw_os_error()
         )
     });
-    let control_db =
-        crate::graph_query::GraphDb::open(&control).expect("open closed control replacement");
-    assert_eq!(control_db.freshness_token().expect("read closed control token").0, 8);
-    drop(control_db);
-
-    let old = crate::graph_query::GraphDb::open_snapshot(&canonical)
-        .expect("open old detached graph snapshot");
-    let old_token = old.freshness_token().expect("read old graph token");
-    let replacement = canonical.with_file_name("bsl-graph.db.open.replacement");
-    fs::copy(&canonical, &replacement).expect("copy open-handle replacement graph");
-    {
-        let connection =
-            rusqlite::Connection::open(&replacement).expect("open open-handle replacement graph");
-        connection
-            .execute("UPDATE meta SET value = '8' WHERE key = 'revision'", [])
-            .expect("stamp open-handle replacement graph");
-    }
-
-    fs::rename(&replacement, &canonical).unwrap_or_else(|error| {
-        panic!(
-            "replacing the canonical graph while an old snapshot is live {} -> {} failed: kind={:?}, raw_os_error={:?}: {error}",
-            replacement.display(),
-            canonical.display(),
-            error.kind(),
-            error.raw_os_error()
-        )
-    });
-    assert_eq!(old_token.0, 7, "the old handle must retain its generation");
-    assert_eq!(old.freshness_token().expect("read old handle after rename").0, 7);
     let new = crate::graph_query::GraphDb::open(&canonical).expect("open replacement graph");
     assert_eq!(new.freshness_token().expect("read replacement graph token").0, 8);
 }

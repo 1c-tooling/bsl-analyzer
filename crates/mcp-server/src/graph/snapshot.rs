@@ -1,10 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::change_hub::{ChangeEntry, ChangeKind};
-#[cfg(windows)]
-use crate::graph_query::detached_snapshot;
 use crate::graph_query::GraphDb;
 
 #[cfg(test)]
@@ -63,7 +61,6 @@ pub(crate) const BACKGROUND_READ_WAIT: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub(crate) enum BackgroundSnapshotError {
     Changed,
-    Operation(anyhow::Error),
 }
 
 #[cfg(test)]
@@ -72,7 +69,6 @@ type SnapshotOpenHook = Box<dyn FnOnce()>;
 #[derive(Clone, Copy)]
 pub(crate) enum BackgroundSnapshotFailure {
     Changed,
-    Open,
     PrepareSecondChanged,
 }
 #[cfg(test)]
@@ -106,23 +102,66 @@ pub(super) struct PooledSnapshotEntry {
     pub(super) force_stale: bool,
     db: GraphDb,
     unread_files: usize,
-    // SQLite closes before the last owner removes the detached Windows file.
-    #[cfg(windows)]
-    _backing: Arc<tempfile::TempPath>,
+}
+
+impl PooledSnapshotEntry {
+    /// Open a handle on the graph file at `path` and read the token it serves.
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        let db = GraphDb::open(path)?;
+        let (generation, fingerprint, force_stale) = db.freshness_token()?;
+        let unread_files = db.unread_files();
+        Ok(Self { generation, fingerprint, force_stale, db, unread_files })
+    }
+
+    fn token(&self) -> (u64, crate::graph_db::GraphFp, bool) {
+        (self.generation, self.fingerprint, self.force_stale)
+    }
 }
 
 #[derive(Default)]
 pub(super) struct SnapshotPool {
     generation: u64,
+    /// Idle handles of the installed publication.
     entries: Vec<PooledSnapshotEntry>,
     /// The root table of the installed publication, handed to every read of it.
     roots: Option<bsl_search::WorkspaceRoots>,
+    /// The file the installed publication is served from, and the token every handle opened on
+    /// it must read; handles past the first are opened on demand.
+    source: Option<InstalledSource>,
     /// Whether any publication has been installed; before that no read is served.
     installed: bool,
-    /// Whether handles may be lent at all.
+    /// Whether this process's ownership lets it lend handles at all.
     admission: Admission,
-    /// Handles lent and not yet returned, the pooled ones and the background reader's own.
+    /// A replacement is being installed: new reads wait, returned handles close.
+    installing: bool,
+    /// Handles lent and not yet returned.
     lent: usize,
+    /// Handles being opened on demand, outside the lock.
+    opening: usize,
+    /// Uses of the file outside the handles: inspections, preparations, copies.
+    uses: usize,
+    /// Why the installed file cannot be trusted, after a replacement whose outcome could not be
+    /// established; nothing is served until a publication is installed again.
+    unusable: Option<String>,
+}
+
+impl SnapshotPool {
+    fn handles(&self) -> usize {
+        self.entries.len() + self.lent + self.opening
+    }
+
+    fn quiet(&self) -> bool {
+        self.lent == 0 && self.opening == 0 && self.uses == 0
+    }
+}
+
+/// The file an installed publication is served from: a handle opened on demand must find the
+/// same file — not another one renamed to its name — holding the same publication.
+#[derive(Clone)]
+struct InstalledSource {
+    path: PathBuf,
+    identity: GraphPathIdentity,
+    token: (u64, crate::graph_db::GraphFp, bool),
 }
 
 /// Whether the store lends handles, as this process's ownership of the graph file allows.
@@ -144,7 +183,8 @@ pub(crate) enum GraphReadError {
     Unavailable,
     /// The installed publication is not the generation the caller planned against.
     Changed,
-    /// Reads are held back for a moment: the file's owner is being confirmed or awaited.
+    /// Reads are held back for a moment: a replacement is installed, or the file's owner is
+    /// being confirmed or awaited.
     Busy,
     /// Another process owns the graph file now; this one reads it no more.
     OwnerChanged,
@@ -192,6 +232,23 @@ pub(super) fn on_disk_identity(path: &Path) -> std::io::Result<Option<OnDiskIden
     }))
 }
 
+/// Finish what an interrupted writer left in the graph file's rollback journal, before any
+/// read-only handle opens it: a read-only connection cannot roll a hot journal back, and the
+/// journal is never deleted by hand. A connection with write access rolls it back on its first
+/// read and removes it.
+pub(super) fn recover_hot_journal(path: &Path) -> anyhow::Result<()> {
+    let mut journal = path.as_os_str().to_owned();
+    journal.push("-journal");
+    let hot = std::fs::metadata(Path::new(&journal)).is_ok_and(|metadata| metadata.len() > 0);
+    if !hot || !path.try_exists()? {
+        return Ok(());
+    }
+    tracing::warn!(path = %path.display(), "graph file has an interrupted journal; recovering it");
+    let conn = rusqlite::Connection::open(path)?;
+    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))?;
+    Ok(())
+}
+
 /// One use of the graph file announced to its [`GraphStore`], ended when dropped.
 pub(crate) struct FileUse {
     store: GraphStore,
@@ -200,8 +257,22 @@ pub(crate) struct FileUse {
 impl Drop for FileUse {
     fn drop(&mut self) {
         let mut pool = lock_recover(&self.store.shared.pool);
-        pool.lent = pool.lent.saturating_sub(1);
+        pool.uses = pool.uses.saturating_sub(1);
         drop(pool);
+        self.store.shared.returned.notify_all();
+    }
+}
+
+/// The graph file emptied of this process's handles for a replacement to be renamed in. New
+/// reads wait while it is held; dropping it without installing a publication lends again from
+/// whatever file is in place.
+pub(super) struct ReplacementPause {
+    store: GraphStore,
+}
+
+impl Drop for ReplacementPause {
+    fn drop(&mut self) {
+        lock_recover(&self.store.shared.pool).installing = false;
         self.store.shared.returned.notify_all();
     }
 }
@@ -210,15 +281,20 @@ impl Drop for FileUse {
 pub(crate) struct GraphStoreStatus {
     /// The installed generation, when one is.
     pub(crate) generation: Option<u64>,
-    /// `force_stale` of an idle handle of that generation; `None` when every handle is out.
+    /// `force_stale` of the installed publication.
     pub(crate) idle_force_stale: Option<bool>,
 }
+
+/// How long a new read waits to be admitted while a replacement is installed or ownership is
+/// confirmed.
+const ADMISSION_WAIT: Duration = Duration::from_secs(2);
 
 /// The one owner of the published graph's read handles.
 ///
 /// Every read of the live graph file borrows a handle here and gives it back when the read
 /// returns — also on an error or an unwind — so the handles open on the file are always the
-/// ones a publication can account for. Nothing outside this type opens the published file.
+/// ones a publication can account for. Handles are opened on the file itself, never on a copy,
+/// at most [`SNAPSHOT_POOL_CAP`] of them and only as reads need them.
 #[derive(Clone, Default)]
 pub(crate) struct GraphStore {
     shared: Arc<StoreShared>,
@@ -227,7 +303,7 @@ pub(crate) struct GraphStore {
 #[derive(Default)]
 struct StoreShared {
     pool: Mutex<SnapshotPool>,
-    /// Signalled whenever a handle returns to the pool or a publication is installed.
+    /// Signalled whenever a handle returns, a use ends, or lending is allowed again.
     returned: Condvar,
 }
 
@@ -236,7 +312,8 @@ impl GraphStore {
     ///
     /// `expected` names the generation the caller planned against; another one is
     /// [`GraphReadError::Changed`]. `wait` bounds how long to wait for a handle while all of
-    /// them are in use. The borrowed view cannot outlive `op`.
+    /// them are in use; a read held back by a replacement or an ownership check waits up to
+    /// [`ADMISSION_WAIT`] in any case. The borrowed view cannot outlive `op`.
     pub(crate) fn read<R>(
         &self,
         expected: Option<u64>,
@@ -247,18 +324,23 @@ impl GraphStore {
         Ok(op(&snapshot))
     }
 
-    /// The installed generation and whether an idle handle of it reads as stale. Never waits:
-    /// a pool busy with a checkout answers `None`.
+    /// The installed generation and whether it reads as stale. Never waits: a pool busy with a
+    /// checkout answers `None`.
     pub(crate) fn status(&self) -> Option<GraphStoreStatus> {
         let pool = self.shared.pool.try_lock().ok()?;
+        let served =
+            pool.installed && pool.unusable.is_none() && pool.admission != Admission::Retired;
         Some(GraphStoreStatus {
-            generation: pool.installed.then_some(pool.generation),
-            idle_force_stale: pool
-                .entries
-                .iter()
-                .find(|entry| entry.generation == pool.generation)
-                .map(|entry| entry.force_stale),
+            generation: served.then_some(pool.generation),
+            idle_force_stale: served
+                .then(|| pool.source.as_ref().map(|source| source.token.2))
+                .flatten(),
         })
+    }
+
+    /// Why the installed file is not served, after a replacement whose outcome is unknown.
+    pub(crate) fn unusable_reason(&self) -> Option<String> {
+        lock_recover(&self.shared.pool).unusable.clone()
     }
 
     pub(super) fn checkout(
@@ -272,29 +354,85 @@ impl GraphStore {
                 hook();
             }
         });
-        let deadline = Instant::now().checked_add(wait);
+        let started = Instant::now();
+        let handle_deadline = started.checked_add(wait);
+        let admission_deadline = started.checked_add(wait.max(ADMISSION_WAIT));
         let mut pool = lock_recover(&self.shared.pool);
         loop {
-            let held = match pool.admission {
-                Admission::Retired => return Err(GraphReadError::OwnerChanged),
-                Admission::Paused => true,
-                Admission::Open => false,
-            };
-            if !held && !pool.installed {
-                return Err(GraphReadError::Unavailable);
+            if pool.admission == Admission::Retired {
+                return Err(GraphReadError::OwnerChanged);
             }
-            let generation = pool.generation;
-            if expected.is_some_and(|expected| expected != generation) {
-                return Err(GraphReadError::Changed);
-            }
-            // Entries of a superseded generation are dropped here, never served.
-            while let Some(entry) = (!held).then(|| pool.entries.pop()).flatten() {
-                if entry.generation == generation {
-                    pool.lent += 1;
-                    let workspace_roots = pool.roots.clone();
-                    return Ok(GraphSnapshot::lent(entry, self.clone(), workspace_roots));
+            let held = pool.admission == Admission::Paused || pool.installing;
+            if !held {
+                if !pool.installed || pool.unusable.is_some() {
+                    return Err(GraphReadError::Unavailable);
+                }
+                let generation = pool.generation;
+                if expected.is_some_and(|expected| expected != generation) {
+                    return Err(GraphReadError::Changed);
+                }
+                // Entries of a superseded generation are dropped here, never served.
+                while let Some(entry) = pool.entries.pop() {
+                    if entry.generation == generation {
+                        pool.lent += 1;
+                        let workspace_roots = pool.roots.clone();
+                        return Ok(GraphSnapshot::lent(entry, self.clone(), workspace_roots));
+                    }
+                }
+                if pool.handles() < SNAPSHOT_POOL_CAP {
+                    if let Some(source) = pool.source.clone() {
+                        let (path, token) = (source.path.clone(), source.token);
+                        pool.opening += 1;
+                        drop(pool);
+                        let opened = GraphPathIdentity::read(&path)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|identity| {
+                                anyhow::ensure!(
+                                    identity == source.identity,
+                                    "another file is at the graph's path"
+                                );
+                                PooledSnapshotEntry::open(&path)
+                            });
+                        pool = lock_recover(&self.shared.pool);
+                        pool.opening -= 1;
+                        self.shared.returned.notify_all();
+                        match opened {
+                            Ok(entry)
+                                if entry.token() == token
+                                    && pool
+                                        .source
+                                        .as_ref()
+                                        .is_some_and(|served| served.token == token) =>
+                            {
+                                if pool.admission == Admission::Open && !pool.installing {
+                                    pool.lent += 1;
+                                    let workspace_roots = pool.roots.clone();
+                                    return Ok(GraphSnapshot::lent(
+                                        entry,
+                                        self.clone(),
+                                        workspace_roots,
+                                    ));
+                                }
+                                continue;
+                            }
+                            Ok(entry) => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    found = ?entry.token(),
+                                    expected = ?token,
+                                    "the graph file no longer holds the installed publication"
+                                );
+                                return Err(GraphReadError::Changed);
+                            }
+                            Err(error) => {
+                                tracing::warn!(path = %path.display(), %error, "could not open a graph read handle");
+                                return Err(GraphReadError::Unavailable);
+                            }
+                        }
+                    }
                 }
             }
+            let deadline = if held { admission_deadline } else { handle_deadline };
             let left = deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::MAX);
@@ -314,20 +452,20 @@ impl GraphStore {
         let mut pool = lock_recover(&self.shared.pool);
         pool.lent = pool.lent.saturating_sub(1);
         let keep = pool.admission != Admission::Retired
+            && !pool.installing
             && pool.generation == entry.generation
             && pool.entries.len() < SNAPSHOT_POOL_CAP;
-        if keep {
+        let closing = if keep {
             pool.entries.push(entry);
-        }
+            None
+        } else {
+            Some(entry)
+        };
         drop(pool);
+        drop(closing);
         // Every waiter re-checks: one whose deadline has just passed must not swallow the
-        // wake-up another could use, and a retirement waits for the last return.
+        // wake-up another could use, and a replacement or retirement waits for the last return.
         self.shared.returned.notify_all();
-    }
-
-    /// Count a handle a background reader opened for itself, which comes back like a pooled one.
-    fn lend_own(&self) {
-        lock_recover(&self.shared.pool).lent += 1;
     }
 
     /// Announce a use of the graph file outside the lent handles — an inspection, a pool being
@@ -338,14 +476,14 @@ impl GraphStore {
         if pool.admission == Admission::Retired {
             return Err(GraphReadError::OwnerChanged);
         }
-        pool.lent += 1;
+        pool.uses += 1;
         Ok(FileUse { store: self.clone() })
     }
 
     /// Whether the store is retired and every handle and use of the file has come back.
     pub(crate) fn retired_and_returned(&self) -> bool {
         let pool = lock_recover(&self.shared.pool);
-        pool.admission == Admission::Retired && pool.lent == 0
+        pool.admission == Admission::Retired && pool.quiet()
     }
 
     /// Allow, hold back or end lending. Retirement is final: the idle handles close at once,
@@ -366,36 +504,87 @@ impl GraphStore {
         self.shared.returned.notify_all();
     }
 
-    /// Wait until every lent handle has come back. No deadline: an active read is never cut.
+    /// Wait until every lent handle and use of the file has come back. No deadline: an active
+    /// read is never cut.
     pub(crate) fn wait_until_returned(&self) {
         let mut pool = lock_recover(&self.shared.pool);
-        while pool.lent > 0 {
+        while !pool.quiet() {
             pool =
                 self.shared.returned.wait(pool).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
-    /// Serve `entries` as the published generation from now on. Returns the unread-module
-    /// count the new publication declares.
+    /// Hold new reads back and wait, up to `readers`, for every lent handle to come back; then
+    /// close the idle ones, so this process has no handle open on the file a replacement is
+    /// renamed over. `None`: a read outlasted the wait — lending resumes and nothing was closed.
+    pub(super) fn pause_for_replacement(&self, readers: Duration) -> Option<ReplacementPause> {
+        let deadline = Instant::now().checked_add(readers);
+        let mut pool = lock_recover(&self.shared.pool);
+        if pool.admission == Admission::Retired {
+            return None;
+        }
+        pool.installing = true;
+        while pool.lent > 0 || pool.opening > 0 {
+            let left = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::MAX);
+            if left.is_zero() {
+                pool.installing = false;
+                drop(pool);
+                self.shared.returned.notify_all();
+                return None;
+            }
+            pool = self
+                .shared
+                .returned
+                .wait_timeout(pool, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        let closing = std::mem::take(&mut pool.entries);
+        drop(pool);
+        drop(closing);
+        Some(ReplacementPause { store: self.clone() })
+    }
+
+    /// Serve `entry`'s publication from the file at `path` from now on; further handles open on
+    /// demand. Returns the unread-module count the new publication declares.
     fn install(
         &self,
-        generation: u64,
-        entries: Vec<PooledSnapshotEntry>,
+        path: PathBuf,
+        identity: GraphPathIdentity,
+        entry: PooledSnapshotEntry,
         roots: Option<bsl_search::WorkspaceRoots>,
     ) -> Option<usize> {
         let mut pool = lock_recover(&self.shared.pool);
         if pool.admission == Admission::Retired {
-            // A process that lost the graph serves no new publication: the handles close here.
+            // A process that lost the graph serves no new publication: the handle closes here.
             return None;
         }
-        pool.generation = generation;
-        pool.entries = entries;
+        let unread_files = entry.unread_files;
+        let closing = std::mem::take(&mut pool.entries);
+        pool.generation = entry.generation;
+        pool.source = Some(InstalledSource { path, identity, token: entry.token() });
+        pool.entries.push(entry);
         pool.roots = roots;
         pool.installed = true;
-        let unread_files = pool.entries.first().map(|entry| entry.unread_files);
+        pool.installing = false;
+        pool.unusable = None;
         drop(pool);
+        drop(closing);
         self.shared.returned.notify_all();
-        unread_files
+        Some(unread_files)
+    }
+
+    /// Serve nothing until a publication is installed again: a replacement left the file in a
+    /// state nobody could establish.
+    pub(super) fn mark_unusable(&self, reason: String) {
+        let mut pool = lock_recover(&self.shared.pool);
+        pool.unusable = Some(reason);
+        let closing = std::mem::take(&mut pool.entries);
+        drop(pool);
+        drop(closing);
+        self.shared.returned.notify_all();
     }
 
     #[cfg(test)]
@@ -410,29 +599,10 @@ impl GraphStore {
         path: &Path,
         roots: Option<bsl_search::WorkspaceRoots>,
     ) -> anyhow::Result<Self> {
-        #[cfg(windows)]
-        let backing = detached_snapshot(path)?;
-        #[cfg(windows)]
-        let read_path: &Path = backing.as_ref();
-        #[cfg(not(windows))]
-        let read_path: &Path = path;
-        let db = GraphDb::open(read_path)?;
-        let (generation, fingerprint, force_stale) = db.freshness_token()?;
-        let unread_files = db.unread_files();
+        let identity = GraphPathIdentity::read(path)?;
+        let entry = PooledSnapshotEntry::open(path)?;
         let store = Self::default();
-        store.install(
-            generation,
-            vec![PooledSnapshotEntry {
-                generation,
-                fingerprint,
-                force_stale,
-                db,
-                unread_files,
-                #[cfg(windows)]
-                _backing: backing,
-            }],
-            roots,
-        );
+        store.install(path.to_path_buf(), identity, entry, roots);
         Ok(store)
     }
 }
@@ -538,10 +708,10 @@ impl GraphPathIdentity {
 }
 
 pub(super) struct PreparedSnapshotPool {
-    // The final fence must still see canonical in-place changes, even with restored mtime.
-    #[cfg(windows)]
-    validation: GraphDb,
-    entries: Vec<PooledSnapshotEntry>,
+    /// The one handle opened and checked before the publication is installed; the rest of the
+    /// pool opens on demand once it is.
+    entry: Option<PooledSnapshotEntry>,
+    path: PathBuf,
     /// The artefact's own unread set, read STRICTLY and bound to the generation validated
     /// above. `None` when the metadata would not read: that is a failure to look, and it says
     /// nothing at all about what this publication owes.
@@ -550,11 +720,19 @@ pub(super) struct PreparedSnapshotPool {
     expected_generation: u64,
     expected_fingerprint: crate::graph_db::GraphFp,
     expected_force_stale: bool,
-    /// The file stays in use while these handles are prepared and not yet installed.
+    /// The file stays in use while this handle is prepared and not yet installed.
     _file_use: FileUse,
+    /// Reads held back since a replacement was renamed in, until this pool is installed.
+    pause: Option<ReplacementPause>,
 }
 
 impl PreparedSnapshotPool {
+    /// Keep new reads waiting until this pool is installed: the file under it was just
+    /// replaced, and nothing of the previous publication may be lent in between.
+    pub(super) fn hold_reads(&mut self, pause: ReplacementPause) {
+        self.pause = Some(pause);
+    }
+
     /// What the artefact this pool holds declares unread, read strictly at prepare time.
     pub(super) fn declared_unread(&self) -> Option<&[bsl_search::FileKey]> {
         self.declared_unread.as_deref()
@@ -766,7 +944,6 @@ impl GraphState {
             match failure {
                 None => 0,
                 Some(BackgroundSnapshotFailure::Changed) => 1,
-                Some(BackgroundSnapshotFailure::Open) => 2,
                 Some(BackgroundSnapshotFailure::PrepareSecondChanged) => 3,
             },
             std::sync::atomic::Ordering::SeqCst,
@@ -801,41 +978,13 @@ impl GraphState {
             .use_file()
             .map_err(|error| SnapshotPrepareError::Open(anyhow::Error::from(error)))?;
         let before = prepare_path_identity(&path)?;
-        #[cfg(windows)]
-        let validation = GraphDb::open(&path).map_err(SnapshotPrepareError::Open)?;
-        #[cfg(windows)]
-        let backing = detached_snapshot(&path).map_err(SnapshotPrepareError::Open)?;
-        #[cfg(windows)]
-        let read_path: &Path = backing.as_ref();
-        #[cfg(not(windows))]
-        let read_path: &Path = &path;
-        let mut entries = Vec::with_capacity(SNAPSHOT_POOL_CAP);
-        for _index in 0..SNAPSHOT_POOL_CAP {
-            #[cfg(test)]
-            if _index == 1
-                && self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 3
-            {
-                return Err(SnapshotPrepareError::Changed);
-            }
-            let db = GraphDb::open(read_path).map_err(SnapshotPrepareError::Open)?;
-            let (generation, fingerprint, force_stale) =
-                db.freshness_token().map_err(SnapshotPrepareError::Open)?;
-            if generation != expected_generation
-                || fingerprint != expected_fingerprint
-                || force_stale != expected_force_stale
-            {
-                return Err(SnapshotPrepareError::Changed);
-            }
-            let unread_files = db.unread_files();
-            entries.push(PooledSnapshotEntry {
-                generation,
-                fingerprint,
-                force_stale,
-                db,
-                #[cfg(windows)]
-                _backing: Arc::clone(&backing),
-                unread_files,
-            });
+        #[cfg(test)]
+        if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+            return Err(SnapshotPrepareError::Changed);
+        }
+        let entry = PooledSnapshotEntry::open(&path).map_err(SnapshotPrepareError::Open)?;
+        if entry.token() != (expected_generation, expected_fingerprint, expected_force_stale) {
+            return Err(SnapshotPrepareError::Changed);
         }
         let after = prepare_path_identity(&path)?;
         if before != after {
@@ -844,20 +993,18 @@ impl GraphState {
         // Read here, where the generation has just been checked against the expectation and
         // the path identity brackets the read: a list taken later could belong to another
         // artefact at the same name.
-        let declared_unread = entries
-            .first()
-            .map(|entry| entry.db.unread_keys_strict().map_err(SnapshotPrepareError::Open))
-            .transpose()?;
+        let declared_unread =
+            Some(entry.db.unread_keys_strict().map_err(SnapshotPrepareError::Open)?);
         Ok(PreparedSnapshotPool {
-            #[cfg(windows)]
-            validation,
-            entries,
+            entry: Some(entry),
+            path,
             declared_unread,
             path_identity: after,
             expected_generation,
             expected_fingerprint,
             expected_force_stale,
             _file_use: file_use,
+            pause: None,
         })
     }
 
@@ -945,12 +1092,9 @@ impl GraphState {
                 }
                 Err(error) => return Err(SnapshotInstallError::Operation(error.to_string())),
             }
-            #[cfg(windows)]
-            let validation = &prepared.validation;
-            #[cfg(not(windows))]
             let validation = &prepared
-                .entries
-                .first()
+                .entry
+                .as_ref()
                 .ok_or_else(|| SnapshotInstallError::Operation("empty snapshot pool".to_owned()))?
                 .db;
             let actual = validation
@@ -983,9 +1127,12 @@ impl GraphState {
             let mut recovery = recovery;
             recovery.straddled |= published.force_stale;
             let mut inner = lock_recover(&self.inner);
+            let entry =
+                prepared.entry.take().expect("a prepared pool holds its handle until installed");
             inner.indexing_unread_files = self.store.install(
-                published.generation,
-                std::mem::take(&mut prepared.entries),
+                prepared.path.clone(),
+                prepared.path_identity.clone(),
+                entry,
                 published.search_roots.clone(),
             );
             inner.published = Some(published);
@@ -1072,139 +1219,35 @@ impl GraphState {
         if let Ok(snapshot) = self.store.checkout(None, Duration::ZERO) {
             return LeaseOperationOutcome::Applied(Some(snapshot));
         }
-        let (generation, fingerprint, force_stale, workspace_roots) = {
-            let inner = lock_recover(&self.inner);
-            let Some(published) = inner.published.as_ref() else {
-                return LeaseOperationOutcome::Applied(None);
-            };
-            (
-                published.generation,
-                published.fingerprint,
-                published.force_stale,
-                published.search_roots.clone(),
-            )
-        };
-        // Asked BEFORE the open, not after it. Opening the graph database is seconds of I/O on
-        // a large configuration, and a generation that has lost the workspace has no business
-        // paying for it: the fence below would refuse the result anyway, but only once the
-        // cost was already sunk.
-        // Each outcome keeps its own name: a released lease is not a superseded one, and the
-        // caller's handling differs.
-        if self.lease.is_superseded() {
-            return LeaseOperationOutcome::Superseded;
+        if lock_recover(&self.inner).published.is_none() {
+            return LeaseOperationOutcome::Applied(None);
         }
+        // Each outcome keeps its own name: a released lease is not a superseded one, and the
+        // caller's handling differs. Asked of the record itself — a background reader may wait
+        // for lease I/O — so an owner that took over is seen before a handle is waited for.
         if self.lease.is_released() {
             return LeaseOperationOutcome::Released;
         }
-        let Ok(file_use) = self.store.use_file() else {
+        if self.is_superseded() {
             return LeaseOperationOutcome::Superseded;
-        };
-        let opened = (|| -> anyhow::Result<(PooledSnapshotEntry, GraphPathIdentity)> {
-            #[cfg(test)]
-            if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 2 {
-                anyhow::bail!("forced background snapshot open failure");
-            }
-            let path =
-                self.graph_db_path().ok_or_else(|| anyhow::anyhow!("graph path unavailable"))?;
-            let before = GraphPathIdentity::read(&path)?;
-            #[cfg(windows)]
-            let backing = detached_snapshot(&path)?;
-            #[cfg(windows)]
-            let read_path: &Path = backing.as_ref();
-            #[cfg(not(windows))]
-            let read_path: &Path = &path;
-            let db = GraphDb::open(read_path)?;
-            if db.freshness_token()? != (generation, fingerprint, force_stale) {
-                anyhow::bail!("graph changed while opening a background snapshot");
-            }
-            let after = GraphPathIdentity::read(&path)?;
-            if before != after {
-                anyhow::bail!("graph path changed while opening a background snapshot");
-            }
-            let unread_files = db.unread_files();
-            Ok((
-                PooledSnapshotEntry {
-                    generation,
-                    fingerprint,
-                    force_stale,
-                    db,
-                    unread_files,
-                    #[cfg(windows)]
-                    _backing: backing,
-                },
-                after,
-            ))
-        })();
-        let (entry, identity) = match opened {
-            Ok(opened) => opened,
-            Err(error) => {
-                return LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
-                    BackgroundSnapshotError::Operation(error),
-                ))
-            }
-        };
-
+        }
         #[cfg(test)]
-        SNAPSHOT_OPEN_HOOK.with(|slot| {
-            if let Some(hook) = slot.borrow_mut().take() {
-                hook();
-            }
-        });
-        let mut prepared = Some((entry, identity));
-        match self.lease.publish_short(&mut prepared, |prepared| {
-            let (_, identity) = prepared
-                .as_ref()
-                .expect("background snapshot publication keeps its prepared value until commit");
-            #[cfg(test)]
-            if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 1 {
-                return Err(SnapshotInstallError::Changed);
-            }
-            let path = self.graph_db_path().ok_or_else(|| {
-                SnapshotInstallError::Operation("graph path unavailable".to_owned())
-            })?;
-            match GraphPathIdentity::read(&path) {
-                Ok(current) if current == *identity => {}
-                Ok(_) => return Err(SnapshotInstallError::Changed),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(SnapshotInstallError::Changed)
-                }
-                Err(error) => return Err(SnapshotInstallError::Operation(error.to_string())),
-            }
-            let inner = lock_recover(&self.inner);
-            let published = inner.published.as_ref().ok_or(SnapshotInstallError::Changed)?;
-            if (published.generation, published.fingerprint, published.force_stale)
-                != (generation, fingerprint, force_stale)
-            {
-                return Err(SnapshotInstallError::Changed);
-            }
-            Ok(())
-        }) {
-            LeaseOperationOutcome::Applied(()) => {
-                let (entry, _) = prepared.take().expect("successful publication retains entry");
-                self.store.lend_own();
-                drop(file_use);
-                LeaseOperationOutcome::Applied(Some(GraphSnapshot::lent(
-                    entry,
-                    self.store.clone(),
-                    workspace_roots,
-                )))
-            }
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
-                SnapshotInstallError::Changed,
-            )) => LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+        if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            return LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
                 BackgroundSnapshotError::Changed,
-            )),
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
-                SnapshotInstallError::Operation(message),
-            )) => LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
-                BackgroundSnapshotError::Operation(anyhow::anyhow!(message)),
-            )),
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
-                LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error))
+            ));
+        }
+        // No handle of its own past the pool: a background reader waits for one like any other,
+        // so the handles on the file stay the ones a replacement drains.
+        match self.store.checkout(None, BACKGROUND_READ_WAIT) {
+            Ok(snapshot) => LeaseOperationOutcome::Applied(Some(snapshot)),
+            Err(GraphReadError::OwnerChanged) => LeaseOperationOutcome::Superseded,
+            Err(GraphReadError::Changed) => LeaseOperationOutcome::OperationError(
+                LeaseOperationError::Operation(BackgroundSnapshotError::Changed),
+            ),
+            Err(GraphReadError::Busy | GraphReadError::Unavailable) => {
+                LeaseOperationOutcome::TransientRefusal
             }
-            LeaseOperationOutcome::TransientRefusal => LeaseOperationOutcome::TransientRefusal,
-            LeaseOperationOutcome::Superseded => LeaseOperationOutcome::Superseded,
-            LeaseOperationOutcome::Released => LeaseOperationOutcome::Released,
         }
     }
 
@@ -1911,18 +1954,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let graph = ready_graph(dir.path());
         let idle = || graph.store.lock_pool().len();
-        assert_eq!(idle(), SNAPSHOT_POOL_CAP);
+        let before = idle();
+        assert!(before >= 1, "an installed publication keeps its checked handle");
 
         let failed: Result<anyhow::Result<()>, _> =
             graph.read(|_| Err(anyhow::anyhow!("the operation failed")));
         assert!(matches!(failed, Ok(Err(_))), "the operation's own error is its result");
-        assert_eq!(idle(), SNAPSHOT_POOL_CAP, "a failed read gives its handle back");
+        assert_eq!(idle(), before, "a failed read gives its handle back");
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             graph.read(|_| -> u64 { panic!("the reader unwinds") })
         }));
         assert!(unwound.is_err());
-        assert_eq!(idle(), SNAPSHOT_POOL_CAP, "an unwinding read gives its handle back");
+        assert_eq!(idle(), before, "an unwinding read gives its handle back");
         assert!(graph.read(|snapshot| snapshot.generation()).is_ok());
     }
 
@@ -1995,14 +2039,13 @@ mod tests {
         let module = "CommonModules/Клиент/Ext/Module.bsl";
         let rendered = provider.try_graph_context(module, "Главная", "procedure");
         assert!(matches!(rendered, Ok(Some(_))), "{rendered:?}");
-        assert_eq!(graph.store.lock_pool().len(), SNAPSHOT_POOL_CAP, "the provider owns no handle");
+        assert_eq!(graph.store.lock_pool().lent, 0, "the provider owns no handle");
 
         let mut prepared =
             graph.prepare_snapshot_pool(generation, fingerprint, force_stale).unwrap();
-        for entry in &mut prepared.entries {
-            entry.generation = generation + 1;
-        }
-        graph.store.install(generation + 1, std::mem::take(&mut prepared.entries), roots);
+        let mut entry = prepared.entry.take().unwrap();
+        entry.generation = generation + 1;
+        graph.store.install(prepared.path.clone(), prepared.path_identity.clone(), entry, roots);
         assert!(
             provider.try_graph_context(module, "Главная", "procedure").is_err(),
             "a render against a newer publication fails, so its mark is kept"
@@ -2195,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn superseded_graph_serves_only_preopened_snapshot() {
+    fn a_request_miss_never_consults_the_lease() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
@@ -2216,12 +2259,7 @@ mod tests {
         assert!(graph.snapshot().is_none(), "owner release cannot refill the empty pool");
 
         drop(held);
-        assert!(graph.snapshot().is_some(), "a returned preopened descriptor remains readable");
-        graph.store.lock_pool().clear();
-        assert!(
-            graph.snapshot().is_none(),
-            "a cleared pool is never refilled after terminal supersession"
-        );
+        assert!(graph.snapshot().is_some(), "a returned handle serves again");
 
         let transient_dir = tempfile::tempdir().unwrap();
         let transient_root = transient_dir.path();
@@ -2259,15 +2297,17 @@ mod tests {
         wait_ready(&graph);
 
         let pool_len = || graph.store.lock_pool().len();
-        assert_eq!(pool_len(), SNAPSHOT_POOL_CAP, "publication prepares the full pool");
+        assert_eq!(pool_len(), 1, "publication opens and checks one handle, no more");
         let s1 = graph.snapshot().expect("snapshots");
-        assert_eq!(pool_len(), SNAPSHOT_POOL_CAP - 1);
+        assert_eq!(pool_len(), 0);
         drop(s1);
-        assert_eq!(pool_len(), SNAPSHOT_POOL_CAP, "the dropped handle returns to the pool");
-        let s2 = graph.snapshot().expect("snapshots");
-        assert_eq!(pool_len(), SNAPSHOT_POOL_CAP - 1);
-        drop(s2);
-        assert_eq!(pool_len(), SNAPSHOT_POOL_CAP);
+        assert_eq!(pool_len(), 1, "the dropped handle returns to the pool");
+
+        let held: Vec<_> =
+            (0..SNAPSHOT_POOL_CAP).map(|_| graph.snapshot().expect("opened on demand")).collect();
+        assert!(graph.snapshot().is_none(), "never more handles than the cap");
+        drop(held);
+        assert_eq!(pool_len(), SNAPSHOT_POOL_CAP, "every returned handle is kept for reuse");
 
         {
             let mut pool = graph.store.lock_pool();
@@ -2306,14 +2346,14 @@ mod tests {
         };
         let mut prepared =
             graph.prepare_snapshot_pool(generation, fingerprint, force_stale).unwrap();
-        for entry in &mut prepared.entries {
-            entry.generation = generation + 1;
-        }
+        let mut entry = prepared.entry.take().unwrap();
+        entry.generation = generation + 1;
+        let (path, identity) = (prepared.path.clone(), prepared.path_identity.clone());
 
         let old = graph.snapshot().expect("the published pool lends a handle");
         let publishing = graph.store.clone();
         set_snapshot_checkout_hook(Box::new(move || {
-            publishing.install(generation + 1, prepared.entries, None);
+            publishing.install(path, identity, entry, None);
         }));
         let raced = graph.snapshot().expect("a checkout racing the publication is served");
         assert_eq!(raced.generation, generation + 1, "the race is served by the new pool");
@@ -2322,7 +2362,8 @@ mod tests {
 
         let pool = graph.store.lock_pool();
         assert_eq!(pool.generation, generation + 1);
-        assert_eq!(pool.len(), SNAPSHOT_POOL_CAP, "the complete new pool survives old checkout");
+        assert_eq!(pool.len(), 1, "the new handle survives the old checkout's return");
+        assert!(pool.iter().all(|entry| entry.generation == generation + 1));
     }
 
     #[test]
@@ -2362,24 +2403,12 @@ mod tests {
 
         let (_dir, graph, _lease) = ready_graph();
         let _occupied = occupy(&graph);
-        let changed = graph.clone();
-        set_snapshot_install_hook(Box::new(move || {
-            lock_recover(&changed.inner).published.as_mut().unwrap().generation += 1;
-        }));
+        graph.set_background_snapshot_failure_for_test(Some(BackgroundSnapshotFailure::Changed));
         assert!(matches!(
             graph.snapshot_blocking(),
             LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(_))
         ));
-
-        let (_dir, graph, _lease) = ready_graph();
-        let _occupied = occupy(&graph);
-        graph.set_background_snapshot_failure_for_test(Some(BackgroundSnapshotFailure::Open));
-        let result = graph.snapshot_blocking();
         graph.set_background_snapshot_failure_for_test(None);
-        assert!(matches!(
-            result,
-            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(_))
-        ));
 
         let missing = GraphState::for_workspace(tempfile::tempdir().unwrap().path().to_path_buf());
         assert!(matches!(missing.snapshot_blocking(), LeaseOperationOutcome::Applied(None)));
@@ -2431,13 +2460,6 @@ mod tests {
 
         let snap1 = graph.snapshot().expect("ready graph snapshots");
         let old_token = snap1.graph.freshness_token().unwrap();
-        #[cfg(windows)]
-        let old_copy = {
-            let entry = snap1.graph.entry.as_ref().unwrap();
-            let pool = graph.store.lock_pool();
-            assert!(pool.iter().all(|other| Arc::ptr_eq(&entry._backing, &other._backing)));
-            entry._backing.to_path_buf()
-        };
         let fresh = graph.freshness(&snap1);
         assert_eq!(fresh.revision, 1);
         assert!(!fresh.stale);
@@ -2452,6 +2474,10 @@ mod tests {
         assert!(drifted.stale, "an on-disk edit must read as stale");
         assert_eq!(drifted.revision, 1, "the stale response still serves the old generation");
         assert!(matches!(drifted.reload, "running" | "failed"));
+        // The read in flight stays whole for as long as it runs; the reload's installation
+        // waits for it to return rather than replacing the file under it.
+        assert_eq!(snap1.graph.freshness_token().unwrap(), old_token);
+        drop(snap1);
 
         wait_until_within(
             &graph,
@@ -2463,12 +2489,6 @@ mod tests {
         assert!(!settled.stale);
         assert_eq!(settled.revision, 2);
         assert_eq!(settled.reload, "none");
-        assert_eq!(snap1.graph.freshness_token().unwrap(), old_token);
-        #[cfg(windows)]
-        assert!(old_copy.exists(), "the checked-out old generation keeps its copy alive");
-        drop(snap1);
-        #[cfg(windows)]
-        assert!(!old_copy.exists(), "the last old reader removes its detached copy");
     }
 
     #[test]
@@ -2538,6 +2558,8 @@ mod tests {
         let drifted = graph.freshness(&snap);
         assert!(drifted.stale, "a dependsOn-only edit must read as stale");
         assert!(matches!(drifted.reload, "running" | "failed"));
+        // Returned, so the reload's installation need not wait for it.
+        drop(snap);
 
         wait_until_within(
             &graph,
@@ -2591,6 +2613,7 @@ mod tests {
             "the new extension root to read as drift",
             || graph.freshness(&snap).stale,
         );
+        drop(snap);
         wait_until(&graph, "the drift reload to publish generation 2", || {
             graph.snapshot().map(|s| s.generation) == Some(2)
         });

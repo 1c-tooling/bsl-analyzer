@@ -1290,9 +1290,16 @@ impl GraphState {
         self
     }
 
-    /// Why this graph will not be opened at all, when that is so: its cache directory is held
-    /// by another live process of this version, or this process could not coordinate over it.
+    /// Why this graph is not served, when that is so: the file in place could not be
+    /// established after a replacement, or this process may not open the graph at all.
     pub(crate) fn unavailable_reason(&self) -> Option<String> {
+        self.store.unusable_reason().or_else(|| self.ownership_refusal())
+    }
+
+    /// Why this process may not open the graph at all: its cache directory is held by another
+    /// live process, or it could not coordinate over it. Unlike an unusable file, which a
+    /// rebuild replaces, nothing this process does lifts it.
+    pub(super) fn ownership_refusal(&self) -> Option<String> {
         let cache_dir =
             || self.cache().map(|cache| cache.root().display().to_string()).unwrap_or_default();
         if self.lease.coordination_failed() {
@@ -2699,7 +2706,7 @@ impl GraphState {
         };
         // The boot does not wait for another process's reads: the loader waits for the file
         // on its own thread, and the search index is built standalone meanwhile.
-        if self.unavailable_reason().is_some() || !self.acquire_graph_access(false) {
+        if self.ownership_refusal().is_some() || !self.acquire_graph_access(false) {
             self.ensure_loading();
             return FusedStartup::Standalone;
         }
