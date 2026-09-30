@@ -277,6 +277,15 @@ impl Drop for ReplacementPause {
     }
 }
 
+/// What an attempt to empty the graph file of this process's handles came to.
+pub(super) enum Pausing {
+    Paused(ReplacementPause),
+    /// A read or use of the file outlasted the wait.
+    ReadersBusy,
+    /// This process lost the graph; it replaces nothing.
+    Retired,
+}
+
 /// What [`GraphStore::status`] can say without opening anything.
 pub(crate) struct GraphStoreStatus {
     /// The installed generation, when one is.
@@ -384,18 +393,31 @@ impl GraphStore {
                         let (path, token) = (source.path.clone(), source.token);
                         pool.opening += 1;
                         drop(pool);
-                        let opened = GraphPathIdentity::read(&path)
-                            .map_err(anyhow::Error::from)
-                            .and_then(|identity| {
-                                anyhow::ensure!(
-                                    identity == source.identity,
-                                    "another file is at the graph's path"
-                                );
-                                PooledSnapshotEntry::open(&path)
-                            });
+                        let opened = std::panic::catch_unwind(|| {
+                            GraphPathIdentity::read(&path).map_err(anyhow::Error::from).and_then(
+                                |identity| {
+                                    anyhow::ensure!(
+                                        identity == source.identity,
+                                        "another file is at the graph's path"
+                                    );
+                                    PooledSnapshotEntry::open(&path)
+                                },
+                            )
+                        });
                         pool = lock_recover(&self.shared.pool);
                         pool.opening -= 1;
                         self.shared.returned.notify_all();
+                        let opened = match opened {
+                            Ok(opened) => opened,
+                            Err(panic) => {
+                                drop(pool);
+                                std::panic::resume_unwind(panic);
+                            }
+                        };
+                        if pool.source.as_ref().is_none_or(|served| served.token != token) {
+                            // Another publication was installed meanwhile: ask again.
+                            continue;
+                        }
                         match opened {
                             Ok(entry)
                                 if entry.token() == token
@@ -450,19 +472,21 @@ impl GraphStore {
 
     fn give_back(&self, entry: PooledSnapshotEntry) {
         let mut pool = lock_recover(&self.shared.pool);
-        pool.lent = pool.lent.saturating_sub(1);
         let keep = pool.admission != Admission::Retired
             && !pool.installing
             && pool.generation == entry.generation
             && pool.entries.len() < SNAPSHOT_POOL_CAP;
-        let closing = if keep {
+        if keep {
             pool.entries.push(entry);
-            None
         } else {
-            Some(entry)
-        };
+            // Closed while it still counts as lent: a replacement waiting for the count to reach
+            // zero must not rename the file while this handle is open on it.
+            drop(pool);
+            drop(entry);
+            pool = lock_recover(&self.shared.pool);
+        }
+        pool.lent = pool.lent.saturating_sub(1);
         drop(pool);
-        drop(closing);
         // Every waiter re-checks: one whose deadline has just passed must not swallow the
         // wake-up another could use, and a replacement or retirement waits for the last return.
         self.shared.returned.notify_all();
@@ -514,17 +538,18 @@ impl GraphStore {
         }
     }
 
-    /// Hold new reads back and wait, up to `readers`, for every lent handle to come back; then
-    /// close the idle ones, so this process has no handle open on the file a replacement is
-    /// renamed over. `None`: a read outlasted the wait — lending resumes and nothing was closed.
-    pub(super) fn pause_for_replacement(&self, readers: Duration) -> Option<ReplacementPause> {
+    /// Hold new reads back and wait, up to `readers`, for every lent handle and every use of
+    /// the file to end; then close the idle handles, so this process has nothing open on the file
+    /// a replacement is renamed over. A read that outlasts the wait resumes lending with nothing
+    /// closed.
+    pub(super) fn pause_for_replacement(&self, readers: Duration) -> Pausing {
         let deadline = Instant::now().checked_add(readers);
         let mut pool = lock_recover(&self.shared.pool);
         if pool.admission == Admission::Retired {
-            return None;
+            return Pausing::Retired;
         }
         pool.installing = true;
-        while pool.lent > 0 || pool.opening > 0 {
+        while !pool.quiet() {
             let left = deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::MAX);
@@ -532,7 +557,7 @@ impl GraphStore {
                 pool.installing = false;
                 drop(pool);
                 self.shared.returned.notify_all();
-                return None;
+                return Pausing::ReadersBusy;
             }
             pool = self
                 .shared
@@ -544,7 +569,7 @@ impl GraphStore {
         let closing = std::mem::take(&mut pool.entries);
         drop(pool);
         drop(closing);
-        Some(ReplacementPause { store: self.clone() })
+        Pausing::Paused(ReplacementPause { store: self.clone() })
     }
 
     /// Serve `entry`'s publication from the file at `path` from now on; further handles open on
@@ -568,7 +593,6 @@ impl GraphStore {
         pool.entries.push(entry);
         pool.roots = roots;
         pool.installed = true;
-        pool.installing = false;
         pool.unusable = None;
         drop(pool);
         drop(closing);
@@ -1154,6 +1178,18 @@ impl GraphState {
             Ok(())
         });
         drop(_gate);
+        if prepared.pause.is_some()
+            && !matches!(outcome, crate::workspace_lease::LeaseOperationOutcome::Applied(()))
+        {
+            // The file was already replaced: the generation in memory is no longer on disk.
+            self.store.mark_unusable(
+                "graph unavailable: a replaced graph file could not be installed; it is \
+                 rebuilt"
+                    .to_owned(),
+            );
+        }
+        // Reads resume here, once the publication is in memory: the pause goes with the pool.
+        drop(prepared);
         #[cfg(test)]
         if let Some(hook) = &self.install_section_hook {
             // Outside every lock, and before the payload goes: what the next line frees is
@@ -1224,7 +1260,7 @@ impl GraphState {
         }
         // Each outcome keeps its own name: a released lease is not a superseded one, and the
         // caller's handling differs. Asked of the record itself — a background reader may wait
-        // for lease I/O — so an owner that took over is seen before a handle is waited for.
+        // for lease I/O — so an owner that took over is seen before the wait for a free handle.
         if self.lease.is_released() {
             return LeaseOperationOutcome::Released;
         }

@@ -654,13 +654,15 @@ impl GraphState {
         };
         // The patch is applied to a copy of the database on disk, which is what it replaces —
         // not necessarily the one served, when an earlier install was refused after its rename.
-        // Held until the patched copy is published or dropped: the copy reads the live file.
-        let Ok(_file_use) = self.store.use_file() else {
+        // Held while the patch reads the live file, and let go before the replacement waits
+        // for every use of that file to end.
+        let Ok(file_use) = self.store.use_file() else {
             return PublishAttemptOutcome::Refused(LoadFailure::new(
                 LoadFailureReason::Superseded,
                 super::types::SUPERSEDED_GRAPH_ERROR,
             ));
         };
+        let mut file_use = Some(file_use);
         let base_publication = match publication_base(&db_path) {
             Ok(base) => base,
             Err(error) => return PublishAttemptOutcome::Refused(error),
@@ -724,6 +726,7 @@ impl GraphState {
                 )
                 .map_err(LoadFailure::operation)?;
             }
+            drop(file_use.take());
             let pause = match publish_or_discard(
                 self,
                 &tmp_path,
@@ -1608,18 +1611,23 @@ fn publish_or_discard(
         discard();
         return Err(lost_workspace_failure(graph));
     }
-    let Some(pause) = graph.store.pause_for_replacement(INSTALL_READERS_WAIT) else {
-        if graph.lease.is_superseded() || graph.lease.is_released() {
+    let pause = match graph.store.pause_for_replacement(INSTALL_READERS_WAIT) {
+        super::snapshot::Pausing::Paused(pause) => pause,
+        super::snapshot::Pausing::ReadersBusy => return Ok(Replaced::ReadersBusy),
+        super::snapshot::Pausing::Retired => {
             discard();
             return Err(lost_workspace_failure(graph));
         }
-        return Ok(Replaced::ReadersBusy);
     };
     let replacement = super::snapshot::on_disk_identity(tmp_path)
         .ok()
         .flatten()
         .and_then(|identity| identity.publication_id);
     let outcome = graph.lease.publish_short(&mut (), |_| {
+        // What an interrupted writer left is finished first — never carried over to the new
+        // file or deleted by hand — so the identity read next is the file's settled one.
+        super::snapshot::recover_hot_journal(out_path)
+            .map_err(|error| PublishRefusal::Io(std::io::Error::other(error)))?;
         // Re-read under the fence: the database this build replaces must still be the one it
         // was prepared from, and a newer format is not replaced at all.
         let current = super::snapshot::on_disk_identity(out_path).map_err(PublishRefusal::Io)?;
@@ -1629,10 +1637,6 @@ fn publish_or_discard(
         if current.and_then(|identity| identity.publication_id).as_deref() != base {
             return Err(PublishRefusal::StaleBase);
         }
-        // What an interrupted writer left is finished before the file is replaced, never carried
-        // over to the new one or deleted by hand.
-        super::snapshot::recover_hot_journal(out_path)
-            .map_err(|error| PublishRefusal::Io(std::io::Error::other(error)))?;
         std::fs::rename(tmp_path, out_path).map_err(PublishRefusal::Io)
     });
     match outcome {
@@ -1666,15 +1670,19 @@ fn publish_or_discard(
                 error.kind(),
                 error.raw_os_error()
             );
+            // A file that cannot be looked at confirms nothing either way.
             let in_place = super::snapshot::on_disk_identity(out_path)
-                .ok()
-                .flatten()
-                .and_then(|identity| identity.publication_id);
-            if replacement.is_some() && in_place == replacement {
+                .map(|found| found.map(|identity| identity.publication_id));
+            if replacement.is_some() && matches!(&in_place, Ok(Some(id)) if *id == replacement) {
                 tracing::warn!("{message}; the replacement is in place all the same");
                 return Ok(Replaced::Done(pause));
             }
-            if in_place.as_deref() == base {
+            let untouched = match &in_place {
+                Ok(Some(id)) => id.as_deref() == base,
+                Ok(None) => base.is_none(),
+                Err(_) => false,
+            };
+            if untouched {
                 // Confirmed untouched: the old file serves on once the pause is let go.
                 discard();
                 return Err(LoadFailure::new(LoadFailureReason::OperationError, message));
@@ -2914,6 +2922,9 @@ mod tests {
         let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone());
 
         let clean = build_and_publish_graph_file(root, 1, &graph, None).unwrap();
+        // An uninstalled publication holds its file: it is let go before the next one replaces it.
+        let clean_files = clean.files;
+        drop(clean);
 
         // The same workspace, plus a module dropped inside the analyzer's own cache.
         crate::graph::test_support::write_common_module(
@@ -2925,7 +2936,7 @@ mod tests {
         let with_vendored = build_and_publish_graph_file(root, 2, &graph, None).unwrap();
 
         assert_eq!(
-            with_vendored.files, clean.files,
+            with_vendored.files, clean_files,
             "a module under the cache entered the graph built from the workspace"
         );
     }
