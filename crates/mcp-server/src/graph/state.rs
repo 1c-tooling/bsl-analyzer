@@ -1277,19 +1277,10 @@ impl GraphState {
                         .name("bsl-graph-retire".to_owned())
                         .spawn(move || {
                             store.wait_until_returned();
-                            let held = std::mem::replace(
-                                &mut *lock_recover(&access),
-                                GraphAccess::Released,
-                            );
-                            if matches!(held, GraphAccess::Held(_)) {
-                                tracing::info!(
-                                    "graph ownership passed on: reads finished, handles closed, \
-                                     access to the graph file released"
-                                );
-                            }
+                            release_access(&store, &access);
                         });
                     if let Err(error) = spawned {
-                        // The closed handles are already gone; the lock goes with the process.
+                        // `released` completes the hand-over when its transport next asks.
                         tracing::warn!(%error, "could not start the graph retirement thread");
                     }
                 }
@@ -1326,7 +1317,7 @@ impl GraphState {
     /// Whether this process has let the graph go for good: ownership was lost, every read in
     /// flight has finished and the file's access lock is released.
     pub(crate) fn released(&self) -> bool {
-        matches!(*lock_recover(&self.access), GraphAccess::Released)
+        release_access(&self.store, &self.access)
     }
 
     /// Since when this process has been waiting for the previous owner to release the graph
@@ -1355,7 +1346,7 @@ impl GraphState {
         };
         let mut warned_at = None;
         loop {
-            {
+            let taken = {
                 let mut access = lock_recover(&self.access);
                 match &*access {
                     GraphAccess::Held(_) => return true,
@@ -1363,26 +1354,12 @@ impl GraphState {
                     GraphAccess::NotHeld | GraphAccess::Waiting { .. } => {}
                 }
                 match crate::workspace_lease::ExclusiveFileLock::try_acquire(&path) {
-                    Ok(Some(lock)) => {
-                        // Confirmed again once the file is ours: the lease may have moved on
-                        // while this process waited for the previous owner.
-                        if !self.lease.owns_caches_now() {
-                            *access = GraphAccess::NotHeld;
-                            return false;
-                        }
-                        if let GraphAccess::Waiting { since } = &*access {
-                            tracing::info!(
-                                waited_secs = since.elapsed().as_secs(),
-                                "the previous owner released the graph file; opening it"
-                            );
-                        }
-                        *access = GraphAccess::Held(lock);
-                        return true;
-                    }
+                    Ok(Some(lock)) => Some(lock),
                     Ok(None) => {
                         if matches!(*access, GraphAccess::NotHeld) {
                             *access = GraphAccess::Waiting { since: Instant::now() };
                         }
+                        None
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -1394,6 +1371,28 @@ impl GraphState {
                         return false;
                     }
                 }
+            };
+            if let Some(lock) = taken {
+                // Confirmed again once the file is ours — the lease may have moved on while this
+                // process waited — and asked with the state unlocked: the answer can take the
+                // lease's own lock, and a status request reads the state meanwhile.
+                let owner = self.lease.owns_caches_now();
+                let mut access = lock_recover(&self.access);
+                if matches!(*access, GraphAccess::Released) {
+                    return false;
+                }
+                if !owner {
+                    *access = GraphAccess::NotHeld;
+                    return false;
+                }
+                if let GraphAccess::Waiting { since } = &*access {
+                    tracing::info!(
+                        waited_secs = since.elapsed().as_secs(),
+                        "the previous owner released the graph file; opening it"
+                    );
+                }
+                *access = GraphAccess::Held(lock);
+                return true;
             }
             if !wait || self.stop.is_stopped() || self.lease_is_terminal() {
                 return false;
@@ -2753,6 +2752,22 @@ impl GraphState {
             }
         }
     }
+}
+
+/// Let the graph file's access lock go once the store is retired and every read and use of the
+/// file has come back. Says whether it is let go.
+fn release_access(store: &GraphStore, access: &Mutex<GraphAccess>) -> bool {
+    let mut access = lock_recover(access);
+    if !matches!(*access, GraphAccess::Released) && store.retired_and_returned() {
+        if matches!(*access, GraphAccess::Held(_)) {
+            tracing::info!(
+                "graph ownership passed on: reads finished, handles closed, access to the graph \
+                 file released"
+            );
+        }
+        *access = GraphAccess::Released;
+    }
+    matches!(*access, GraphAccess::Released)
 }
 
 /// How often a process waiting for the graph file tries its access lock again.
@@ -4590,6 +4605,30 @@ mod tests {
         drop(in_flight);
         wait_ready(&second);
         assert!(first.released(), "the file went to the successor");
+    }
+
+    /// A use of the graph file outside the lent handles — a build inspecting or copying it —
+    /// keeps the file from the next owner exactly like a read in flight, and none starts once
+    /// the workspace is lost.
+    #[test]
+    fn a_retiring_graph_waits_for_uses_of_its_file_outside_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease.clone());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let copying = graph.store.use_file().expect("a use of the file");
+
+        lease.release();
+        assert!(graph.store.use_file().is_err(), "no use starts after the workspace is lost");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!graph.released(), "the file is still in use");
+        drop(copying);
+        wait_until(&graph, "the file to be let go", || graph.released());
     }
 
     /// Each cache directory has its own access lock: a directory whose file is held elsewhere

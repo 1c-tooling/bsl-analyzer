@@ -415,9 +415,9 @@ impl WorkspaceLease {
                     cache_dir = %cache.root().display(),
                     owner_pid = owner.pid,
                     owner_version = owner.version.as_deref().unwrap_or("unknown"),
-                    "the graph is busy: another live process of this program version owns this \
-                     cache directory; give this process a separate --cache-dir, or stop sharing \
-                     the directory"
+                    "the graph is busy: another live process owns this cache directory and this \
+                     version does not take it over (same, newer or unknown version); give this \
+                     process a separate --cache-dir, or stop sharing the directory"
                 ),
                 None => tracing::warn!(
                     root = %cache.root().display(),
@@ -477,7 +477,22 @@ impl WorkspaceLease {
         if self.inner.released.load(Ordering::SeqCst) {
             return false;
         }
-        let found = read_record(path);
+        let found = match read_record_result(path) {
+            Ok(found) => found,
+            // A record that will not read says nothing about whether its owner lives. Only one
+            // nobody has rewritten for longer than a live owner's heartbeat allows is taken.
+            Err(_) if written_before_stale(path) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "the workspace lease record will not read; not taking the workspace from \
+                     an owner that may be alive"
+                );
+                *lock_recover(&self.inner.busy) = None;
+                return false;
+            }
+        };
         if !claimable(found.as_ref()) {
             *lock_recover(&self.inner.busy) = found
                 .filter(|record| !is_stale(record))
@@ -588,21 +603,33 @@ impl WorkspaceLease {
 
     /// Watch this lease's ownership checks. An observer added after the workspace was lost
     /// hears so at once.
+    ///
+    /// A new observer is told the last check's finding at once, under the same lock the next
+    /// report takes: nothing reported before it joined is lost, and nothing reported after it
+    /// joined reaches it out of order.
     pub(crate) fn observe(&self, observer: OwnershipObserver) {
-        let lost = self.terminal_outcome::<(), ()>().is_some();
+        let last = lock_recover(&self.inner.last_check);
+        let found = if self.terminal_outcome::<(), ()>().is_some() {
+            Some(OwnershipCheck::Lost)
+        } else {
+            *last
+        };
         lock_recover(&self.inner.observers).push(Arc::clone(&observer));
-        if lost {
-            observer(OwnershipCheck::Lost);
+        if let Some(found) = found {
+            observer(found);
         }
+        drop(last);
     }
 
+    /// Tell the observers what a check found, when it differs from the last finding. Delivered
+    /// with the finding's lock held, so two checks finishing together cannot reach an observer
+    /// in the opposite order from the one they were recorded in.
     fn report(&self, check: OwnershipCheck) {
         let mut last = lock_recover(&self.inner.last_check);
         if *last == Some(check) || *last == Some(OwnershipCheck::Lost) {
             return;
         }
         *last = Some(check);
-        drop(last);
         for observer in lock_recover(&self.inner.observers).iter() {
             observer(check);
         }
@@ -1132,6 +1159,16 @@ fn write_record(path: &Path, generation: u64, token: u64) -> io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// Whether the record file at `path` was last written longer ago than a live owner's heartbeat
+/// allows — the only staleness a record that will not parse can still show.
+fn written_before_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > STALE_AFTER)
 }
 
 fn is_stale(record: &LeaseRecord) -> bool {
@@ -2265,7 +2302,14 @@ mod tests {
         let corrupt_dir = tempfile::tempdir().unwrap();
         let corrupt = WorkspaceLease::claim(corrupt_dir.path());
         std::fs::write(lease_path(corrupt_dir.path()), "not a lease record").unwrap();
-        assert!(corrupt.owns_caches_now(), "a corrupt record remains recoverable");
+        assert!(!corrupt.owns_caches_now(), "a corrupt record may still belong to a live owner");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(lease_path(corrupt_dir.path()))
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_AFTER - Duration::from_secs(5))
+            .unwrap();
+        assert!(corrupt.owns_caches_now(), "a corrupt record remains recoverable once stale");
         assert!(!corrupt.is_superseded());
 
         let brief_dir = tempfile::tempdir().unwrap();
@@ -2382,6 +2426,46 @@ mod tests {
         child.wait().unwrap();
         assert!(path.exists(), "nothing cleaned the file up");
         assert!(ExclusiveFileLock::try_acquire(&path).unwrap().is_some(), "free after the crash");
+    }
+
+    /// A record that will not read is not a free workspace: it is taken only once nobody has
+    /// rewritten it for longer than a live owner's heartbeat allows.
+    #[test]
+    fn an_unreadable_record_is_taken_only_once_it_has_gone_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        cache.ensure().unwrap();
+        std::fs::write(cache.lease_path(), b"{ not a record").unwrap();
+
+        let lease = WorkspaceLease::claim(dir.path());
+        assert!(!lease.owns_caches_now(), "an owner that may be alive keeps the workspace");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cache.lease_path())
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_AFTER - Duration::from_secs(5))
+            .unwrap();
+        assert!(lease.owns_caches_now(), "a record nobody has kept up is taken");
+    }
+
+    /// An observer that joins after a check could not answer hears so at once, instead of
+    /// waiting for a finding that differs from one it never received.
+    #[test]
+    fn a_late_observer_hears_the_last_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = WorkspaceLease::claim(dir.path());
+        let held = lease.hold_file_lock_for_test();
+        std::fs::remove_file(lease_path(dir.path())).unwrap();
+        assert!(!lease.owns_caches_now());
+        drop(held);
+
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        lease.observe(Arc::new(move |check| lock_recover(&sink).push(check)));
+        assert_eq!(*lock_recover(&heard), vec![OwnershipCheck::Unknown]);
+        lease.release();
+        assert_eq!(*lock_recover(&heard), vec![OwnershipCheck::Unknown, OwnershipCheck::Lost]);
     }
 
     fn foreign_owner(root: &Path, version: Option<&str>, heartbeat_secs: u64) -> LeaseRecord {

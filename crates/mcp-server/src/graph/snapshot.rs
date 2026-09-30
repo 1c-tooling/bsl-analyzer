@@ -192,6 +192,20 @@ pub(super) fn on_disk_identity(path: &Path) -> std::io::Result<Option<OnDiskIden
     }))
 }
 
+/// One use of the graph file announced to its [`GraphStore`], ended when dropped.
+pub(crate) struct FileUse {
+    store: GraphStore,
+}
+
+impl Drop for FileUse {
+    fn drop(&mut self) {
+        let mut pool = lock_recover(&self.store.shared.pool);
+        pool.lent = pool.lent.saturating_sub(1);
+        drop(pool);
+        self.store.shared.returned.notify_all();
+    }
+}
+
 /// What [`GraphStore::status`] can say without opening anything.
 pub(crate) struct GraphStoreStatus {
     /// The installed generation, when one is.
@@ -316,6 +330,24 @@ impl GraphStore {
         lock_recover(&self.shared.pool).lent += 1;
     }
 
+    /// Announce a use of the graph file outside the lent handles — an inspection, a pool being
+    /// prepared, a copy for a patch. A retirement waits for it as for a lent read, and none
+    /// starts once the store is retired.
+    pub(crate) fn use_file(&self) -> Result<FileUse, GraphReadError> {
+        let mut pool = lock_recover(&self.shared.pool);
+        if pool.admission == Admission::Retired {
+            return Err(GraphReadError::OwnerChanged);
+        }
+        pool.lent += 1;
+        Ok(FileUse { store: self.clone() })
+    }
+
+    /// Whether the store is retired and every handle and use of the file has come back.
+    pub(crate) fn retired_and_returned(&self) -> bool {
+        let pool = lock_recover(&self.shared.pool);
+        pool.admission == Admission::Retired && pool.lent == 0
+    }
+
     /// Allow, hold back or end lending. Retirement is final: the idle handles close at once,
     /// and the lent ones as they return.
     pub(crate) fn set_admission(&self, admission: Admission) {
@@ -352,6 +384,10 @@ impl GraphStore {
         roots: Option<bsl_search::WorkspaceRoots>,
     ) -> Option<usize> {
         let mut pool = lock_recover(&self.shared.pool);
+        if pool.admission == Admission::Retired {
+            // A process that lost the graph serves no new publication: the handles close here.
+            return None;
+        }
         pool.generation = generation;
         pool.entries = entries;
         pool.roots = roots;
@@ -514,6 +550,8 @@ pub(super) struct PreparedSnapshotPool {
     expected_generation: u64,
     expected_fingerprint: crate::graph_db::GraphFp,
     expected_force_stale: bool,
+    /// The file stays in use while these handles are prepared and not yet installed.
+    _file_use: FileUse,
 }
 
 impl PreparedSnapshotPool {
@@ -743,6 +781,7 @@ impl GraphState {
         op: impl FnOnce(&GraphDb) -> R,
     ) -> anyhow::Result<R> {
         let path = self.graph_db_path().ok_or_else(|| anyhow::anyhow!("graph path unavailable"))?;
+        let _use = self.store.use_file()?;
         let db = GraphDb::open(&path)?;
         Ok(op(&db))
     }
@@ -757,6 +796,10 @@ impl GraphState {
         let path = self
             .graph_db_path()
             .ok_or_else(|| SnapshotPrepareError::Open(anyhow::anyhow!("graph path unavailable")))?;
+        let file_use = self
+            .store
+            .use_file()
+            .map_err(|error| SnapshotPrepareError::Open(anyhow::Error::from(error)))?;
         let before = prepare_path_identity(&path)?;
         #[cfg(windows)]
         let validation = GraphDb::open(&path).map_err(SnapshotPrepareError::Open)?;
@@ -814,6 +857,7 @@ impl GraphState {
             expected_generation,
             expected_fingerprint,
             expected_force_stale,
+            _file_use: file_use,
         })
     }
 
@@ -1052,6 +1096,9 @@ impl GraphState {
         if self.lease.is_released() {
             return LeaseOperationOutcome::Released;
         }
+        let Ok(file_use) = self.store.use_file() else {
+            return LeaseOperationOutcome::Superseded;
+        };
         let opened = (|| -> anyhow::Result<(PooledSnapshotEntry, GraphPathIdentity)> {
             #[cfg(test)]
             if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 2 {
@@ -1135,6 +1182,7 @@ impl GraphState {
             LeaseOperationOutcome::Applied(()) => {
                 let (entry, _) = prepared.take().expect("successful publication retains entry");
                 self.store.lend_own();
+                drop(file_use);
                 LeaseOperationOutcome::Applied(Some(GraphSnapshot::lent(
                     entry,
                     self.store.clone(),

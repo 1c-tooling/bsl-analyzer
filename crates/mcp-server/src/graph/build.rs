@@ -638,6 +638,13 @@ impl GraphState {
         };
         // The patch is applied to a copy of the database on disk, which is what it replaces —
         // not necessarily the one served, when an earlier install was refused after its rename.
+        // Held until the patched copy is published or dropped: the copy reads the live file.
+        let Ok(_file_use) = self.store.use_file() else {
+            return PublishAttemptOutcome::Refused(LoadFailure::new(
+                LoadFailureReason::Superseded,
+                super::types::SUPERSEDED_GRAPH_ERROR,
+            ));
+        };
         let base_publication = match publication_base(&db_path) {
             Ok(base) => base,
             Err(error) => return PublishAttemptOutcome::Refused(error),
@@ -1163,7 +1170,13 @@ fn build_and_publish_scanned_inner(
     let out_path = graph.graph_db_path().expect("workspace graph has cache layout");
     // Asked before the minutes of building, and asked again at the rename: a database of a
     // newer format is neither built over nor replaced.
-    let base = publication_base(&out_path)?;
+    let base = {
+        let _use = graph
+            .store
+            .use_file()
+            .map_err(|error| LoadFailure::new(LoadFailureReason::Superseded, error.to_string()))?;
+        publication_base(&out_path)?
+    };
     let tmp_path = graph_build_path(&out_path);
     let _tmp_cleanup = TempBuildFile(tmp_path.clone());
     if let Some(parent) = out_path.parent() {
@@ -1322,10 +1335,8 @@ fn publish_or_discard(
         // Re-read under the fence: the database this build replaces must still be the one it
         // was prepared from, and a newer format is not replaced at all.
         let current = super::snapshot::on_disk_identity(out_path).map_err(PublishRefusal::Io)?;
-        if let Some(version) = current.as_ref().and_then(|identity| identity.schema_version) {
-            if version > crate::graph_db::SCHEMA_VERSION {
-                return Err(PublishRefusal::NewerFormat(version));
-            }
+        if let Some(version) = newer_format(current.as_ref()) {
+            return Err(PublishRefusal::NewerFormat(version));
         }
         if current.and_then(|identity| identity.publication_id).as_deref() != base {
             return Err(PublishRefusal::StaleBase);
@@ -1415,12 +1426,17 @@ enum PublishRefusal {
 /// format: this program neither reads such a database nor writes over it.
 fn publication_base(out_path: &Path) -> Result<Option<String>, LoadFailure> {
     let identity = super::snapshot::on_disk_identity(out_path).map_err(LoadFailure::operation)?;
-    if let Some(version) = identity.as_ref().and_then(|identity| identity.schema_version) {
-        if version > crate::graph_db::SCHEMA_VERSION {
-            return Err(newer_format_failure(out_path, version));
-        }
+    if let Some(version) = newer_format(identity.as_ref()) {
+        return Err(newer_format_failure(out_path, version));
     }
     Ok(identity.and_then(|identity| identity.publication_id))
+}
+
+/// The format of a database newer than this program writes, when it is one.
+fn newer_format(identity: Option<&super::snapshot::OnDiskIdentity>) -> Option<u32> {
+    identity
+        .and_then(|identity| identity.schema_version)
+        .filter(|version| *version > crate::graph_db::SCHEMA_VERSION)
 }
 
 fn newer_format_failure(out_path: &Path, version: u32) -> LoadFailure {
