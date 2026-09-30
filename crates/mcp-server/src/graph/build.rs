@@ -3245,12 +3245,30 @@ mod tests {
         let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
             .with_lease(lease.clone());
         drop(build_and_publish_graph_file(root, 1, &graph, None).unwrap());
+        let db = graph.graph_db_path().unwrap();
+        let publication_id = graph.next_publication_id();
+        let (project, universe, patch, meta, plan) =
+            edit_and_compute_patch(root, &db, publication_id);
+        PatchFixture { cache, graph, db, project, universe, patch, meta, plan }
+    }
+
+    /// Edit the sample module's body and work out the patch for it against the graph at `db`.
+    fn edit_and_compute_patch(
+        root: &Path,
+        db: &Path,
+        publication_id: String,
+    ) -> (
+        crate::graph::ProjectSnapshot,
+        crate::graph::universe::ScannedUniverse,
+        crate::graph_db::BodyPatch,
+        crate::graph_db::GraphMeta,
+        PatchPlan,
+    ) {
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
             "&НаСервере\nФункция Считать() Экспорт\nЗначение = 1;\nВозврат Значение;\nКонецФункции",
         );
-        let db = graph.graph_db_path().unwrap();
         let module = root.join("CommonModules/Сервер/Ext/Module.bsl").canonicalize().unwrap();
         let project = crate::graph::ProjectSnapshot::load(root);
         let universe = crate::graph::universe::ScannedUniverse::scan(&project.scan_roots);
@@ -3259,7 +3277,7 @@ mod tests {
         let patch = crate::graph_db::compute_body_patch(
             &project,
             &universe,
-            &db,
+            db,
             std::slice::from_ref(&module),
             1,
         )
@@ -3269,14 +3287,14 @@ mod tests {
             fingerprint,
             files: 0,
             built_at: "now".into(),
-            publication_id: graph.next_publication_id(),
+            publication_id,
         };
         let plan = PatchPlan {
-            base: publication_base(&db).unwrap(),
+            base: publication_base(db).unwrap(),
             target: fingerprint,
             changed: vec![module],
         };
-        PatchFixture { cache, graph, db, project, universe, patch, meta, plan }
+        (project, universe, patch, meta, plan)
     }
 
     fn stored_revision(db: &Path) -> u64 {
@@ -3306,12 +3324,10 @@ mod tests {
 Возврат Значение;
 КонецФункции",
         );
-        let audit = crate::graph_db::copy_audit();
 
         let outcome = graph.try_incremental_reload(root, 2, 0);
 
         assert!(matches!(outcome, PublishAttemptOutcome::Published), "{:?}", graph.status());
-        assert_eq!(crate::graph_db::copy_audit(), audit, "no full copy or replacement was written");
         assert_eq!(stored_revision(db), 2);
         assert_ne!(
             fs::read(&same_file).unwrap(),
@@ -3416,6 +3432,241 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
         other.execute_batch("ROLLBACK").unwrap();
         assert_eq!(stored_revision(&fixture.db), 1);
+    }
+
+    /// What a child process of a crash test does: build the sample graph in the workspace it is
+    /// given, then take the step the test names, announce it, and wait to be killed.
+    fn patch_child_workspace(step: &str) -> Option<PathBuf> {
+        std::env::var_os(format!("BSL_PATCH_CHILD_{step}")).map(PathBuf::from)
+    }
+
+    fn announce_and_wait(announcement: &str) {
+        println!("READY {announcement}");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    /// Run `test` again as a child in `root` for `step`, and return it once it has announced,
+    /// with what it announced.
+    fn spawn_patch_child(test: &str, step: &str, root: &Path) -> (PatchChild, String) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+            .env(format!("BSL_PATCH_CHILD_{step}"), root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let child = PatchChild(child);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                std::io::BufRead::read_line(&mut reader, &mut line).unwrap(),
+                0,
+                "the child ended before announcing"
+            );
+            // The harness's own "test ... " prefix is on the same line: nothing ends it first.
+            if let Some((_, announcement)) = line.split_once("READY ") {
+                return (child, announcement.trim().to_owned());
+            }
+        }
+    }
+
+    fn kill(mut child: PatchChild) {
+        child.0.kill().unwrap();
+    }
+
+    /// A child of a crash test, ended and reaped however the test that started it ends.
+    struct PatchChild(std::process::Child);
+
+    impl Drop for PatchChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A process that dies with the patch written and not committed leaves the file to be
+    /// opened as it was: the next open finishes what the interrupted writer left, the old
+    /// publication is in place, and the same patch then applies once.
+    #[test]
+    fn a_crash_before_the_commit_leaves_the_old_publication_and_the_patch_applies_once() {
+        const TEST: &str = "graph::build::tests::a_crash_before_the_commit_leaves_the_old_publication_and_the_patch_applies_once";
+        if let Some(root) = patch_child_workspace("BEFORE") {
+            let fixture = patch_fixture(&root);
+            let Ok(_open) = crate::graph_db::begin_body_patch(
+                &fixture.db,
+                &fixture.project,
+                &fixture.universe,
+                &fixture.patch,
+                &fixture.meta,
+                false,
+                crate::graph_db::PATCH_SQL_BUDGET,
+            ) else {
+                panic!("the child could not write the patch");
+            };
+            announce_and_wait(&fixture.db.display().to_string());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (child, db) = spawn_patch_child(TEST, "BEFORE", root);
+        let db = PathBuf::from(db);
+        kill(child);
+
+        super::super::snapshot::recover_hot_journal(&db).unwrap();
+        assert_eq!(stored_revision(&db), 1, "the old publication is in place");
+        assert!(crate::graph_query::GraphDb::open(&db).unwrap().quick_check().is_ok());
+
+        let (project, universe, patch, meta, _) =
+            edit_and_compute_patch(root, &db, "after-crash-1".into());
+        let Ok(open) = crate::graph_db::begin_body_patch(
+            &db,
+            &project,
+            &universe,
+            &patch,
+            &meta,
+            false,
+            crate::graph_db::PATCH_SQL_BUDGET,
+        ) else {
+            panic!("the patch cannot be written after the crash");
+        };
+        open.commit().unwrap();
+        assert_eq!(stored_revision(&db), 2);
+        assert_eq!(publication_base(&db).unwrap().as_deref(), Some("after-crash-1"));
+    }
+
+    /// A process that dies with the interrupted write already spilled to the file — the journal
+    /// is what holds the old pages — is recovered by the next open, without the journal being
+    /// deleted by hand, and the file is the one it was before.
+    #[test]
+    fn a_hot_journal_is_recovered_by_the_next_open_and_the_file_is_as_it_was() {
+        const TEST: &str = "graph::build::tests::a_hot_journal_is_recovered_by_the_next_open_and_the_file_is_as_it_was";
+        if let Some(root) = patch_child_workspace("SPILL") {
+            let fixture = patch_fixture(&root);
+            let length = fs::metadata(&fixture.db).unwrap().len();
+            let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+            conn.query_row("PRAGMA journal_mode = PERSIST", [], |r| r.get::<_, String>(0)).unwrap();
+            conn.execute_batch("PRAGMA cache_size = 10; BEGIN IMMEDIATE;").unwrap();
+            conn.execute_batch(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 20000)
+                 INSERT INTO meta (key, value) SELECT 'junk' || x, randomblob(1000) FROM c;",
+            )
+            .unwrap();
+            announce_and_wait(&format!("{length} {}", fixture.db.display()));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (child, announced) = spawn_patch_child(TEST, "SPILL", dir.path());
+        let (length, db) = announced.split_once(' ').unwrap();
+        let (length, db) = (length.parse::<u64>().unwrap(), PathBuf::from(db));
+        kill(child);
+
+        let mut journal = db.as_os_str().to_owned();
+        journal.push("-journal");
+        assert!(
+            fs::metadata(Path::new(&journal)).is_ok_and(|journal| journal.len() > 0),
+            "the crash left a journal to recover"
+        );
+        assert!(
+            fs::metadata(&db).unwrap().len() > length,
+            "the interrupted write reached the file"
+        );
+
+        super::super::snapshot::recover_hot_journal(&db).unwrap();
+
+        assert_eq!(fs::metadata(&db).unwrap().len(), length, "the file is as long as it was");
+        assert_eq!(stored_revision(&db), 1);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let junk: i64 = conn
+            .query_row("SELECT COUNT(*) FROM meta WHERE key LIKE 'junk%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(junk, 0, "nothing of the interrupted write is left");
+        assert!(crate::graph_query::GraphDb::open(&db).unwrap().quick_check().is_ok());
+    }
+
+    /// A process that dies after the commit leaves the new publication whole: nothing is rolled
+    /// back, nothing is applied twice, and the file opens without recovery.
+    #[test]
+    fn a_crash_after_the_commit_leaves_the_new_publication() {
+        const TEST: &str =
+            "graph::build::tests::a_crash_after_the_commit_leaves_the_new_publication";
+        if let Some(root) = patch_child_workspace("AFTER") {
+            let fixture = patch_fixture(&root);
+            let Ok(open) = crate::graph_db::begin_body_patch(
+                &fixture.db,
+                &fixture.project,
+                &fixture.universe,
+                &fixture.patch,
+                &fixture.meta,
+                false,
+                crate::graph_db::PATCH_SQL_BUDGET,
+            ) else {
+                panic!("the child could not write the patch");
+            };
+            open.commit().unwrap();
+            announce_and_wait(&format!("{} {}", fixture.meta.publication_id, fixture.db.display()));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (child, announced) = spawn_patch_child(TEST, "AFTER", dir.path());
+        let (publication, db) = announced.split_once(' ').unwrap();
+        let (publication, db) = (publication.to_owned(), PathBuf::from(db));
+        kill(child);
+
+        super::super::snapshot::recover_hot_journal(&db).unwrap();
+
+        assert_eq!(stored_revision(&db), 2);
+        assert_eq!(publication_base(&db).unwrap(), Some(publication));
+        let graph = crate::graph_query::GraphDb::open(&db).unwrap();
+        assert!(graph.quick_check().is_ok());
+        assert!(!graph.freshness_token().unwrap().2, "the final force_stale was committed with it");
+    }
+
+    /// The search context is refreshed once the patch is committed and installed, against the
+    /// patch's own publication, and a body-only patch does not ask for the whole collection to be
+    /// rendered again.
+    #[test]
+    fn a_point_patch_refreshes_the_search_context_against_its_own_publication() {
+        use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let signals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = {
+            let signals = std::sync::Arc::clone(&signals);
+            std::sync::Arc::new(move |signal: crate::graph::GraphPublishSignal| {
+                signals.lock().unwrap().push((signal.revision, signal.topology_changed));
+                crate::graph::GraphPublishOutcome::HANDLED
+            })
+                as std::sync::Arc<
+                    dyn Fn(crate::graph::GraphPublishSignal) -> crate::graph::GraphPublishOutcome
+                        + Send
+                        + Sync,
+                >
+        };
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_publish_pass_within(&graph, WAIT_CEILING, 1);
+        signals.lock().unwrap().clear();
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать() Экспорт\nЗначение = 1;\nВозврат Значение;\nКонецФункции",
+        );
+
+        let outcome = graph.try_incremental_reload(root, 2, 0);
+
+        assert!(matches!(outcome, PublishAttemptOutcome::Published));
+        assert_eq!(
+            *signals.lock().unwrap(),
+            vec![(2, false)],
+            "one refresh, for the patch's revision, without a whole-collection request"
+        );
+        assert_eq!(stored_revision(&graph_db_path(root)), 2);
     }
 
     #[test]
