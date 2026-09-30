@@ -202,7 +202,7 @@ version = "11.5.22.129"
 
 ## Сборка из исходников
 
-**Требования:** Rust 1.91+
+**Требования:** Rust 1.95+
 
 ```bash
 git clone https://github.com/itrous/bsl-analyzer.git
