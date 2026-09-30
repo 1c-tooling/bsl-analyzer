@@ -137,12 +137,17 @@ async fn superseded_daemon_lifecycle() {
 
     let new_revision = wait_current_graph(&new_client, Some(old_revision)).await;
     assert_ne!(new_revision, old_revision);
-    assert_ne!(stamp(&cache.graph_db_path()).inode, old_inode, "publish atomically replaced inode");
+    // A body-only edit is patched into the published file itself, not renamed over it.
+    assert_eq!(stamp(&cache.graph_db_path()).inode, old_inode, "the patch kept the file");
     assert_eq!(old_file.metadata().unwrap().ino(), old_inode, "the old inode stays open");
     let revision: String = old_db
         .query_row("SELECT value FROM meta WHERE key = 'revision'", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(revision.parse::<u64>().unwrap(), old_revision);
+    assert_eq!(
+        revision.parse::<u64>().unwrap(),
+        new_revision,
+        "an outside connection on the file sees the publication the new owner committed"
+    );
     let nodes: i64 = old_db.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
     assert!(nodes > 0, "the pre-replacement SQLite handle remains readable");
 

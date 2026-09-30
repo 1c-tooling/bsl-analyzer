@@ -25,6 +25,7 @@ use super::types::GraphStatus;
 /// while the resident method index resolves cross-batch calls.
 pub(super) const GRAPH_BUILD_BATCH: usize = 500;
 
+#[cfg(test)]
 fn graph_build_path(path: &Path) -> PathBuf {
     // Backend generations can overlap within one process as well as across processes.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -652,10 +653,10 @@ impl GraphState {
             );
             return self.note_incremental("incomplete portable fingerprint");
         };
-        // The patch is applied to a copy of the database on disk, which is what it replaces —
-        // not necessarily the one served, when an earlier install was refused after its rename.
-        // Held while the patch reads the live file, and let go before the replacement waits
-        // for every use of that file to end.
+        // The patch is written into the database on disk — not necessarily the one served, when
+        // an earlier install was refused after its write — so its base is read off the file.
+        // Held while the patch is computed from the live file, and let go before the write
+        // waits for every use of that file to end.
         let Ok(file_use) = self.store.use_file() else {
             return PublishAttemptOutcome::Refused(LoadFailure::new(
                 LoadFailureReason::Superseded,
@@ -667,29 +668,23 @@ impl GraphState {
             Ok(base) => base,
             Err(error) => return PublishAttemptOutcome::Refused(error),
         };
-        let tmp_path = graph_build_path(&db_path);
-        // The same guard the full build carries. The explicit removals below cover the two
-        // outcomes this function names, and `catch_unwind` turns an unwind into one of them —
-        // but each of those removals can itself fail, and the name is unique per build, so
-        // nothing later reuses or clears it. A workspace-sized file left in the cache for good
-        // is too cheap to prevent to leave resting on which exits somebody remembered.
-        let _tmp_cleanup = TempBuildFile(tmp_path.clone());
+        let plan = PatchPlan {
+            base: base_publication.clone(),
+            target: fp_pre,
+            changed: {
+                let mut changed = changed_paths.clone();
+                changed.sort();
+                changed
+            },
+        };
         let built_at = chrono::Utc::now().to_rfc3339();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let summary = crate::graph_db::update_graph_database_bodies(
+            let patch = crate::graph_db::compute_body_patch(
                 &project,
                 &pre,
                 &db_path,
-                &tmp_path,
                 &changed_paths,
                 GRAPH_BUILD_BATCH,
-                &crate::graph_db::GraphMeta {
-                    revision: generation,
-                    fingerprint: fp_pre,
-                    files: 0,
-                    built_at,
-                    publication_id: self.next_publication_id(),
-                },
             )
             .map_err(LoadFailure::operation)?;
             let post_project = crate::graph::ProjectSnapshot::load_excluding(
@@ -718,31 +713,38 @@ impl GraphState {
             let force_stale = publish_force_stale(fp_pre, fp_post, pre.clean(), post.clean())
                 || hub_moved
                 || hub_unhealthy;
-            {
-                let conn = rusqlite::Connection::open(&tmp_path).map_err(LoadFailure::operation)?;
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_stale', ?1)",
-                    rusqlite::params![if force_stale { "1" } else { "0" }],
-                )
-                .map_err(LoadFailure::operation)?;
-            }
+            // The reads of the file end here: the write below holds new ones back and waits for
+            // the ones in flight.
             drop(file_use.take());
-            let pause = match publish_or_discard(
-                self,
-                &tmp_path,
-                &db_path,
-                base_publication.as_deref(),
-                false,
-            )? {
-                Replaced::Done(pause) => pause,
-                Replaced::ReadersBusy => {
+            let meta = crate::graph_db::GraphMeta {
+                revision: generation,
+                fingerprint: fp_pre,
+                files: 0,
+                built_at,
+                publication_id: self.next_publication_id(),
+            };
+            let pause = match self.store.pause_for_replacement(INSTALL_READERS_WAIT) {
+                super::snapshot::Pausing::Paused(pause) => pause,
+                super::snapshot::Pausing::ReadersBusy => {
                     return Err(LoadFailure::new(
                         LoadFailureReason::TransientRefusal,
                         "a graph read outlasted the installation wait; the patch is prepared \
                          again on the next reload",
                     ))
                 }
+                super::snapshot::Pausing::Retired => return Err(lost_workspace_failure(self)),
             };
+            let (modules, pause) = write_patch_in_place(
+                self,
+                &project,
+                &pre,
+                &patch,
+                &meta,
+                force_stale,
+                &db_path,
+                &plan,
+                pause,
+            )?;
             let prepared =
                 open_installed_replacement(self, generation, fp_pre, force_stale, &db_path, pause)?;
             // A point patch re-projected exactly what it was given. It proves nothing about
@@ -760,7 +762,7 @@ impl GraphState {
                 crate::graph::snapshot::RecoveryCoverage::PatchedKeys { rewritten: &rewritten },
                 project.search_roots.as_ref(),
             );
-            Ok::<_, LoadFailure>((summary.modules, fp_pre, force_stale, prepared, recovery))
+            Ok::<_, LoadFailure>((modules, fp_pre, force_stale, prepared, recovery))
         }));
 
         match outcome {
@@ -810,7 +812,6 @@ impl GraphState {
             }
             Ok(Err(e)) => {
                 tracing::warn!("incremental reload failed, falling back to full rebuild: {e}");
-                let _ = std::fs::remove_file(&tmp_path);
                 match e.reason {
                     LoadFailureReason::TransientRefusal
                     | LoadFailureReason::Superseded
@@ -820,7 +821,6 @@ impl GraphState {
             }
             Err(_) => {
                 tracing::error!("incremental reload panicked, falling back to full rebuild");
-                let _ = std::fs::remove_file(&tmp_path);
                 PublishAttemptOutcome::FallBack
             }
         }
@@ -1170,8 +1170,10 @@ fn build_and_publish_graph_file(
 /// an operation error, or a panic unwinding out of the builder into the loader's `catch_unwind` —
 /// leaves a database the size of the workspace behind for the life of the cache directory. The
 /// published build is renamed out of this path, so removing it afterwards finds nothing.
+#[cfg(test)]
 struct TempBuildFile(std::path::PathBuf);
 
+#[cfg(test)]
 impl Drop for TempBuildFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -1561,6 +1563,191 @@ fn cache_is_reusable(
     scan_clean: bool,
 ) -> bool {
     !force_stale && scan_clean && stored == fp_now
+}
+
+/// What identifies one attempt to patch: the publication it is written over, the fingerprint it
+/// leads to and the files it rewrites. An attempt of the same plan that outlasts its SQL budget
+/// twice is not tried a third time.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct PatchPlan {
+    base: Option<String>,
+    target: crate::graph_db::GraphFp,
+    changed: Vec<PathBuf>,
+}
+
+impl GraphState {
+    /// Count one overrun of `plan`'s budget; the count is of this process only and starts again
+    /// when the plan changes.
+    fn note_patch_overrun(&self, plan: &PatchPlan) -> u32 {
+        let mut overruns = lock_recover(&self.patch_overruns);
+        match overruns.as_mut() {
+            Some((seen, count)) if seen == plan => {
+                *count += 1;
+                *count
+            }
+            _ => {
+                *overruns = Some((plan.clone(), 1));
+                1
+            }
+        }
+    }
+}
+
+/// Leave the graph file as a rolled-back write found it: served on when it still holds the
+/// publication it held before — its modification time moved, and the store is told the file is
+/// the same one — and unavailable when it holds anything else or cannot be looked at.
+fn settle_after_rollback(
+    graph: &GraphState,
+    db_path: &Path,
+    base: Option<&str>,
+    pause: &super::snapshot::ReplacementPause,
+) {
+    match super::snapshot::on_disk_identity(db_path) {
+        Ok(Some(identity)) if identity.publication_id.as_deref() == base => {
+            graph.store.accept_rewritten_file(db_path, pause);
+        }
+        other => graph.store.mark_unusable(format!(
+            "graph unavailable: after a rolled-back write the file in place is not the \
+             publication it held before ({})",
+            match other {
+                Ok(_) => "another publication or none".to_owned(),
+                Err(error) => error.to_string(),
+            }
+        )),
+    }
+}
+
+/// Write a computed patch into the graph file in one transaction and commit it under the lease.
+///
+/// Reads are held back by `pause` while the SQL is applied, and the transaction counts as a use
+/// of the file: an owner that loses the graph waits for its return, so the rollback of an
+/// unfinished transaction comes before the file is handed on. The lease is held only for the
+/// commit, never for the SQL. A commit that fails is not taken for "nothing happened": the file
+/// is recovered and identified by its `publication_id`, and one that is neither the old
+/// publication nor the new one leaves the graph unavailable.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct input of the write
+fn write_patch_in_place(
+    graph: &GraphState,
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    patch: &crate::graph_db::BodyPatch,
+    meta: &crate::graph_db::GraphMeta,
+    force_stale: bool,
+    db_path: &Path,
+    plan: &PatchPlan,
+    pause: super::snapshot::ReplacementPause,
+) -> Result<(usize, super::snapshot::ReplacementPause), LoadFailure> {
+    let base = plan.base.as_deref();
+    let Ok(_file_use) = graph.store.use_file() else {
+        return Err(lost_workspace_failure(graph));
+    };
+    super::snapshot::recover_hot_journal(db_path).map_err(LoadFailure::operation)?;
+    let current = super::snapshot::on_disk_identity(db_path)
+        .map_err(|error| LoadFailure::operation(error.to_string()))?;
+    if let Some(version) = newer_format(current.as_ref()) {
+        return Err(newer_format_failure(db_path, version));
+    }
+    if current.and_then(|identity| identity.publication_id).as_deref() != base {
+        return Err(LoadFailure::new(
+            LoadFailureReason::TransientRefusal,
+            format!(
+                "graph database {} was replaced while this patch was prepared from an earlier \
+                 one; the patch is prepared again",
+                db_path.display()
+            ),
+        ));
+    }
+    let transaction = match crate::graph_db::begin_body_patch(
+        db_path,
+        project,
+        universe,
+        patch,
+        meta,
+        force_stale,
+        crate::graph_db::PATCH_SQL_BUDGET,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            settle_after_rollback(graph, db_path, base, &pause);
+            return Err(match error {
+                crate::graph_db::PatchError::Busy => LoadFailure::new(
+                    LoadFailureReason::TransientRefusal,
+                    "another process holds the graph file's write lock; the patch is prepared \
+                     again on the next reload",
+                ),
+                crate::graph_db::PatchError::Budget => {
+                    let overruns = graph.note_patch_overrun(plan);
+                    tracing::warn!(overruns, "applying a graph patch outlasted its budget");
+                    if overruns >= 2 {
+                        LoadFailure::operation(
+                            "applying the same graph patch outlasted its budget twice",
+                        )
+                    } else {
+                        LoadFailure::new(
+                            LoadFailureReason::TransientRefusal,
+                            "applying a graph patch outlasted its budget; it is prepared again",
+                        )
+                    }
+                }
+                crate::graph_db::PatchError::Failed(error) => LoadFailure::operation(error),
+            });
+        }
+    };
+    let mut held = Some(transaction);
+    let outcome = graph.lease.publish_short(&mut held, |held| {
+        held.take().expect("the transaction is committed once").commit()
+    });
+    match outcome {
+        LeaseOperationOutcome::Applied(_) => Ok((patch.modules(), pause)),
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(error)) => {
+            drop(held);
+            let message =
+                format!("committing the graph patch into {} failed: {error}", db_path.display());
+            let after = super::snapshot::recover_hot_journal(db_path)
+                .and_then(|()| super::snapshot::on_disk_identity(db_path).map_err(Into::into));
+            match after {
+                Ok(Some(identity))
+                    if identity.publication_id.as_deref() == Some(meta.publication_id.as_str()) =>
+                {
+                    tracing::warn!("{message}; the patch is committed all the same");
+                    Ok((patch.modules(), pause))
+                }
+                Ok(Some(identity)) if identity.publication_id.as_deref() == base => {
+                    graph.store.accept_rewritten_file(db_path, &pause);
+                    Err(LoadFailure::operation(message))
+                }
+                _ => {
+                    graph.store.mark_unusable(format!(
+                        "graph unavailable: after a failed commit ({message}) the file in place \
+                         is neither the publication it patched nor the patch"
+                    ));
+                    Err(LoadFailure::operation(message))
+                }
+            }
+        }
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+            drop(held);
+            settle_after_rollback(graph, db_path, base, &pause);
+            Err(LoadFailure::operation(format!(
+                "publishing the graph patch lease failed for {}: {error}",
+                db_path.display()
+            )))
+        }
+        LeaseOperationOutcome::TransientRefusal => {
+            drop(held);
+            settle_after_rollback(graph, db_path, base, &pause);
+            Err(LoadFailure::new(
+                LoadFailureReason::TransientRefusal,
+                "this daemon could not establish ownership of the workspace's derived caches \
+                 when the graph patch was ready; it was not committed",
+            ))
+        }
+        LeaseOperationOutcome::Superseded | LeaseOperationOutcome::Released => {
+            // Rolled back here, while the transaction still counts as a use of the file.
+            drop(held);
+            Err(lost_workspace_failure(graph))
+        }
+    }
 }
 
 /// What an attempt to rename a finished build over the shared database came to.
@@ -3035,6 +3222,200 @@ mod tests {
             None,
             "the replaced file is not served under the generation it no longer holds"
         );
+    }
+
+    /// A graph built under a lease of its own, then one module edited: what writing a point
+    /// patch into the published file takes, short of the reload that would do it.
+    struct PatchFixture {
+        cache: crate::cache::WorkspaceCacheLayout,
+        graph: GraphState,
+        db: PathBuf,
+        project: crate::graph::ProjectSnapshot,
+        universe: crate::graph::universe::ScannedUniverse,
+        patch: crate::graph_db::BodyPatch,
+        meta: crate::graph_db::GraphMeta,
+        plan: PatchPlan,
+    }
+
+    fn patch_fixture(root: &Path) -> PatchFixture {
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease.clone());
+        drop(build_and_publish_graph_file(root, 1, &graph, None).unwrap());
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать() Экспорт\nЗначение = 1;\nВозврат Значение;\nКонецФункции",
+        );
+        let db = graph.graph_db_path().unwrap();
+        let module = root.join("CommonModules/Сервер/Ext/Module.bsl").canonicalize().unwrap();
+        let project = crate::graph::ProjectSnapshot::load(root);
+        let universe = crate::graph::universe::ScannedUniverse::scan(&project.scan_roots);
+        let fingerprint =
+            crate::graph::scan::fingerprint_of_project(&universe.stats, &project).unwrap();
+        let patch = crate::graph_db::compute_body_patch(
+            &project,
+            &universe,
+            &db,
+            std::slice::from_ref(&module),
+            1,
+        )
+        .unwrap();
+        let meta = crate::graph_db::GraphMeta {
+            revision: 2,
+            fingerprint,
+            files: 0,
+            built_at: "now".into(),
+            publication_id: graph.next_publication_id(),
+        };
+        let plan = PatchPlan {
+            base: publication_base(&db).unwrap(),
+            target: fingerprint,
+            changed: vec![module],
+        };
+        PatchFixture { cache, graph, db, project, universe, patch, meta, plan }
+    }
+
+    fn stored_revision(db: &Path) -> u64 {
+        crate::graph_query::GraphDb::open(db).unwrap().freshness_token().unwrap().0
+    }
+
+    /// A point patch is written into the published file itself: the same file holds the new
+    /// publication afterwards, nothing is copied or replaced, and nothing is left beside it.
+    #[test]
+    fn a_point_patch_is_written_into_the_published_file_and_copies_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let db = &graph_db_path(root);
+        let same_file = db.with_extension("same-file");
+        fs::hard_link(db, &same_file).unwrap();
+        let before = fs::read(db).unwrap();
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере
+Функция Считать() Экспорт
+Значение = 1;
+Возврат Значение;
+КонецФункции",
+        );
+        let audit = crate::graph_db::copy_audit();
+
+        let outcome = graph.try_incremental_reload(root, 2, 0);
+
+        assert!(matches!(outcome, PublishAttemptOutcome::Published), "{:?}", graph.status());
+        assert_eq!(crate::graph_db::copy_audit(), audit, "no full copy or replacement was written");
+        assert_eq!(stored_revision(db), 2);
+        assert_ne!(
+            fs::read(&same_file).unwrap(),
+            before,
+            "the file the graph is served from changed"
+        );
+        assert_eq!(fs::read(&same_file).unwrap(), fs::read(db).unwrap());
+        let leftovers: Vec<_> = fs::read_dir(db.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("pending") || name.contains(".building."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The owner of the workspace changed before the commit: the unfinished transaction is
+    /// rolled back, the file still holds the publication it held, and the refusal says why.
+    #[test]
+    fn lost_ownership_before_the_commit_rolls_the_patch_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fixture = patch_fixture(root);
+        let before = fs::read(&fixture.db).unwrap();
+        let newer = crate::workspace_lease::WorkspaceLease::claim_cache(&fixture.cache);
+        let super::super::snapshot::Pausing::Paused(pause) =
+            fixture.graph.store.pause_for_replacement(std::time::Duration::from_secs(1))
+        else {
+            panic!("nothing holds the graph file");
+        };
+
+        let Err(error) = write_patch_in_place(
+            &fixture.graph,
+            &fixture.project,
+            &fixture.universe,
+            &fixture.patch,
+            &fixture.meta,
+            false,
+            &fixture.db,
+            &fixture.plan,
+            pause,
+        ) else {
+            panic!("a patch lost to a new owner was committed");
+        };
+
+        assert_eq!(error.reason, LoadFailureReason::Superseded);
+        assert_eq!(publication_base(&fixture.db).unwrap(), fixture.plan.base);
+        assert_eq!(stored_revision(&fixture.db), 1);
+        assert_eq!(fs::read(&fixture.db).unwrap(), before, "nothing of the patch is left");
+        newer.release();
+    }
+
+    /// SQL that outlasts its budget is interrupted and rolled back, and the same plan doing it
+    /// twice is not tried a third time.
+    #[test]
+    fn a_patch_that_outlasts_its_budget_is_rolled_back_and_the_repeat_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fixture = patch_fixture(root);
+
+        let refused = crate::graph_db::begin_body_patch(
+            &fixture.db,
+            &fixture.project,
+            &fixture.universe,
+            &fixture.patch,
+            &fixture.meta,
+            false,
+            std::time::Duration::ZERO,
+        );
+
+        assert!(matches!(refused, Err(crate::graph_db::PatchError::Budget)));
+        drop(refused);
+        assert_eq!(publication_base(&fixture.db).unwrap(), fixture.plan.base);
+        assert_eq!(stored_revision(&fixture.db), 1);
+        assert_eq!(fixture.graph.note_patch_overrun(&fixture.plan), 1);
+        assert_eq!(fixture.graph.note_patch_overrun(&fixture.plan), 2);
+        let other = PatchPlan { base: Some("elsewhere-1".into()), ..fixture.plan.clone() };
+        assert_eq!(fixture.graph.note_patch_overrun(&other), 1, "another base starts again");
+    }
+
+    /// Another process holding the file's write lock is waited for briefly, and then the patch
+    /// is refused for a later attempt with nothing written.
+    #[test]
+    fn a_patch_does_not_wait_long_for_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fixture = patch_fixture(root);
+        let other = rusqlite::Connection::open(&fixture.db).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+
+        let refused = crate::graph_db::begin_body_patch(
+            &fixture.db,
+            &fixture.project,
+            &fixture.universe,
+            &fixture.patch,
+            &fixture.meta,
+            false,
+            crate::graph_db::PATCH_SQL_BUDGET,
+        );
+
+        assert!(matches!(refused, Err(crate::graph_db::PatchError::Busy)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(stored_revision(&fixture.db), 1);
     }
 
     #[test]

@@ -504,6 +504,19 @@ impl GraphStore {
         Ok(FileUse { store: self.clone() })
     }
 
+    /// Take the file at `path` for the one this store serves after this process rewrote it in
+    /// place and rolled the write back: its modification time moved, its contents did not.
+    pub(super) fn accept_rewritten_file(&self, path: &Path, _pause: &ReplacementPause) {
+        let Ok(identity) = GraphPathIdentity::read(path) else {
+            self.mark_unusable("graph unavailable: the graph file cannot be looked at".to_owned());
+            return;
+        };
+        let mut pool = lock_recover(&self.shared.pool);
+        if let Some(source) = pool.source.as_mut().filter(|source| source.path == path) {
+            source.identity = identity;
+        }
+    }
+
     /// Whether the store is retired and every handle and use of the file has come back.
     pub(crate) fn retired_and_returned(&self) -> bool {
         let pool = lock_recover(&self.shared.pool);

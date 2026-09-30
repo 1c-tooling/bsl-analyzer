@@ -452,7 +452,7 @@ fn no_generic_or_unclassified_production_lease_callers() {
 #[test]
 fn fence_callers_are_exactly_classified() {
     let expected = [
-        ("graph/build.rs", 2),
+        ("graph/build.rs", 3),
         ("graph/snapshot.rs", 1),
         ("state/bootstrap.rs", 3),
         ("state/embed.rs", 4),
@@ -474,11 +474,11 @@ fn fence_callers_are_exactly_classified() {
     }
 }
 
-/// A graph database is copied in one place only, where the copy is counted: reads and the
-/// preparation of a replacement copy nothing, and the audit that compares the counters with the
-/// process's disk writes would not see a copy made anywhere else.
+/// A graph database is not copied by production code at all: reads use the file itself, a full
+/// build writes its own replacement, and a point patch writes into the file in one transaction.
+/// A copy anywhere would be a full copy of the file the counters and the disk audit do not see.
 #[test]
-fn graph_databases_are_copied_only_where_the_copy_is_counted() {
+fn production_code_copies_no_graph_database() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut copies = Vec::new();
     for path in production_sources() {
@@ -496,14 +496,7 @@ fn graph_databases_are_copied_only_where_the_copy_is_counted() {
             path.display()
         );
     }
-    assert_eq!(copies.len(), 1, "graph copies outside the counted one: {copies:?}");
-    let graph_db = production_source(
-        &std::fs::read_to_string(root.join("graph_db.rs")).expect("Rust source is readable"),
-    );
-    assert!(
-        fn_body(&graph_db, "copy_graph_database").contains("std::fs::copy("),
-        "the one copy is the counted one"
-    );
+    assert!(copies.is_empty(), "graph copies in production code: {copies:?}");
 }
 
 /// The published graph file is opened only by the graph module that lends its handles: a
@@ -694,6 +687,8 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("graph_db.rs", "spawn_build_watchdog", ".wait_timeout(", Waiting::OwnProtocol),
     // A read waiting for a pooled graph handle to come back: bounded by the caller's wait.
     ("graph/snapshot.rs", "checkout", ".wait_timeout(", Waiting::Bounded),
+    // The budget of a patch's SQL: a watchdog thread that interrupts the statement in flight.
+    ("graph_db.rs", "begin_body_patch", ".recv_timeout(", Waiting::Bounded),
     // A replacement waits for the reads in flight, bounded by the installation wait.
     ("graph/snapshot.rs", "pause_for_replacement", ".wait_timeout(", Waiting::Bounded),
     // A superseded graph waits for its reads in flight before it closes the file; it ends when

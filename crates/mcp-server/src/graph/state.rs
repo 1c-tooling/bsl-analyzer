@@ -455,6 +455,8 @@ pub(crate) struct GraphState {
     /// Whole graph builders actually entered, independently of their loader thread.
     #[cfg(test)]
     pub(super) full_builds_started: Arc<AtomicUsize>,
+    /// How many times the SQL of one patch plan has outlasted its budget in this process.
+    pub(super) patch_overruns: Arc<Mutex<Option<(super::build::PatchPlan, u32)>>>,
     /// Reconciles delivered to this ledger by a consumer that records without deciding — the
     /// watcher. A stand waits on this to know a delivery has happened at all, which a ledger
     /// that correctly recognises the loss as one it already acted on cannot show by itself.
@@ -574,6 +576,7 @@ impl GraphState {
             builders_started: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             full_builds_started: Arc::new(AtomicUsize::new(0)),
+            patch_overruns: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             quiet_losses: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
