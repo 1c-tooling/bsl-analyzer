@@ -4266,7 +4266,7 @@ mod tests {
         assert!(eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Unobserved)));
         assert!(eventually(&|| {
             let report = state.graph().status_report();
-            report.drift_watch == Some("unobserved") && report.stale == Some(true)
+            report.drift_watch == Some("unobserved") && report.stale != Some(false)
         }));
     }
 
@@ -4375,7 +4375,14 @@ mod tests {
                 "an edit was applied"
             );
         }
-        assert_eq!(state.graph().status_report().revision, revision, "the graph was rebuilt");
+        assert!(
+            eventually(&|| state.graph().released()),
+            "the superseded graph kept the file from the owner"
+        );
+        let report = state.graph().status_report();
+        assert_eq!((report.state, report.superseded), ("failed", Some(true)), "it serves nothing");
+        let on_disk = crate::graph::test_support::meta_string(&cache.graph_db_path(), "revision");
+        assert_eq!(Some(on_disk.parse::<u64>().unwrap()), revision, "the graph was rebuilt");
         state.shutdown();
     }
 

@@ -70,6 +70,27 @@ pub(crate) const WAIT_POLL: Duration = Duration::from_millis(10);
 /// The default ceiling for a bounded wait on graph state.
 pub(crate) const WAIT_CEILING: Duration = Duration::from_secs(30);
 
+/// Every pooled handle of `graph`, taken once none is lent. A consumer of a fresh publication —
+/// the search hook confirming which generation it serves — borrows one for a moment right after
+/// the graph reads as ready, so a stand that must hold them all waits for that to pass.
+pub(crate) fn hold_every_handle(graph: &GraphState) -> Vec<super::GraphSnapshot> {
+    let deadline = std::time::Instant::now() + WAIT_CEILING;
+    loop {
+        let held: Vec<_> =
+            std::iter::from_fn(|| graph.snapshot()).take(super::SNAPSHOT_POOL_CAP).collect();
+        if held.len() == super::SNAPSHOT_POOL_CAP {
+            return held;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pool never had every handle idle: {}",
+            graph_state_summary(graph)
+        );
+        drop(held);
+        std::thread::sleep(WAIT_POLL);
+    }
+}
+
 /// Everything a timed-out wait needs to say to be diagnosable: which condition it
 /// waited on is the caller's half, the observed state is this one.
 pub(crate) fn graph_state_summary(graph: &GraphState) -> String {

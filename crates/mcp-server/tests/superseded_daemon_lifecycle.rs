@@ -162,9 +162,19 @@ async fn superseded_daemon_lifecycle() {
     for _ in 0..3 {
         let status = graph_status(&old_client).await;
         assert_eq!(status["superseded"], true);
-        let _ = old_client
+        // Never an empty answer from a daemon that lost the workspace: the client is told to
+        // open a new session.
+        match old_client
             .call_tool(CallToolRequestParams::new("graph").with_arguments(arguments("overview")))
-            .await;
+            .await
+        {
+            Err(rmcp::ServiceError::McpError(error)) => assert_eq!(
+                error.data.as_ref().and_then(|data| data["reason"].as_str()),
+                Some("owner_changed"),
+                "{error:?}"
+            ),
+            other => panic!("a superseded daemon answered the graph: {other:?}"),
+        }
         let _ = old_client
             .call_tool(CallToolRequestParams::new("search").with_arguments(arguments("status")))
             .await;

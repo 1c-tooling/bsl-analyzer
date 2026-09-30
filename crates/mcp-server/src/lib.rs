@@ -938,6 +938,17 @@ fn graph_provider_state(status: &GraphStatus, has_snapshot: bool) -> ide::Provid
     }
 }
 
+/// How long a graph request waits for a hand-over between owners before it answers busy.
+const GRAPH_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A graph refusal in the tool's error form, carrying a machine-readable `reason`:
+/// `graph_busy` — retry shortly; `owner_changed` — another process owns the graph now, open a
+/// new session; `graph_unavailable` — this process will not open the graph, the message says
+/// why. None of them is an empty answer.
+fn graph_refusal(reason: &'static str, message: impl Into<String>) -> McpError {
+    McpError::internal_error(message.into(), Some(serde_json::json!({ "reason": reason })))
+}
+
 /// The graph as a name source for one answer: answering from the lent handle and its root
 /// table, or absent for the reason the graph's lifecycle gives.
 fn graph_name_source<'a>(
@@ -1172,6 +1183,13 @@ impl McpServer {
 
     pub(crate) fn background_work_active(&self) -> bool {
         self.state.background_work_active()
+    }
+
+    /// Whether this server, superseded, has finished its graph reads and let the graph file go:
+    /// from then on it has nothing to finish but its sessions, and a transport serving it
+    /// closes them rather than keep a client on a backend that answers `owner_changed`.
+    pub fn graph_released(&self) -> bool {
+        self.state.graph_released()
     }
 
     /// Browse the configuration's metadata: objects, their structure, and managed forms.
@@ -1984,9 +2002,32 @@ impl McpServer {
             };
         }
 
+        if let Some(reason) = graph.unavailable_reason() {
+            return Err(graph_refusal("graph_unavailable", reason));
+        }
+        // A new owner waiting for the previous one to let the file go: a request waits a moment
+        // for the hand-over, then says it is busy rather than holding the client indefinitely.
+        if graph.waiting_for_access_since().is_some() {
+            let admission = tokio::time::Instant::now() + GRAPH_ADMISSION_WAIT;
+            while graph.waiting_for_access_since().is_some()
+                && tokio::time::Instant::now() < admission
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if let Some(since) = graph.waiting_for_access_since() {
+                return Err(graph_refusal(
+                    "graph_busy",
+                    format!(
+                        "the graph is being handed over from the previous owner ({}s so far); \
+                         retry shortly",
+                        since.elapsed().as_secs()
+                    ),
+                ));
+            }
+        }
         match graph.status() {
             _ if superseded => {
-                return Err(McpError::internal_error(crate::graph::SUPERSEDED_GRAPH_ERROR, None))
+                return Err(graph_refusal("owner_changed", crate::graph::SUPERSEDED_GRAPH_ERROR))
             }
             GraphStatus::Disabled => {
                 return Err(McpError::invalid_params(
@@ -2087,9 +2128,16 @@ impl McpServer {
         .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?;
         match served {
             Ok(response) => response,
-            Err(_) if graph.superseded_latched() => {
-                Err(McpError::internal_error(crate::graph::SUPERSEDED_GRAPH_ERROR, None))
+            Err(crate::graph::GraphReadError::OwnerChanged) => {
+                Err(graph_refusal("owner_changed", crate::graph::SUPERSEDED_GRAPH_ERROR))
             }
+            Err(_) if graph.superseded_latched() => {
+                Err(graph_refusal("owner_changed", crate::graph::SUPERSEDED_GRAPH_ERROR))
+            }
+            Err(crate::graph::GraphReadError::Busy) => Err(graph_refusal(
+                "graph_busy",
+                "the graph's ownership is being confirmed; retry shortly",
+            )),
             Err(_) => finish_loading(tools::graph::loading(None)),
         }
     }
@@ -3486,6 +3534,53 @@ mod graph_supersession_contract {
         References,
     }
 
+    /// A second live process of this version over one cache directory never opens the graph:
+    /// its graph requests are refused as unavailable — not as loading, not as an empty answer —
+    /// naming the directory and the way out, and the first owner's files are left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_held_by_a_live_process_of_this_version_refuses_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let heartbeat =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::write(
+            cache.lease_path(),
+            serde_json::json!({
+                "generation": 1,
+                "token": 7,
+                "pid": 424242,
+                "heartbeat_secs": heartbeat,
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+        let token = tokio_util::sync::CancellationToken::new;
+        let refused = server
+            .graph(params("overview", None), token())
+            .await
+            .expect_err("a graph this process may not open is refused");
+        assert_eq!(
+            refused.data.as_ref().and_then(|data| data["reason"].as_str()),
+            Some("graph_unavailable")
+        );
+        assert!(refused.message.contains(&cache.root().display().to_string()), "{refused:?}");
+        assert!(refused.message.contains("--cache-dir"), "{refused:?}");
+        let status = server.graph(params("status", None), token()).await.unwrap();
+        let body = status.structured_content.expect("status is structured");
+        assert_eq!(body["state"], "failed");
+        assert!(body["error"].as_str().unwrap_or_default().contains("graph busy"), "{body}");
+        assert!(!cache.graph_db_path().exists(), "the graph file was neither opened nor built");
+        server.shutdown();
+    }
+
     async fn assert_busy_graph_handler_returns_immediately(handler: BusyGraphHandler) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3498,9 +3593,7 @@ mod graph_supersession_contract {
         let graph = state.graph().clone();
         graph.ensure_first_build();
         crate::graph::test_support::wait_ready(&graph);
-        let held: Vec<_> = (0..crate::graph::SNAPSHOT_POOL_CAP)
-            .map(|_| graph.snapshot().expect("the published pool has four handles"))
-            .collect();
+        let held = crate::graph::test_support::hold_every_handle(&graph);
         // Held until this stand lets go, so what follows can say WHEN the answer came back
         // rather than how long it took.
         let (lock, release_the_lock) =
@@ -4226,8 +4319,7 @@ mod graph_supersession_contract {
                 assert!(!validator.is_valid(&missing));
             }
         }
-        let held: Vec<_> =
-            (0..crate::graph::SNAPSHOT_POOL_CAP).map(|_| graph.snapshot().unwrap()).collect();
+        let held = crate::graph::test_support::hold_every_handle(&graph);
         for action in ["overview", "node", "source", "neighbors", "callers", "callees"] {
             let request = params(action, Some("method/common/Сервер/Считать"));
             let body = server.graph(request, token()).await.unwrap().structured_content.unwrap();

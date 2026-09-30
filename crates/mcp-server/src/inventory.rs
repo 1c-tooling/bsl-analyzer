@@ -662,6 +662,12 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("graph_db.rs", "spawn_build_watchdog", ".wait_timeout(", Waiting::OwnProtocol),
     // A read waiting for a pooled graph handle to come back: bounded by the caller's wait.
     ("graph/snapshot.rs", "checkout", ".wait_timeout(", Waiting::Bounded),
+    // A superseded graph waits for its reads in flight before it closes the file; it ends when
+    // they return, and no read is cut short.
+    ("graph/snapshot.rs", "wait_until_returned", ".wait(", Waiting::OwnProtocol),
+    // A new owner re-trying the graph file's access lock, one short sleep per attempt, leaving
+    // on the stop it checks between them.
+    ("graph/state.rs", "acquire_graph_access", "thread::sleep", Waiting::Bounded),
     // The boot's publication takes the engine for one attempt at a time; the pause between
     // lease attempts is not held under it, which is why this wait is the owner's and bounded
     // by the attempt rather than by a foreign lease holder.

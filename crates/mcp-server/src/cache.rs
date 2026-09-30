@@ -102,6 +102,12 @@ impl WorkspaceCacheLayout {
         self.root.join(LEASE_LOCK_FILE)
     }
 
+    /// The file whose exclusive lock a process holds for as long as it may open the published
+    /// graph. Never removed or renamed while in use.
+    pub(crate) fn graph_access_lock_path(&self) -> PathBuf {
+        self.root.join("bsl-graph.access.lock")
+    }
+
     pub fn stall_report_path(&self) -> PathBuf {
         self.root.join(STALL_REPORT_FILE)
     }

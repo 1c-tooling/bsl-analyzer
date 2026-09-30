@@ -264,6 +264,25 @@ impl GraphState {
         let Some(workspace_root) = self.workspace_root.clone() else {
             return;
         };
+        if let Some(reason) = self.unavailable_reason() {
+            self.record_load_failure(
+                is_reload,
+                LoadFailure::new(LoadFailureReason::TransientRefusal, reason),
+            );
+            return;
+        }
+        // Nothing below opens the graph file before this process holds its access lock. The
+        // wait has no deadline: the previous owner lets go once its reads are done.
+        if !self.acquire_graph_access(true) {
+            self.record_load_failure(
+                is_reload,
+                LoadFailure::new(
+                    LoadFailureReason::TransientRefusal,
+                    "this process does not hold the graph file's access lock",
+                ),
+            );
+            return;
+        }
         // The generation this build will carry. Only one load runs at a time (the
         // initial load, then at most one reload via the claim guard), so peeking the
         // current generation without reserving it is race-free; a failed build leaves

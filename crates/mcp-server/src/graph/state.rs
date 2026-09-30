@@ -433,6 +433,8 @@ pub(crate) struct GraphState {
     /// The highest context-dirty mark the search engine placed for a render this graph could
     /// not serve, not yet registered. See [`OwedContextMarks`].
     pub(super) owed_context_marks: Arc<std::sync::atomic::AtomicI64>,
+    /// This process's hold on the graph file, shared with the lease observer that lets it go.
+    pub(super) access: Arc<Mutex<GraphAccess>>,
     /// Who publishes through this graph, in every `publication_id` it writes.
     pub(super) publication_owner: u64,
     /// How many publication identities this graph has handed out.
@@ -562,6 +564,7 @@ impl GraphState {
             first_build_kicks: Arc::new(AtomicUsize::new(0)),
             claims: Arc::new(AtomicUsize::new(0)),
             owed_context_marks: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            access: Arc::new(Mutex::new(GraphAccess::NotHeld)),
             publication_owner: crate::workspace_lease::new_token(),
             publications: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             continuation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1254,10 +1257,160 @@ impl GraphState {
     }
 
     /// Attach the daemon's claim on the workspace's derived caches, so this graph stops
-    /// building and publishing once a newer daemon generation takes the workspace over.
+    /// building and publishing once a newer daemon generation takes the workspace over — and
+    /// stops reading: a lost workspace retires the store, waits for the reads in flight, closes
+    /// every handle and gives the file's access lock to the next owner. A check that could not
+    /// answer only holds new reads back until one does.
     pub(crate) fn with_lease(mut self, lease: crate::workspace_lease::WorkspaceLease) -> Self {
+        let store = self.store.clone();
+        let access = Arc::clone(&self.access);
+        lease.observe(Arc::new(move |check| {
+            use super::snapshot::Admission;
+            use crate::workspace_lease::OwnershipCheck;
+            match check {
+                OwnershipCheck::Owned => store.set_admission(Admission::Open),
+                OwnershipCheck::Unknown => store.set_admission(Admission::Paused),
+                OwnershipCheck::Lost => {
+                    store.set_admission(Admission::Retired);
+                    let (store, access) = (store.clone(), Arc::clone(&access));
+                    let spawned = std::thread::Builder::new()
+                        .name("bsl-graph-retire".to_owned())
+                        .spawn(move || {
+                            store.wait_until_returned();
+                            let held = std::mem::replace(
+                                &mut *lock_recover(&access),
+                                GraphAccess::Released,
+                            );
+                            if matches!(held, GraphAccess::Held(_)) {
+                                tracing::info!(
+                                    "graph ownership passed on: reads finished, handles closed, \
+                                     access to the graph file released"
+                                );
+                            }
+                        });
+                    if let Err(error) = spawned {
+                        // The closed handles are already gone; the lock goes with the process.
+                        tracing::warn!(%error, "could not start the graph retirement thread");
+                    }
+                }
+            }
+        }));
         self.lease = lease;
         self
+    }
+
+    /// Why this graph will not be opened at all, when that is so: its cache directory is held
+    /// by another live process of this version, or this process could not coordinate over it.
+    pub(crate) fn unavailable_reason(&self) -> Option<String> {
+        let cache_dir =
+            || self.cache().map(|cache| cache.root().display().to_string()).unwrap_or_default();
+        if self.lease.coordination_failed() {
+            return Some(format!(
+                "graph unavailable: this process could not claim the cache directory {} and \
+                 does not open a graph it cannot coordinate over; restart it once the directory \
+                 is writable",
+                cache_dir()
+            ));
+        }
+        self.lease.busy_owner().map(|owner| {
+            format!(
+                "graph busy: the cache directory {} is used by another live process (pid {}, \
+                 version {}); give this process a separate --cache-dir",
+                cache_dir(),
+                owner.pid,
+                owner.version.as_deref().unwrap_or("unknown")
+            )
+        })
+    }
+
+    /// Whether this process has let the graph go for good: ownership was lost, every read in
+    /// flight has finished and the file's access lock is released.
+    pub(crate) fn released(&self) -> bool {
+        matches!(*lock_recover(&self.access), GraphAccess::Released)
+    }
+
+    /// Since when this process has been waiting for the previous owner to release the graph
+    /// file, while it waits.
+    pub(crate) fn waiting_for_access_since(&self) -> Option<Instant> {
+        match &*lock_recover(&self.access) {
+            GraphAccess::Waiting { since } => Some(*since),
+            _ => None,
+        }
+    }
+
+    /// Take the graph file's access lock before this process opens the published graph, and
+    /// keep it for as long as it may. Only a managed lease coordinates across processes; any
+    /// other graph has nobody to wait for.
+    ///
+    /// Waits without a deadline when `wait`, re-trying the lock and never holding the lease's
+    /// own lock meanwhile, and says so in the log at a bounded rate. `false`: the lock is not
+    /// held — not yet, when not waiting, or never again, once ownership is gone.
+    pub(super) fn acquire_graph_access(&self, wait: bool) -> bool {
+        let Some(path) = self
+            .cache()
+            .filter(|_| self.lease.is_managed())
+            .map(crate::cache::WorkspaceCacheLayout::graph_access_lock_path)
+        else {
+            return true;
+        };
+        let mut warned_at = None;
+        loop {
+            {
+                let mut access = lock_recover(&self.access);
+                match &*access {
+                    GraphAccess::Held(_) => return true,
+                    GraphAccess::Released => return false,
+                    GraphAccess::NotHeld | GraphAccess::Waiting { .. } => {}
+                }
+                match crate::workspace_lease::ExclusiveFileLock::try_acquire(&path) {
+                    Ok(Some(lock)) => {
+                        // Confirmed again once the file is ours: the lease may have moved on
+                        // while this process waited for the previous owner.
+                        if !self.lease.owns_caches_now() {
+                            *access = GraphAccess::NotHeld;
+                            return false;
+                        }
+                        if let GraphAccess::Waiting { since } = &*access {
+                            tracing::info!(
+                                waited_secs = since.elapsed().as_secs(),
+                                "the previous owner released the graph file; opening it"
+                            );
+                        }
+                        *access = GraphAccess::Held(lock);
+                        return true;
+                    }
+                    Ok(None) => {
+                        if matches!(*access, GraphAccess::NotHeld) {
+                            *access = GraphAccess::Waiting { since: Instant::now() };
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            path = %path.display(),
+                            "could not take the graph access lock; the graph stays closed"
+                        );
+                        *access = GraphAccess::NotHeld;
+                        return false;
+                    }
+                }
+            }
+            if !wait || self.stop.is_stopped() || self.lease_is_terminal() {
+                return false;
+            }
+            if warned_at.is_none_or(|at: Instant| at.elapsed() >= ACCESS_WAIT_WARNING) {
+                warned_at = Some(Instant::now());
+                tracing::warn!(
+                    path = %path.display(),
+                    waited_secs = self
+                        .waiting_for_access_since()
+                        .map_or(0, |since| since.elapsed().as_secs()),
+                    "waiting for the previous owner of the graph to finish its reads and release \
+                     the file"
+                );
+            }
+            std::thread::sleep(ACCESS_RETRY);
+        }
     }
 
     /// Wire the daemon's stop into the graph, so the decision reads it.
@@ -1990,6 +2143,25 @@ impl GraphState {
             drift_watch,
             poll_cycle_secs: watch_sample.and_then(|(_, cycle, _)| cycle),
         };
+        if let Some(reason) = self.unavailable_reason() {
+            return (
+                GraphStatusReport { error: Some(reason), ..report("failed", None) },
+                Target::new(Kind::Graph, crate::indexing::State::Failed, None),
+            );
+        }
+        if let Some(since) = self.waiting_for_access_since() {
+            return (
+                GraphStatusReport {
+                    error: Some(format!(
+                        "waiting {}s for the previous owner to finish its reads and release the \
+                         graph file",
+                        since.elapsed().as_secs()
+                    )),
+                    ..report("loading", None)
+                },
+                Target::new(Kind::Graph, crate::indexing::State::Waiting, None),
+            );
+        }
         let superseded = self.lease.is_superseded();
         // A busy owner reads as loading, but a superseded one is terminal and never loads.
         let busy = || {
@@ -2526,6 +2698,12 @@ impl GraphState {
         let Some(workspace_root) = self.workspace_root.clone() else {
             return FusedStartup::Standalone;
         };
+        // The boot does not wait for another process's reads: the loader waits for the file
+        // on its own thread, and the search index is built standalone meanwhile.
+        if self.unavailable_reason().is_some() || !self.acquire_graph_access(false) {
+            self.ensure_loading();
+            return FusedStartup::Standalone;
+        }
         if !self.try_begin_external_build() {
             // A concurrent path (e.g. a graph tool call) already owns the build; index
             // the search engine the normal way against whatever graph it produces.
@@ -2575,6 +2753,26 @@ impl GraphState {
             }
         }
     }
+}
+
+/// How often a process waiting for the graph file tries its access lock again.
+const ACCESS_RETRY: Duration = Duration::from_millis(250);
+/// How often a process still waiting for the graph file says so in the log.
+const ACCESS_WAIT_WARNING: Duration = Duration::from_secs(60);
+
+/// This process's hold on the graph file's access lock.
+pub(super) enum GraphAccess {
+    NotHeld,
+    /// The previous owner still holds the file.
+    Waiting {
+        since: Instant,
+    },
+    Held(
+        #[allow(dead_code, reason = "held for its drop, which releases the lock")]
+        crate::workspace_lease::ExclusiveFileLock,
+    ),
+    /// Ownership is gone; the lock was let go and is never taken again by this process.
+    Released,
 }
 
 /// Context-dirty marks the search engine placed for renders the published graph could not
@@ -4300,6 +4498,159 @@ mod tests {
         );
     }
 
+    /// A new owner opens nothing while the previous one still holds the graph file: it waits,
+    /// says since when, and loads once the file is let go.
+    #[test]
+    fn a_new_owner_waits_for_the_graph_file_before_opening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let previous =
+            crate::workspace_lease::ExclusiveFileLock::try_acquire(&cache.graph_access_lock_path())
+                .unwrap()
+                .expect("the previous owner's lock");
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease);
+        graph.ensure_loading();
+        wait_until(&graph, "the new owner to wait for the file", || {
+            graph.waiting_for_access_since().is_some()
+        });
+        let report = graph.status_report();
+        assert_eq!(report.state, "loading");
+        assert!(report.error.as_deref().is_some_and(|error| error.contains("previous owner")));
+        assert!(!cache.graph_db_path().exists(), "nothing was built or opened meanwhile");
+
+        drop(previous);
+        wait_ready(&graph);
+        assert!(graph.waiting_for_access_since().is_none());
+    }
+
+    /// A check that cannot answer holds new reads back without retiring anything: once the
+    /// owner is confirmed again, the same handles serve.
+    #[test]
+    fn an_unanswered_ownership_check_pauses_reads_without_retiring_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease.clone());
+        graph.ensure_loading();
+        wait_ready(&graph);
+
+        // The record gone and its lock held: the check can neither read an owner nor claim one.
+        let held = lease.hold_file_lock_for_test();
+        std::fs::remove_file(cache.lease_path()).unwrap();
+        assert!(!lease.owns_caches_now());
+        assert!(!lease.is_superseded(), "an unanswered check is not a lost workspace");
+        assert_eq!(
+            graph.store.read(None, Duration::from_millis(50), |_| ()),
+            Err(super::super::snapshot::GraphReadError::Busy)
+        );
+
+        drop(held);
+        assert!(lease.owns_caches_now(), "the free workspace is claimed again");
+        assert!(graph.read(|snapshot| snapshot.generation()).is_ok(), "the same pool serves");
+        assert!(!graph.released());
+    }
+
+    /// Ownership passes between two graphs of one process in the order two processes need: the
+    /// superseded one lends nothing new, lets its read in flight finish, closes its handles and
+    /// lets the file go, and only then does its successor open it.
+    #[test]
+    fn a_superseded_owner_lets_the_file_go_once_its_reads_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let first = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(crate::workspace_lease::WorkspaceLease::claim_cache(&cache));
+        first.ensure_loading();
+        wait_ready(&first);
+        let in_flight = first.snapshot().expect("a read in flight");
+
+        let second = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(crate::workspace_lease::WorkspaceLease::claim_cache(&cache));
+        assert!(first.is_superseded());
+        second.ensure_loading();
+        wait_until(&second, "the successor to wait for the file", || {
+            second.waiting_for_access_since().is_some()
+        });
+        assert_eq!(
+            first.read(|snapshot| snapshot.generation()),
+            Err(super::super::snapshot::GraphReadError::OwnerChanged)
+        );
+        assert!(in_flight.graph.freshness_token().is_ok(), "the read in flight is not cut");
+        assert!(!first.released());
+
+        drop(in_flight);
+        wait_ready(&second);
+        assert!(first.released(), "the file went to the successor");
+    }
+
+    /// Each cache directory has its own access lock: a directory whose file is held elsewhere
+    /// keeps only its own graph waiting, and the other five load.
+    #[test]
+    fn independent_cache_directories_do_not_wait_for_each_other() {
+        let dirs: Vec<_> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
+        let caches: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                sample_workspace(dir.path());
+                crate::cache::WorkspaceCacheLayout::for_workspace(dir.path())
+            })
+            .collect();
+        caches[0].ensure().unwrap();
+        let held = crate::workspace_lease::ExclusiveFileLock::try_acquire(
+            &caches[0].graph_access_lock_path(),
+        )
+        .unwrap()
+        .expect("a stranger holds the first directory's file");
+        let graphs: Vec<_> = dirs
+            .iter()
+            .zip(&caches)
+            .map(|(dir, cache)| {
+                let graph =
+                    GraphState::for_workspace_with_cache(dir.path().to_path_buf(), cache.clone())
+                        .with_lease(crate::workspace_lease::WorkspaceLease::claim_cache(cache));
+                graph.ensure_loading();
+                graph
+            })
+            .collect();
+        for graph in &graphs[1..] {
+            wait_ready(graph);
+        }
+        assert!(graphs[0].waiting_for_access_since().is_some(), "only the held one waits");
+        drop(held);
+        wait_ready(&graphs[0]);
+    }
+
+    /// A process that could not claim its cache directory at all does not open the graph over
+    /// it, and says why.
+    #[test]
+    fn an_uncoordinated_graph_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        sample_workspace(&root);
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::from_root(blocker.join("cache"));
+        let graph = GraphState::for_workspace_with_cache(root, cache.clone())
+            .with_lease(crate::workspace_lease::WorkspaceLease::claim_cache(&cache));
+        assert!(graph
+            .unavailable_reason()
+            .is_some_and(|reason| reason.contains("could not claim")));
+        graph.ensure_loading();
+        wait_until(&graph, "the load to be refused", || {
+            matches!(graph.status_report().state, "failed")
+        });
+        assert!(graph.snapshot().is_none());
+    }
+
     #[test]
     fn superseded_status_truth_table() {
         let dir = tempfile::tempdir().unwrap();
@@ -4345,11 +4696,18 @@ mod tests {
         assert!(lease.is_superseded());
 
         lock_recover(&graph.inner).status = GraphStatus::Ready { files: 2 };
+        assert!(!graph.released(), "the reads in flight keep the file until they finish");
         drop(held);
+        wait_until(&graph, "the superseded graph to let its file go", || graph.released());
         let returned = graph.status_report();
-        assert_eq!(returned.state, "ready");
+        assert_eq!(returned.state, "failed", "a returned handle is closed, never lent again");
         assert_eq!(returned.superseded, Some(true));
-        assert_eq!(returned.revision, Some(own_revision));
+        assert!(graph.snapshot().is_none());
+        assert_eq!(
+            graph.read(|snapshot| snapshot.generation()),
+            Err(super::super::snapshot::GraphReadError::OwnerChanged),
+            "revision {own_revision} is not served by a process that lost the workspace"
+        );
         assert!(matches!(
             lock_recover(&graph.inner).published.as_ref().map(|p| &p.reload),
             Some(ReloadState::Idle)

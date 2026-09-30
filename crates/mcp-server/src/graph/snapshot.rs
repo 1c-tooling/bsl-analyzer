@@ -119,6 +119,21 @@ pub(super) struct SnapshotPool {
     roots: Option<bsl_search::WorkspaceRoots>,
     /// Whether any publication has been installed; before that no read is served.
     installed: bool,
+    /// Whether handles may be lent at all.
+    admission: Admission,
+    /// Handles lent and not yet returned, the pooled ones and the background reader's own.
+    lent: usize,
+}
+
+/// Whether the store lends handles, as this process's ownership of the graph file allows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Admission {
+    #[default]
+    Open,
+    /// Ownership could not be confirmed a moment ago: new reads wait, nothing is closed.
+    Paused,
+    /// Ownership is gone: no handle is lent again, and each one closes as it comes back.
+    Retired,
 }
 
 /// Why a read of the published graph was not served. Never an empty answer: a caller that
@@ -129,6 +144,10 @@ pub(crate) enum GraphReadError {
     Unavailable,
     /// The installed publication is not the generation the caller planned against.
     Changed,
+    /// Reads are held back for a moment: the file's owner is being confirmed or awaited.
+    Busy,
+    /// Another process owns the graph file now; this one reads it no more.
+    OwnerChanged,
 }
 
 impl std::fmt::Display for GraphReadError {
@@ -136,6 +155,8 @@ impl std::fmt::Display for GraphReadError {
         f.write_str(match self {
             Self::Unavailable => "graph is not available for reading",
             Self::Changed => "the published graph generation changed",
+            Self::Busy => "the graph is busy; retry shortly",
+            Self::OwnerChanged => super::types::SUPERSEDED_GRAPH_ERROR,
         })
     }
 }
@@ -240,7 +261,12 @@ impl GraphStore {
         let deadline = Instant::now().checked_add(wait);
         let mut pool = lock_recover(&self.shared.pool);
         loop {
-            if !pool.installed {
+            let held = match pool.admission {
+                Admission::Retired => return Err(GraphReadError::OwnerChanged),
+                Admission::Paused => true,
+                Admission::Open => false,
+            };
+            if !held && !pool.installed {
                 return Err(GraphReadError::Unavailable);
             }
             let generation = pool.generation;
@@ -248,8 +274,9 @@ impl GraphStore {
                 return Err(GraphReadError::Changed);
             }
             // Entries of a superseded generation are dropped here, never served.
-            while let Some(entry) = pool.entries.pop() {
+            while let Some(entry) = (!held).then(|| pool.entries.pop()).flatten() {
                 if entry.generation == generation {
+                    pool.lent += 1;
                     let workspace_roots = pool.roots.clone();
                     return Ok(GraphSnapshot::lent(entry, self.clone(), workspace_roots));
                 }
@@ -258,7 +285,7 @@ impl GraphStore {
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::MAX);
             if left.is_zero() {
-                return Err(GraphReadError::Unavailable);
+                return Err(if held { GraphReadError::Busy } else { GraphReadError::Unavailable });
             }
             pool = self
                 .shared
@@ -271,12 +298,48 @@ impl GraphStore {
 
     fn give_back(&self, entry: PooledSnapshotEntry) {
         let mut pool = lock_recover(&self.shared.pool);
-        if pool.generation == entry.generation && pool.entries.len() < SNAPSHOT_POOL_CAP {
+        pool.lent = pool.lent.saturating_sub(1);
+        let keep = pool.admission != Admission::Retired
+            && pool.generation == entry.generation
+            && pool.entries.len() < SNAPSHOT_POOL_CAP;
+        if keep {
             pool.entries.push(entry);
-            drop(pool);
-            // Every waiter re-checks: one whose deadline has just passed must not swallow the
-            // wake-up another could use.
-            self.shared.returned.notify_all();
+        }
+        drop(pool);
+        // Every waiter re-checks: one whose deadline has just passed must not swallow the
+        // wake-up another could use, and a retirement waits for the last return.
+        self.shared.returned.notify_all();
+    }
+
+    /// Count a handle a background reader opened for itself, which comes back like a pooled one.
+    fn lend_own(&self) {
+        lock_recover(&self.shared.pool).lent += 1;
+    }
+
+    /// Allow, hold back or end lending. Retirement is final: the idle handles close at once,
+    /// and the lent ones as they return.
+    pub(crate) fn set_admission(&self, admission: Admission) {
+        let mut pool = lock_recover(&self.shared.pool);
+        if pool.admission == Admission::Retired {
+            return;
+        }
+        pool.admission = admission;
+        let closing = if admission == Admission::Retired {
+            std::mem::take(&mut pool.entries)
+        } else {
+            Vec::new()
+        };
+        drop(pool);
+        drop(closing);
+        self.shared.returned.notify_all();
+    }
+
+    /// Wait until every lent handle has come back. No deadline: an active read is never cut.
+    pub(crate) fn wait_until_returned(&self) {
+        let mut pool = lock_recover(&self.shared.pool);
+        while pool.lent > 0 {
+            pool =
+                self.shared.returned.wait(pool).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
@@ -1071,6 +1134,7 @@ impl GraphState {
         }) {
             LeaseOperationOutcome::Applied(()) => {
                 let (entry, _) = prepared.take().expect("successful publication retains entry");
+                self.store.lend_own();
                 LeaseOperationOutcome::Applied(Some(GraphSnapshot::lent(
                     entry,
                     self.store.clone(),
