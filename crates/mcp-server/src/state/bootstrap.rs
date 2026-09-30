@@ -524,11 +524,14 @@ impl SharedState {
         // validation→apply window without making an unrelated watched file reject the plan.
         let embed_flight = EmbedFlight::new();
         let root_drift_epoch = Arc::new(AtomicU64::new(0));
-        let graph = GraphState::for_workspace_with_cache(source_dir.clone(), cache.clone());
+        // The hub first: the provider this hook installs reports owed marks through it.
+        let graph = GraphState::for_workspace_with_cache(source_dir.clone(), cache.clone())
+            .with_change_hub(change_hub.clone());
         let publish_hook = Self::build_publish_hook(
             Arc::clone(&search_engine),
             owners.clone(),
             graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),
@@ -538,7 +541,6 @@ impl SharedState {
             embedding_publish_retry_budget,
         );
         let graph = graph
-            .with_change_hub(change_hub.clone())
             .with_publish_hook(publish_hook)
             .with_lease(workspace_lease.clone())
             .with_owner_stop(owners.clone());
@@ -1773,6 +1775,7 @@ impl SharedState {
                             graph.store().clone(),
                             generation,
                             graph_project.search_roots.as_ref(),
+                            Some(graph.owed_context_marks()),
                         ),
                     ));
                     tracing::info!("graph-enriched embeddings enabled");

@@ -261,6 +261,7 @@ impl Watcher {
         if self.graph.take_first_build_ask() {
             self.graph.ensure_loading();
         }
+        self.graph.register_owed_context_marks();
         self.graph.drive_without_the_first_build();
     }
 

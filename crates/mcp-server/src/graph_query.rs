@@ -1669,36 +1669,31 @@ pub(crate) struct GraphDbContextProvider {
     store: crate::graph::GraphStore,
     generation: u64,
     roots: Option<bsl_search::WorkspaceRoots>,
+    owed: Option<crate::graph::OwedContextMarks>,
 }
 
 impl GraphDbContextProvider {
+    /// `owed` is where marks for renders this provider failed are reported; without it they
+    /// wait in the search store for the next consumption of leftover marks.
     pub(crate) fn new(
         store: crate::graph::GraphStore,
         generation: u64,
         roots: Option<&bsl_search::WorkspaceRoots>,
+        owed: Option<crate::graph::OwedContextMarks>,
     ) -> Self {
-        Self { store, generation, roots: roots.cloned() }
+        Self { store, generation, roots: roots.cloned(), owed }
     }
 }
 
 impl bsl_search::GraphContextProvider for GraphDbContextProvider {
-    /// The render of a chunk indexed from scratch. Such a chunk has no dirty mark to keep, so
-    /// a render lost to a newer publication would stay missing until the next topology change;
-    /// it follows the newest publication instead, as long as that one places files under the
-    /// same root table. A failure is still no context rather than a guess.
-    fn graph_context(&self, rel_path: &str, symbol_name: &str, _kind: &str) -> Option<String> {
-        let id = ide::method_id_for_path(rel_path, symbol_name)?;
-        self.store
-            .read(None, crate::graph::BACKGROUND_READ_WAIT, |snapshot| {
-                if snapshot.generation() != self.generation
-                    && snapshot.workspace_roots() != self.roots.as_ref()
-                {
-                    return None;
-                }
-                snapshot.graph.graph_context(&id, self.roots.as_ref()).ok().flatten()
-            })
-            .ok()
-            .flatten()
+    fn graph_context(&self, rel_path: &str, symbol_name: &str, kind: &str) -> Option<String> {
+        self.try_graph_context(rel_path, symbol_name, kind).ok().flatten()
+    }
+
+    fn context_marks_owed(&self, mark_high: i64) {
+        if let Some(owed) = &self.owed {
+            owed.record(mark_high);
+        }
     }
 
     fn try_graph_context(

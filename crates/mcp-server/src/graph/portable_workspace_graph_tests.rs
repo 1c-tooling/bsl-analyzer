@@ -168,7 +168,8 @@ fn seed_ready_search(cache: &WorkspaceCacheLayout, workspace_root: &Path, vector
         .expect("open graph for search fixture context");
     let generation =
         store.status().and_then(|status| status.generation).expect("the served generation");
-    let provider = crate::graph_query::GraphDbContextProvider::new(store, generation, Some(roots));
+    let provider =
+        crate::graph_query::GraphDbContextProvider::new(store, generation, Some(roots), None);
     let chunks = bsl_search::Chunker::chunk(CLIENT_SOURCE);
     assert_eq!(chunks.len(), 1, "client fixture must have one method chunk");
     let client_contexts = chunks

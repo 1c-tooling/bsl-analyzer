@@ -430,6 +430,9 @@ pub(crate) struct GraphState {
     pub(super) first_build_kicks: Arc<AtomicUsize>,
     /// Admissions granted in this generation, so each has an identity of its own.
     pub(super) claims: Arc<AtomicUsize>,
+    /// The highest context-dirty mark the search engine placed for a render this graph could
+    /// not serve, not yet registered. See [`OwedContextMarks`].
+    pub(super) owed_context_marks: Arc<std::sync::atomic::AtomicI64>,
     /// Owed work a bounded turn could not finish. Read by the owner before its wait, so the
     /// yield hands the work on instead of sleeping on it.
     pub(super) continuation: Arc<std::sync::atomic::AtomicBool>,
@@ -554,6 +557,7 @@ impl GraphState {
             #[cfg(test)]
             first_build_kicks: Arc::new(AtomicUsize::new(0)),
             claims: Arc::new(AtomicUsize::new(0)),
+            owed_context_marks: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             continuation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             loader_cannot_spawn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -565,6 +569,27 @@ impl GraphState {
             quiet_losses: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             claim_is_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Where a context provider of this graph reports the marks it owes.
+    pub(crate) fn owed_context_marks(&self) -> OwedContextMarks {
+        OwedContextMarks {
+            high: Arc::clone(&self.owed_context_marks),
+            alarms: Arc::clone(&self.alarms),
+            hub: self.change_hub.clone(),
+        }
+    }
+
+    /// Register the marks reported through [`OwedContextMarks`] as marks this graph consumes.
+    ///
+    /// Under the fact the hub stands at NOW, not fact `0`: a consumption clears every mark up to
+    /// its bound, and a mark an `.xml` change placed before these, for a fact no publication has
+    /// observed yet, must not be cleared against a graph that predates that change.
+    pub(super) fn register_owed_context_marks(&self) {
+        let high = self.owed_context_marks.swap(0, Ordering::SeqCst);
+        if high > 0 {
+            self.marks_placed(high, self.observation());
         }
     }
 
@@ -2536,6 +2561,27 @@ impl GraphState {
                 );
                 FusedStartup::Standalone
             }
+        }
+    }
+}
+
+/// Context-dirty marks the search engine placed for renders the published graph could not
+/// serve. The context provider reports them while the engine is held, so reporting only raises
+/// a high-water and wakes the watcher; the watcher registers them with the graph, which
+/// consumes them against a publication like any other mark.
+#[derive(Clone)]
+pub(crate) struct OwedContextMarks {
+    high: Arc<std::sync::atomic::AtomicI64>,
+    alarms: Arc<AtomicUsize>,
+    hub: Option<WorkspaceChangeHub>,
+}
+
+impl OwedContextMarks {
+    pub(crate) fn record(&self, mark_high: i64) {
+        self.high.fetch_max(mark_high, Ordering::SeqCst);
+        self.alarms.fetch_add(1, Ordering::SeqCst);
+        if let Some(hub) = &self.hub {
+            hub.wake_waiters();
         }
     }
 }

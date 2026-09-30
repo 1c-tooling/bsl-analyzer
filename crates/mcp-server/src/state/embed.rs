@@ -270,6 +270,7 @@ impl SharedState {
         search_engine: SharedSearchEngine,
         stop: super::OwnerStop,
         graph_store: crate::graph::GraphStore,
+        owed_context_marks: crate::graph::OwedContextMarks,
         semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: Arc<IndexProgress>,
         embed_flight: Arc<EmbedFlight>,
@@ -288,6 +289,7 @@ impl SharedState {
                     &search_engine,
                     &stop,
                     &graph_store,
+                    Some(&owed_context_marks),
                     &root_drift_epoch,
                     &lease,
                     &signal,
@@ -332,6 +334,7 @@ impl SharedState {
         engine: &SharedSearchEngine,
         stop: &super::OwnerStop,
         store: &crate::graph::GraphStore,
+        owed: Option<&crate::graph::OwedContextMarks>,
         root_drift_epoch: &AtomicU64,
         lease: &crate::workspace_lease::WorkspaceLease,
         signal: &crate::graph::GraphPublishSignal,
@@ -353,6 +356,7 @@ impl SharedState {
         };
         let Some(provider) = Self::published_graph_context_provider(
             store,
+            owed,
             signal.revision,
             signal.fingerprint,
             Some(&roots),
@@ -556,6 +560,7 @@ impl SharedState {
 
     fn published_graph_context_provider(
         store: &crate::graph::GraphStore,
+        owed: Option<&crate::graph::OwedContextMarks>,
         revision: u64,
         expected_fingerprint: crate::graph_db::GraphFp,
         roots: Option<&bsl_search::WorkspaceRoots>,
@@ -565,6 +570,7 @@ impl SharedState {
                 store.clone(),
                 revision,
                 roots,
+                owed.cloned(),
             ))),
             Err(error) => {
                 tracing::warn!(
@@ -1046,6 +1052,7 @@ impl SharedState {
                         store.clone(),
                         revision,
                         Some(roots),
+                        None,
                     );
                     let mut apply = |operation: &mut dyn FnMut(
                         &mut dyn FnMut() -> std::ops::ControlFlow<()>,
@@ -2160,6 +2167,7 @@ mod tests {
             Arc::clone(&engine),
             crate::state::OwnerStop::default(),
             graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&progress),
             Arc::clone(&flight),
@@ -2218,6 +2226,7 @@ mod tests {
             Arc::clone(&engine),
             crate::state::OwnerStop::default(),
             graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Disabled)),
             bsl_search::IndexProgress::new(),
             super::EmbedFlight::new(),
@@ -2298,6 +2307,7 @@ mod tests {
                 None,
             )
             .unwrap(),
+            None,
             &AtomicU64::new(0),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &signal,
@@ -2364,6 +2374,7 @@ mod tests {
                 None,
             )
             .unwrap(),
+            None,
             root_drift_epoch.as_ref(),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &signal,
@@ -2817,6 +2828,7 @@ mod tests {
             Arc::clone(&engine_arc),
             crate::state::OwnerStop::default(),
             graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),

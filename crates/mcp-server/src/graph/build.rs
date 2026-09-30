@@ -4069,7 +4069,7 @@ mod tests {
         drop(gdb);
         let store = crate::graph::GraphStore::serving_file_for_test(&out, None).unwrap();
         let provider =
-            crate::graph_query::GraphDbContextProvider::new(store, generation, Some(&roots));
+            crate::graph_query::GraphDbContextProvider::new(store, generation, Some(&roots), None);
         let via_provider = bsl_search::GraphContextProvider::graph_context(
             &provider,
             "CommonModules/Вызыватель/Ext/Module.bsl",

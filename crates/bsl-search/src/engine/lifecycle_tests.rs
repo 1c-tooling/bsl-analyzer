@@ -433,7 +433,7 @@ fn payload_documents() -> (String, Vec<crate::IndexedDocument>, usize) {
     let key = crate::FileKey::configuration("Module.bsl");
     let docs: Vec<_> = crate::Chunker::chunk(&content)
         .iter()
-        .map(|chunk| crate::document::indexed_document_for_chunk(&key, chunk, None))
+        .map(|chunk| crate::document::indexed_document_for_chunk(&key, chunk, None).0)
         .collect();
     assert_eq!(docs.len(), 4);
     let limit = docs.iter().map(|doc| serde_json::json!({"model":"fixture","input":[crate::document::semantic_text_for_indexed_document(doc)],"dimensions":3}).to_string().len()).max().unwrap();

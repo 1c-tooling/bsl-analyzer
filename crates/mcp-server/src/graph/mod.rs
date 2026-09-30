@@ -49,7 +49,7 @@ pub(crate) use snapshot::{
     BackgroundSnapshotError, GraphReadError, GraphSnapshot, GraphStore, PooledGraphDb,
     BACKGROUND_READ_WAIT,
 };
-pub(crate) use state::GraphState;
+pub(crate) use state::{GraphState, OwedContextMarks};
 #[allow(
     unused_imports,
     reason = "the stable graph facade preserves crate::graph lifecycle paths"

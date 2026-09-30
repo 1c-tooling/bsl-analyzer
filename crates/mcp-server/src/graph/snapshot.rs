@@ -1849,35 +1849,54 @@ mod tests {
             graph.store.clone(),
             generation,
             roots.as_ref(),
+            Some(graph.owed_context_marks()),
         );
         let module = "CommonModules/Клиент/Ext/Module.bsl";
         let rendered = provider.try_graph_context(module, "Главная", "procedure");
         assert!(matches!(rendered, Ok(Some(_))), "{rendered:?}");
         assert_eq!(graph.store.lock_pool().len(), SNAPSHOT_POOL_CAP, "the provider owns no handle");
 
-        let newer = |roots: Option<bsl_search::WorkspaceRoots>| {
-            let mut prepared =
-                graph.prepare_snapshot_pool(generation, fingerprint, force_stale).unwrap();
-            for entry in &mut prepared.entries {
-                entry.generation = generation + 1;
-            }
-            graph.store.install(generation + 1, std::mem::take(&mut prepared.entries), roots);
-        };
-        newer(roots.clone());
+        let mut prepared =
+            graph.prepare_snapshot_pool(generation, fingerprint, force_stale).unwrap();
+        for entry in &mut prepared.entries {
+            entry.generation = generation + 1;
+        }
+        graph.store.install(generation + 1, std::mem::take(&mut prepared.entries), roots);
         assert!(
             provider.try_graph_context(module, "Главная", "procedure").is_err(),
-            "a refresh against a newer publication fails, so its dirty mark is kept"
+            "a render against a newer publication fails, so its mark is kept"
         );
-        assert!(
-            provider.graph_context(module, "Главная", "procedure").is_some(),
-            "a chunk indexed from scratch follows a publication under the same roots"
-        );
-        newer(None);
         assert_eq!(
             provider.graph_context(module, "Главная", "procedure"),
             None,
-            "no render against another root table"
+            "the infallible form is the same refusal, never another generation's answer"
         );
+    }
+
+    /// A render the provider failed is owed, and the owing reaches the graph without waiting on
+    /// anything: the engine that reports it is held while it does.
+    #[test]
+    fn marks_owed_by_the_provider_wait_for_the_watcher_to_register_them() {
+        use bsl_search::GraphContextProvider as _;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph = ready_graph(dir.path());
+        let provider = crate::graph_query::GraphDbContextProvider::new(
+            graph.store.clone(),
+            0,
+            None,
+            Some(graph.owed_context_marks()),
+        );
+        let alarms = graph.alarms.load(Ordering::SeqCst);
+        provider.context_marks_owed(5);
+        provider.context_marks_owed(3);
+        assert_eq!(graph.owed_context_marks.load(Ordering::SeqCst), 5, "the highest mark is kept");
+        assert!(graph.alarms.load(Ordering::SeqCst) > alarms, "the watcher is woken");
+
+        graph.register_owed_context_marks();
+        assert_eq!(graph.owed_context_marks.load(Ordering::SeqCst), 0, "registered once");
+        assert!(!graph.marks_pending(), "an observing publication consumes the marks at once");
     }
 
     #[test]

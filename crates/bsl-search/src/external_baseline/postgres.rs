@@ -4440,6 +4440,7 @@ mod tests {
                     chunk,
                     None,
                 )
+                .0
             })
             .collect();
         assert!(documents.len() > 1, "the fixture must exercise more than one chunk");
