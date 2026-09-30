@@ -216,6 +216,9 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
   «умолчание есть, а текст выражения нечитаем» — отдельное состояние, а не
   «параметр обязателен». Добавлен режим `OutlineMode::RegionsOnly`
   (`Analysis::file_outline`) — скелет областей без их содержимого.
+- `UnusedParameters`/`UnusedLocalMethod`: в модуле объекта внешнего отчёта (ERF)
+  `ПриКомпоновкеРезультата`/`OnComposeResult` — платформенное событие, поэтому
+  его параметры и метод больше не считаются неиспользуемыми (github#101).
 
 ### Changed
 

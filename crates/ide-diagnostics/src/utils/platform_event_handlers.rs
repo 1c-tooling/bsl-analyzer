@@ -67,11 +67,11 @@ const MANAGED_APP_UI_HANDLERS: &[&str] = &[
     "приизменениидоступностиосновногосервера",
 ];
 
-/// Result composition — exposed only by the object module of a report. Gated for the
-/// same reason as the application-family sets: a name exempted where the platform never
-/// invokes it masks a genuinely unused method. A catalog's object module is also an
-/// `ObjectModule`, so the module kind alone is not enough — the owning metadata object
-/// decides.
+/// Result composition — exposed only by the object module of a report, ordinary or
+/// external (ERF). Gated for the same reason as the application-family sets: a name
+/// exempted where the platform never invokes it masks a genuinely unused method. A
+/// catalog's object module is also an `ObjectModule`, so the module kind alone is not
+/// enough — the owning metadata object decides.
 const REPORT_OBJECT_MODULE_HANDLERS: &[&str] = &["прикомпоновкерезультата", "oncomposeresult"];
 
 /// The module the platform is looking at: its kind plus, for an object module, the
@@ -112,7 +112,10 @@ pub fn is_external_connection_module_event_handler(name: &str) -> bool {
 
 pub fn is_report_object_module_event_handler(name: &str, owner: ModuleOwner) -> bool {
     if owner.module_type != bsl_metadata::ModuleType::ObjectModule
-        || owner.mdo_type != Some(bsl_metadata::MdoType::Report)
+        || !matches!(
+            owner.mdo_type,
+            Some(bsl_metadata::MdoType::Report | bsl_metadata::MdoType::ExternalReport)
+        )
     {
         return false;
     }
@@ -181,13 +184,30 @@ mod tests {
     }
 
     #[test]
+    fn test_report_handler_is_exempt_for_external_reports() {
+        let external_report = owner(
+            bsl_metadata::ModuleType::ObjectModule,
+            Some(bsl_metadata::MdoType::ExternalReport),
+        );
+
+        assert!(is_report_object_module_event_handler("ПриКомпоновкеРезультата", external_report));
+        assert!(is_report_object_module_event_handler("OnComposeResult", external_report));
+        assert!(is_report_object_module_event_handler("прикомпоновкерезультата", external_report));
+        assert!(!is_report_object_module_event_handler("МойМетод", external_report));
+    }
+
+    #[test]
     fn test_report_handler_not_exempt_for_other_owners() {
         let catalog =
             owner(bsl_metadata::ModuleType::ObjectModule, Some(bsl_metadata::MdoType::Catalog));
         let unknown_owner = owner(bsl_metadata::ModuleType::ObjectModule, None);
         let common = owner(bsl_metadata::ModuleType::CommonModule, None);
+        let external_processor = owner(
+            bsl_metadata::ModuleType::ObjectModule,
+            Some(bsl_metadata::MdoType::ExternalDataProcessor),
+        );
 
-        for other in [catalog, unknown_owner, common] {
+        for other in [catalog, unknown_owner, common, external_processor] {
             assert!(!is_report_object_module_event_handler("ПриКомпоновкеРезультата", other));
             assert!(!is_report_object_module_event_handler("OnComposeResult", other));
         }
