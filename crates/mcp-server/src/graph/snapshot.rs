@@ -142,6 +142,35 @@ impl std::fmt::Display for GraphReadError {
 
 impl std::error::Error for GraphReadError {}
 
+/// What a database declares in its `meta`, read without validating it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct OnDiskIdentity {
+    pub(super) schema_version: Option<u32>,
+    pub(super) publication_id: Option<String>,
+}
+
+/// What the database at `path` says about its own format and identity, read without
+/// validating it. `None`: no database is there. A database whose `meta` will not read declares
+/// nothing, which is not a newer format.
+pub(super) fn on_disk_identity(path: &Path) -> std::io::Result<Option<OnDiskIdentity>> {
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Ok(Some(OnDiskIdentity::default()));
+    };
+    let meta = |key: &str| -> Option<String> {
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0)).ok()
+    };
+    Ok(Some(OnDiskIdentity {
+        schema_version: meta("schema_version").and_then(|value| value.parse().ok()),
+        publication_id: meta("publication_id"),
+    }))
+}
+
 /// What [`GraphStore::status`] can say without opening anything.
 pub(crate) struct GraphStoreStatus {
     /// The installed generation, when one is.

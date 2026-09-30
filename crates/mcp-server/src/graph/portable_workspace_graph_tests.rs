@@ -580,6 +580,11 @@ fn moved_external_cache_reuses_graph_without_a_full_build() {
         "a moved external cache is reused"
     );
     assert_eq!(state.graph().snapshot().expect("moved external graph snapshot").generation, 7);
+    assert_eq!(
+        meta_string(&graph_path, "publication_id"),
+        "test-1",
+        "a moved database keeps the identity another owner published it with, and is served"
+    );
     state.shutdown();
     drop(state);
     assert_eq!(

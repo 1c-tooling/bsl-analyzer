@@ -440,9 +440,19 @@ impl GraphDb {
         let version = self
             .meta("schema_version")?
             .context("graph database has no schema_version (incomplete build)")?;
+        match version.parse::<u32>() {
+            Ok(version) if version == SCHEMA_VERSION => {}
+            Ok(version) if version > SCHEMA_VERSION => anyhow::bail!(
+                "graph database schema_version {version} is newer than this program's \
+                 {SCHEMA_VERSION}"
+            ),
+            _ => anyhow::bail!(
+                "graph database schema_version {version} != expected {SCHEMA_VERSION}"
+            ),
+        }
         anyhow::ensure!(
-            version == SCHEMA_VERSION.to_string(),
-            "graph database schema_version {version} != expected {SCHEMA_VERSION}"
+            self.meta("publication_id")?.is_some_and(|id| !id.is_empty()),
+            "graph database has no publication_id"
         );
         // `nodes`/`edges` are the last meta rows finalize writes; their presence
         // means the build ran to completion.
@@ -474,6 +484,12 @@ impl GraphDb {
             .context("graph database meta.topology_fp missing or unparsable")?;
         let force_stale = self.meta("force_stale")?.map(|v| v == "1").unwrap_or(false);
         Ok((revision, crate::graph_db::GraphFp { files, topology }, force_stale))
+    }
+
+    /// The identity of the publication this database holds.
+    #[cfg(test)]
+    pub(crate) fn publication_id(&self) -> anyhow::Result<String> {
+        self.meta("publication_id")?.context("graph database has no publication_id")
     }
 
     /// The indexed `.bsl` file count recorded at build time, for status display.
@@ -1813,6 +1829,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
         Connection::open(&path)
@@ -1825,6 +1842,48 @@ mod tests {
 
         // Then: a graph from the prior projection schema is rejected for rebuilding.
         assert!(result.is_err(), "prior projection graphs must be rebuilt");
+    }
+
+    /// A database that cannot say which publication it holds is not stamped with an invented
+    /// identity: it is rebuilt. One of a newer format is refused as newer, not as broken.
+    #[test]
+    fn a_database_without_identity_or_of_a_newer_format_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db");
+        let create = || {
+            let _ = std::fs::remove_file(&path);
+            GraphDbWriter::create(&path)
+                .unwrap()
+                .finalize(&GraphMeta {
+                    revision: 1,
+                    fingerprint: crate::graph_db::GraphFp::default(),
+                    files: 0,
+                    built_at: "t".to_string(),
+                    publication_id: "test-1".to_owned(),
+                })
+                .unwrap();
+        };
+
+        create();
+        assert_eq!(GraphDb::open(&path).unwrap().publication_id().unwrap(), "test-1");
+
+        Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM meta WHERE key = 'publication_id'", [])
+            .unwrap();
+        let missing = GraphDb::open(&path).err().expect("no identity, no service").to_string();
+        assert!(missing.contains("publication_id"), "{missing}");
+
+        create();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                params![(crate::graph_db::SCHEMA_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        let newer = GraphDb::open(&path).err().expect("a newer format is refused").to_string();
+        assert!(newer.contains("newer"), "{newer}");
     }
 
     /// A subsystem's `<Content>` puts a common module into the graph as an `mdo`
@@ -1914,6 +1973,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
 

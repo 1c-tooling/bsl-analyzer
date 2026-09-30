@@ -3596,6 +3596,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_owned(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph builds");
@@ -3668,6 +3669,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_owned(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .unwrap();
@@ -4353,6 +4355,7 @@ mod tests {
                     fingerprint: crate::graph_db::GraphFp::default(),
                     files: 0,
                     built_at: "t".to_owned(),
+                    publication_id: "test-1".to_owned(),
                 },
             )
             .expect("graph builds");

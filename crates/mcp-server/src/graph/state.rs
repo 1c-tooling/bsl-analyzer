@@ -433,6 +433,10 @@ pub(crate) struct GraphState {
     /// The highest context-dirty mark the search engine placed for a render this graph could
     /// not serve, not yet registered. See [`OwedContextMarks`].
     pub(super) owed_context_marks: Arc<std::sync::atomic::AtomicI64>,
+    /// Who publishes through this graph, in every `publication_id` it writes.
+    pub(super) publication_owner: u64,
+    /// How many publication identities this graph has handed out.
+    pub(super) publications: Arc<std::sync::atomic::AtomicU64>,
     /// Owed work a bounded turn could not finish. Read by the owner before its wait, so the
     /// yield hands the work on instead of sleeping on it.
     pub(super) continuation: Arc<std::sync::atomic::AtomicBool>,
@@ -558,6 +562,8 @@ impl GraphState {
             first_build_kicks: Arc::new(AtomicUsize::new(0)),
             claims: Arc::new(AtomicUsize::new(0)),
             owed_context_marks: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            publication_owner: crate::workspace_lease::new_token(),
+            publications: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             continuation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             loader_cannot_spawn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -570,6 +576,12 @@ impl GraphState {
             #[cfg(test)]
             claim_is_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// A fresh identity for the next database this graph publishes.
+    pub(super) fn next_publication_id(&self) -> String {
+        let number = self.publications.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("{:016x}-{number}", self.publication_owner)
     }
 
     /// Where a context provider of this graph reports the marks it owes.

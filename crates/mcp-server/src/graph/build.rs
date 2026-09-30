@@ -617,6 +617,12 @@ impl GraphState {
             );
             return self.note_incremental("incomplete portable fingerprint");
         };
+        // The patch is applied to a copy of the database on disk, which is what it replaces —
+        // not necessarily the one served, when an earlier install was refused after its rename.
+        let base_publication = match publication_base(&db_path) {
+            Ok(base) => base,
+            Err(error) => return PublishAttemptOutcome::Refused(error),
+        };
         let tmp_path = graph_build_path(&db_path);
         // The same guard the full build carries. The explicit removals below cover the two
         // outcomes this function names, and `catch_unwind` turns an unwind into one of them —
@@ -638,6 +644,7 @@ impl GraphState {
                     fingerprint: fp_pre,
                     files: 0,
                     built_at,
+                    publication_id: self.next_publication_id(),
                 },
             )
             .map_err(LoadFailure::operation)?;
@@ -675,7 +682,7 @@ impl GraphState {
                 )
                 .map_err(LoadFailure::operation)?;
             }
-            self.publish_or_discard(&tmp_path, &db_path)?;
+            publish_or_discard(self, &tmp_path, &db_path, base_publication.as_deref())?;
             let prepared = self
                 .prepare_snapshot_pool(generation, fp_pre, force_stale)
                 .map_err(prepare_failure)?;
@@ -1031,12 +1038,6 @@ impl GraphState {
         PublishAttemptOutcome::Published
     }
 
-    /// Move a finished build into the shared path — unless this daemon lost the workspace
-    /// while it was building. See [`publish_or_discard`].
-    fn publish_or_discard(&self, tmp_path: &Path, out_path: &Path) -> Result<(), LoadFailure> {
-        publish_or_discard(self, tmp_path, out_path)
-    }
-
     /// A failed initial load surfaces as `Failed`; a failed reload keeps the
     /// previous snapshot but flags `reload="failed"` so the agent sees it. A
     /// later drift check retries the reload (the throttle bounds the retry rate).
@@ -1141,6 +1142,9 @@ fn build_and_publish_scanned_inner(
     let fp_pre = super::scan::fingerprint_of_project(&pre.stats, project)
         .ok_or_else(|| LoadFailure::operation("incomplete portable pre-scan fingerprint"))?;
     let out_path = graph.graph_db_path().expect("workspace graph has cache layout");
+    // Asked before the minutes of building, and asked again at the rename: a database of a
+    // newer format is neither built over nor replaced.
+    let base = publication_base(&out_path)?;
     let tmp_path = graph_build_path(&out_path);
     let _tmp_cleanup = TempBuildFile(tmp_path.clone());
     if let Some(parent) = out_path.parent() {
@@ -1152,6 +1156,7 @@ fn build_and_publish_scanned_inner(
         fingerprint: fp_pre,
         files: 0,
         built_at,
+        publication_id: graph.next_publication_id(),
     };
     // The ticket's fact frontier is kept separately as `Published::observed_through` for debt
     // and marks. It is not the coherence window: a delivery after admission but before this
@@ -1215,7 +1220,7 @@ fn build_and_publish_scanned_inner(
         Ok(())
     })();
     stamped?;
-    publish_or_discard(graph, &tmp_path, &out_path)?;
+    publish_or_discard(graph, &tmp_path, &out_path, base.as_deref())?;
     let prepared =
         graph.prepare_snapshot_pool(generation, fp_pre, force_stale).map_err(prepare_failure)?;
     // Borrowed from the walk, not cloned out of it: what the coverage needs is membership, and
@@ -1292,10 +1297,46 @@ fn publish_or_discard(
     graph: &GraphState,
     tmp_path: &Path,
     out_path: &Path,
+    base: Option<&str>,
 ) -> Result<(), LoadFailure> {
-    match graph.lease.publish_short(&mut (), |_| std::fs::rename(tmp_path, out_path)) {
+    let outcome = graph.lease.publish_short(&mut (), |_| {
+        // Re-read under the fence: the database this build replaces must still be the one it
+        // was prepared from, and a newer format is not replaced at all.
+        let current = super::snapshot::on_disk_identity(out_path).map_err(PublishRefusal::Io)?;
+        if let Some(version) = current.as_ref().and_then(|identity| identity.schema_version) {
+            if version > crate::graph_db::SCHEMA_VERSION {
+                return Err(PublishRefusal::NewerFormat(version));
+            }
+        }
+        if current.and_then(|identity| identity.publication_id).as_deref() != base {
+            return Err(PublishRefusal::StaleBase);
+        }
+        std::fs::rename(tmp_path, out_path).map_err(PublishRefusal::Io)
+    });
+    match outcome {
         LeaseOperationOutcome::Applied(()) => Ok(()),
-        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(error)) => {
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+            PublishRefusal::NewerFormat(version),
+        )) => {
+            let _ = std::fs::remove_file(tmp_path);
+            Err(newer_format_failure(out_path, version))
+        }
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+            PublishRefusal::StaleBase,
+        )) => {
+            let _ = std::fs::remove_file(tmp_path);
+            Err(LoadFailure::new(
+                LoadFailureReason::TransientRefusal,
+                format!(
+                    "graph database {} was replaced while this build was prepared from an \
+                     earlier one; the build was discarded and is prepared again",
+                    out_path.display()
+                ),
+            ))
+        }
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+            PublishRefusal::Io(error),
+        )) => {
             let message = format!(
                 "publishing graph database {} -> {} failed: kind={:?}, raw_os_error={:?}: {error}",
                 tmp_path.display(),
@@ -1340,6 +1381,46 @@ fn publish_or_discard(
             ))
         }
     }
+}
+
+/// Why a finished build was not renamed over the shared database.
+enum PublishRefusal {
+    /// The shared database is of a format newer than this program writes.
+    NewerFormat(u32),
+    /// The shared database is no longer the publication this build was prepared from.
+    StaleBase,
+    Io(std::io::Error),
+}
+
+/// The publication a build replaces, or a refusal when the shared database is of a newer
+/// format: this program neither reads such a database nor writes over it.
+fn publication_base(out_path: &Path) -> Result<Option<String>, LoadFailure> {
+    let identity = super::snapshot::on_disk_identity(out_path).map_err(LoadFailure::operation)?;
+    if let Some(version) = identity.as_ref().and_then(|identity| identity.schema_version) {
+        if version > crate::graph_db::SCHEMA_VERSION {
+            return Err(newer_format_failure(out_path, version));
+        }
+    }
+    Ok(identity.and_then(|identity| identity.publication_id))
+}
+
+fn newer_format_failure(out_path: &Path, version: u32) -> LoadFailure {
+    tracing::error!(
+        path = %out_path.display(),
+        found = version,
+        supported = crate::graph_db::SCHEMA_VERSION,
+        "graph database has a newer format; it is not read or overwritten — run the newer \
+         program or give this one a separate --cache-dir"
+    );
+    LoadFailure::new(
+        LoadFailureReason::OperationError,
+        format!(
+            "graph database {} has format {version}, newer than this program's {}; it is not \
+             read or overwritten",
+            out_path.display(),
+            crate::graph_db::SCHEMA_VERSION
+        ),
+    )
 }
 
 /// The outcome of one full build+publish pass: what was published, the identity it
@@ -1640,6 +1721,98 @@ mod tests {
     use std::fs;
     use std::time::{Duration, UNIX_EPOCH};
     use walkdir::WalkDir;
+
+    /// A database of a newer format belongs to a newer program: this one neither reads it, nor
+    /// spends a build on replacing it, nor renames anything over it.
+    #[test]
+    fn a_newer_database_format_is_neither_built_over_nor_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let path = graph_db_path(root);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [(crate::graph_db::SCHEMA_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_until(&graph, "the load to be refused", || {
+            matches!(graph.status(), GraphStatus::Failed(_))
+        });
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(message) if message.contains("newer")),
+            "{:?}",
+            graph.status()
+        );
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0, "no build was spent");
+        assert_eq!(fs::read(&path).unwrap(), before, "the newer database is untouched");
+
+        let temp = graph_build_path(&path);
+        fs::write(&temp, b"candidate").unwrap();
+        let error = publish_or_discard(&graph, &temp, &path, None).unwrap_err();
+        assert_eq!(error.reason, LoadFailureReason::OperationError);
+        assert!(!temp.exists(), "the refused build is discarded");
+        assert_eq!(fs::read(&path).unwrap(), before, "and nothing is renamed over it");
+    }
+
+    /// A build replaces exactly the publication it was prepared from. Another one standing at
+    /// the shared path by the rename makes the build stale, not the new answer.
+    #[test]
+    fn a_build_prepared_from_a_replaced_database_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let path = graph_db_path(root);
+        let before = fs::read(&path).unwrap();
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        let temp = graph_build_path(&path);
+
+        fs::write(&temp, b"candidate").unwrap();
+        let error = publish_or_discard(&graph, &temp, &path, Some("another-1")).unwrap_err();
+        assert_eq!(error.reason, LoadFailureReason::TransientRefusal, "{}", error.message);
+        assert!(!temp.exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        fs::write(&temp, b"candidate").unwrap();
+        publish_or_discard(&graph, &temp, &path, Some("test-1")).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"candidate", "its own base is replaced");
+    }
+
+    /// Two publications of the same content are two publications; a database served again as
+    /// it stands is the same one.
+    #[test]
+    fn every_publication_has_its_own_identity_and_a_reused_one_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let path = graph_db_path(root);
+        let load = || {
+            let graph = GraphState::for_workspace(root.to_path_buf());
+            graph.ensure_loading();
+            wait_ready(&graph);
+        };
+
+        load();
+        let built = meta_string(&path, "publication_id");
+        let fingerprint = meta_string(&path, "fingerprint");
+        load();
+        assert_eq!(meta_string(&path, "publication_id"), built, "a reused database keeps it");
+
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE meta SET value = '1' WHERE key = 'force_stale'", [])
+            .unwrap();
+        load();
+        assert_eq!(meta_string(&path, "fingerprint"), fingerprint, "the same content");
+        assert_ne!(meta_string(&path, "publication_id"), built, "is published anew");
+    }
 
     /// The fused pass writes the search rows itself, so it must key them the way the rest of the
     /// index does: a module of a declared extension belongs to that extension, not to the
@@ -2004,7 +2177,7 @@ mod tests {
         assert!(old.is_superseded());
         newer.release();
 
-        publish_or_discard(&graph, &temp, &canonical).unwrap_err();
+        publish_or_discard(&graph, &temp, &canonical, None).unwrap_err();
         assert_eq!(fs::read(&canonical).unwrap(), b"new-owner-graph");
         assert!(!temp.exists(), "normal refusal removes only this build's temp file");
         assert_eq!(fs::read(&other_temp).unwrap(), b"other-build-in-progress");
@@ -2071,7 +2244,7 @@ mod tests {
         fs::write(&temp, b"candidate").unwrap();
 
         let held = lease.hold_file_lock_for_test();
-        let error = publish_or_discard(&graph, &temp, &canonical).unwrap_err();
+        let error = publish_or_discard(&graph, &temp, &canonical, None).unwrap_err();
         drop(held);
 
         assert_eq!(error.reason, LoadFailureReason::TransientRefusal);
@@ -2110,6 +2283,7 @@ mod tests {
             &released_graph,
             &released_temp,
             &released_cache.root().join("released.db"),
+            None,
         )
         .unwrap_err();
         assert_eq!(released_error.reason, LoadFailureReason::Released);
@@ -2133,6 +2307,7 @@ mod tests {
             &superseded_graph,
             &superseded_temp,
             &superseded_cache.root().join("superseded.db"),
+            None,
         )
         .unwrap_err();
         assert_eq!(superseded_error.reason, LoadFailureReason::Superseded);
@@ -2154,7 +2329,7 @@ mod tests {
         let prepared = cache.root().join("prepared.building");
         fs::write(&prepared, b"candidate").unwrap();
         lease.fail_next_restamp_for_test();
-        let error = publish_or_discard(&graph, &prepared, &cache.root().join("output.db"))
+        let error = publish_or_discard(&graph, &prepared, &cache.root().join("output.db"), None)
             .expect_err("a lease restamp failure is a real operation error");
         assert_eq!(error.reason, LoadFailureReason::OperationError);
 
@@ -2747,6 +2922,7 @@ mod tests {
                 fingerprint: fp_pre,
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .unwrap();
@@ -3117,6 +3293,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let project = crate::graph::ProjectSnapshot::load(root);
         let universe = crate::graph::universe::ScannedUniverse::scan(&project.scan_roots);
@@ -3181,6 +3358,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let src = root.join(".build/bsl-graph.db");
         fs::create_dir_all(src.parent().unwrap()).unwrap();
@@ -3275,6 +3453,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3362,6 +3541,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3445,6 +3625,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3516,6 +3697,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3573,6 +3755,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3638,6 +3821,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3700,6 +3884,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3744,6 +3929,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3839,6 +4025,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -3879,6 +4066,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -4035,6 +4223,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -4131,6 +4320,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
             &mut sink,
         )
@@ -4303,6 +4493,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -4413,6 +4604,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -4485,6 +4677,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -4691,6 +4884,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -4756,6 +4950,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let server_sig = |out: &Path| -> i64 {
             Connection::open(out)
@@ -4806,6 +5001,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -5432,6 +5628,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -5506,6 +5703,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -5571,6 +5769,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -5639,6 +5838,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -5743,6 +5943,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -5808,6 +6009,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -5889,6 +6091,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -5948,6 +6151,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -6081,6 +6285,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6140,6 +6345,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6177,6 +6383,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6225,6 +6432,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6282,6 +6490,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6368,6 +6577,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6438,6 +6648,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6545,6 +6756,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             };
             let db = root.join(".build/graph.db");
             fs::create_dir_all(db.parent().unwrap()).unwrap();
@@ -6604,6 +6816,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6679,6 +6892,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let base_body = root.join("CommonModules/Сервер/Ext/Module.bsl");
         fs::write(&base_body, [0xff, 0xfe]).unwrap();
@@ -6770,6 +6984,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6833,6 +7048,7 @@ mod tests {
             fingerprint: crate::graph_db::GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let db_pre = root.join(".build/pre.db");
         fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
@@ -6879,6 +7095,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .expect("graph database builds");
@@ -7122,6 +7339,7 @@ mod form_twin_tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .unwrap();

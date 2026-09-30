@@ -79,7 +79,9 @@ use crate::graph::input::{build_source_root, db_for_files};
 // identity cannot survive as the current format.
 // 22: the files table records the stat identity each content hash was taken under, so a
 // later process reuses the hash of an unchanged file instead of reading it again.
-pub(crate) const SCHEMA_VERSION: u32 = 22;
+// 23: every publication records a `publication_id`, so the result of a write is established
+// from the database itself; an older database has none and is rebuilt, never stamped.
+pub(crate) const SCHEMA_VERSION: u32 = 23;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -128,6 +130,10 @@ pub struct GraphMeta {
     pub files: usize,
     /// RFC 3339 build timestamp.
     pub built_at: String,
+    /// This publication's identity: the publishing owner's token and its monotonic
+    /// publication number. It differs between two publications even when their fingerprints
+    /// are equal, and a moved database keeps the one it was published with.
+    pub publication_id: String,
 }
 
 /// Read the canonical method-call digest from an existing bounded-build SQLite graph.
@@ -494,8 +500,9 @@ impl GraphDbWriter {
         let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
 
-        let rows: [(&str, String); 8] = [
+        let rows: [(&str, String); 9] = [
             ("schema_version", SCHEMA_VERSION.to_string()),
+            ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
@@ -1700,7 +1707,8 @@ pub(crate) fn update_graph_database_bodies(
         // never force-stale.
         let node_count: i64 = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edge_count: i64 = tx.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-        let meta_rows: [(&str, String); 8] = [
+        let meta_rows: [(&str, String); 9] = [
+            ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
@@ -2086,6 +2094,7 @@ mod tests {
             fingerprint: GraphFp { files: 42, topology: 7 },
             files: 1,
             built_at: "2026-06-01T00:00:00Z".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2137,6 +2146,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2178,6 +2188,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2218,6 +2229,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2256,6 +2268,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2286,6 +2299,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2296,6 +2310,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2331,6 +2346,7 @@ mod tests {
             fingerprint: GraphFp { files: 1, topology: 0 },
             files: 1,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
         open(&path)
@@ -2388,6 +2404,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         }
     }
 
@@ -2529,6 +2546,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let scanned = |root: &Path| {
             let project = crate::graph::ProjectSnapshot::load(root);
@@ -2698,6 +2716,7 @@ mod tests {
                 fingerprint: GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .unwrap();
@@ -2785,6 +2804,7 @@ mod tests {
                 fingerprint: GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
 
@@ -2846,6 +2866,7 @@ mod tests {
                 fingerprint: GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
 

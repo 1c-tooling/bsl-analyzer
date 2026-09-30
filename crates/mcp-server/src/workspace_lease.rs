@@ -127,7 +127,7 @@ struct LeaseRecord {
 /// Distinctness is probabilistic in the digest, which at a handful of claims per workspace is a
 /// collision chance no one will meet; what it must not be is DERIVABLE, as the generation is,
 /// since that is what let two daemons read one record as both of theirs.
-fn new_token() -> u64 {
+pub(crate) fn new_token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos =
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0) as u64;

@@ -228,6 +228,7 @@ pub(super) fn seed_cache_with_layout(
             fingerprint,
             files: 0,
             built_at: "cached-build-sentinel".to_string(),
+            publication_id: "test-1".to_owned(),
         },
     )
     .expect("seed cache builds");
