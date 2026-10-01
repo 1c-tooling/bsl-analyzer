@@ -11,7 +11,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["BSL Analyzer Contributors"]
 repository = "https://github.com/itrous/bsl-analyzer"
-rust-version = "1.91"
+rust-version = "1.95"
 
 [workspace.dependencies]
 bsl-analyzer = { path = "crates/bsl-analyzer" }
