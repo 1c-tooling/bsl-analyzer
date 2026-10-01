@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::helpers::{
     child_bool, child_text, child_u32, create_register_standard_attribute, find_child,
+    parse_extension_ownership,
 };
 
 pub(crate) struct MdoProperties {
@@ -44,13 +45,8 @@ impl MdoProperties {
         let code_series = child_text(props_node, "CodeSeries").map(|s| s.to_string());
         let dependence_on_calculation_types =
             child_text(props_node, "DependenceOnCalculationTypes").map(|s| s.to_string());
-        let object_belonging = match child_text(props_node, "ObjectBelonging") {
-            Some("Adopted") => ObjectBelonging::Adopted,
-            Some("Own") => ObjectBelonging::Own,
-            _ => ObjectBelonging::Unknown,
-        };
-        let extended_configuration_object = child_text(props_node, "ExtendedConfigurationObject")
-            .and_then(|raw| Uuid::parse_str(raw).ok());
+        let (object_belonging, extended_configuration_object) =
+            parse_extension_ownership(props_node);
 
         let owners = find_child(props_node, "Owners")
             .map(|owners_node| {

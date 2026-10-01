@@ -1040,6 +1040,64 @@ mod tests {
         );
     }
 
+    /// Enums and constants are parsed outside the shared MDO property reader, so
+    /// they must carry their extension ownership too: an adopted copy that lost it
+    /// would replace the base object instead of extending it.
+    #[test]
+    fn adopted_enum_and_constant_parsed_from_xml_extend_the_base_object() {
+        use crate::xml_parser::{parse_constant_xml, parse_enum_xml};
+
+        fn mdo(kind: &str, uuid: &str, name: &str, ownership: &str, body: &str) -> String {
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema"><{kind} uuid="{uuid}"><Properties><Name>{name}</Name>{ownership}</Properties>{body}</{kind}></MetaDataObject>"#
+            )
+        }
+        let base_uuid = "11111111-1111-1111-1111-111111111111";
+        let adopted = format!(
+            "<ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>{base_uuid}</ExtendedConfigurationObject>"
+        );
+        let value = |name: &str| {
+            format!(
+                r#"<ChildObjects><EnumValue uuid="{name}"><Properties><Name>{name}</Name></Properties></EnumValue></ChildObjects>"#
+            )
+        };
+
+        let mut base = Configuration::new("Base");
+        base.add_metadata_object(
+            parse_enum_xml(&mdo("Enum", base_uuid, "Статусы", "", &value("А"))).unwrap(),
+        );
+        base.add_metadata_object(
+            parse_constant_xml(&mdo(
+                "Constant",
+                base_uuid,
+                "Флаг",
+                "<Type><v8:Type>xs:boolean</v8:Type></Type>",
+                "",
+            ))
+            .unwrap(),
+        );
+
+        let ext_uuid = "22222222-2222-2222-2222-222222222222";
+        let mut extension = Configuration::new("Extension");
+        extension.add_metadata_object(
+            parse_enum_xml(&mdo("Enum", ext_uuid, "Статусы", &adopted, &value("В"))).unwrap(),
+        );
+        extension.add_metadata_object(
+            parse_constant_xml(&mdo("Constant", ext_uuid, "Флаг", &adopted, "")).unwrap(),
+        );
+
+        let merged = base.merged_with_extension(&extension);
+        assert_eq!(merged.metadata_objects().len(), 2, "adopted objects must not be duplicated");
+        let statuses = merged.find_metadata_object(MdoType::Enum, "Статусы").unwrap();
+        assert!(statuses.find_enum_value("А").is_some(), "base enum value must survive");
+        assert!(statuses.find_enum_value("В").is_some(), "extension enum value must be added");
+        assert_eq!(
+            merged.find_metadata_object(MdoType::Constant, "Флаг").unwrap().constant_type,
+            Some(AttributeType::Boolean),
+            "base constant type must survive an adopted copy without <Type>"
+        );
+    }
+
     #[test]
     fn merge_extension_overlay_merges_borrowed_register_fields() {
         use crate::dimension::Dimension;

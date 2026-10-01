@@ -1,7 +1,9 @@
 use crate::error::{MetadataError, Result};
 use crate::metadata_object::{EnumValue, MdoType, MetadataObject};
 
-use super::helpers::{child_text, find_child, find_mdo_element, parse_uuid, parse_xml};
+use super::helpers::{
+    child_text, find_child, find_mdo_element, parse_extension_ownership, parse_uuid, parse_xml,
+};
 
 pub fn parse_enum_xml(xml: &str) -> Result<MetadataObject> {
     let _span = tracing::debug_span!("parse_enum_xml").entered();
@@ -46,6 +48,11 @@ pub fn parse_enum_xml(xml: &str) -> Result<MetadataObject> {
         }
     }
     mdo_obj.enum_values = enum_values;
+    let (belonging, extends) = parse_extension_ownership(props);
+    mdo_obj.set_object_belonging(belonging);
+    if let Some(uuid) = extends {
+        mdo_obj.set_extends_uuid(uuid);
+    }
 
     tracing::debug!(
         enum_name = %mdo_obj.name,
@@ -129,5 +136,27 @@ mod tests {
         assert_eq!(enum_obj.name, "ПустоеПеречисление");
         assert_eq!(enum_obj.mdo_type, MdoType::Enum);
         assert_eq!(enum_obj.enum_values.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_enum_xml_reads_extension_ownership() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Enum uuid="22222222-2222-2222-2222-222222222222">
+        <Properties>
+            <ObjectBelonging>Adopted</ObjectBelonging>
+            <Name>Статусы</Name>
+            <ExtendedConfigurationObject>11111111-1111-1111-1111-111111111111</ExtendedConfigurationObject>
+        </Properties>
+    </Enum>
+</MetaDataObject>"#;
+
+        let enum_obj = parse_enum_xml(xml).unwrap();
+
+        assert_eq!(enum_obj.object_belonging(), crate::ObjectBelonging::Adopted);
+        assert_eq!(
+            enum_obj.extends_uuid().map(|u| u.to_string()),
+            Some("11111111-1111-1111-1111-111111111111".to_string())
+        );
     }
 }
