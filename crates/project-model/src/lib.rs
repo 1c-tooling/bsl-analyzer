@@ -2173,6 +2173,17 @@ impl ProjectConfig {
         self.config_file_path.as_deref()
     }
 
+    /// Resolve the local tokenizer artifact from its declaring config directory.
+    pub fn search_tokenizer_file(&self, project_root: &Path) -> Option<PathBuf> {
+        self.search.baseline.embedding.tokenizer_file.as_deref().map(|path| {
+            self.config_file_path
+                .as_deref()
+                .and_then(Path::parent)
+                .unwrap_or(project_root)
+                .join(path)
+        })
+    }
+
     fn config_error(&self, message: String) -> ConfigLoadError {
         ConfigLoadError {
             path: self
@@ -2482,6 +2493,37 @@ pub struct SearchEmbeddingConfig {
 
     #[serde(default)]
     pub url: Option<String>,
+
+    /// Literal model input prefixes. `Some("")` deliberately disables an environment value.
+    #[serde(default)]
+    pub query_prefix: Option<String>,
+
+    #[serde(default)]
+    pub document_prefix: Option<String>,
+
+    /// Opt-in exact input token ceiling. It is ignored unless tokenizer path and hash
+    /// are also supplied by project config or the corresponding environment values.
+    #[serde(default)]
+    pub max_input_tokens: Option<toml::Value>,
+
+    /// Local tokenizer artifact path. Relative project values use the config directory;
+    /// relative environment values are resolved by the workspace runtime.
+    #[serde(default)]
+    pub tokenizer_file: Option<String>,
+
+    /// Expected SHA256 of the local tokenizer artifact.
+    #[serde(default)]
+    pub tokenizer_sha256: Option<String>,
+}
+
+impl SearchEmbeddingConfig {
+    pub fn resolve_query_prefix(&self, environment: Option<&str>) -> String {
+        self.query_prefix.as_deref().or(environment).unwrap_or_default().to_owned()
+    }
+
+    pub fn resolve_document_prefix(&self, environment: Option<&str>) -> String {
+        self.document_prefix.as_deref().or(environment).unwrap_or_default().to_owned()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -3548,6 +3590,52 @@ mod tests {
         assert_eq!(
             config.search.baseline.reference.snapshot_id.as_deref(),
             Some("reference:0.1.104")
+        );
+    }
+
+    #[test]
+    fn embedding_prefix_fields_preserve_explicit_empty_and_whitespace() {
+        let config: super::TomlConfig = toml::from_str(
+            "[search.baseline.embedding]\nqueryPrefix = \"\"\ndocumentPrefix = \"  \"\n",
+        )
+        .unwrap();
+        let embedding = &config.search.baseline.embedding;
+        assert_eq!(embedding.query_prefix.as_deref(), Some(""));
+        assert_eq!(embedding.resolve_query_prefix(Some("env query")), "");
+        assert_eq!(embedding.document_prefix.as_deref(), Some("  "));
+        assert_eq!(embedding.resolve_document_prefix(Some("env document")), "  ");
+
+        let defaults = super::SearchEmbeddingConfig::default();
+        assert_eq!(defaults.resolve_query_prefix(Some("env query")), "env query");
+        assert_eq!(defaults.resolve_document_prefix(None), "");
+    }
+
+    #[test]
+    fn token_profile_fields_deserialize_and_project_tokenizer_paths_use_config_origin() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("bsl-analyzer.toml");
+        fs::write(
+            &config_path,
+            "[search.baseline.embedding]\nmaxInputTokens = 8192\ntokenizerFile = \"models/tokenizer.json\"\ntokenizerSha256 = \"abc\"\n",
+        )
+        .unwrap();
+        let config = ProjectConfig::load_from_file(&config_path).unwrap();
+
+        assert_eq!(
+            config
+                .search
+                .baseline
+                .embedding
+                .max_input_tokens
+                .as_ref()
+                .and_then(toml::Value::as_integer),
+            Some(8192)
+        );
+        assert_eq!(
+            config.search_tokenizer_file(dir.path()),
+            Some(config_dir.join("models/tokenizer.json"))
         );
     }
 

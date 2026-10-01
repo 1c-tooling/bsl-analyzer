@@ -2,6 +2,33 @@ use bsl_search::{EmbeddingFailure, SearchEngine, SearchError};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbeddingPrefixes {
+    pub query: String,
+    pub document: String,
+    /// Frozen opt-in token profile resolved by the launching CLI.
+    pub token_profile: Option<EmbeddingTokenProfile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingTokenProfile {
+    pub max_input_tokens: usize,
+    pub tokenizer_file: PathBuf,
+    pub tokenizer_sha256: String,
+    /// Loaded once at state bootstrap and then cloned by embedding workers.
+    pub token_policy: Option<bsl_search::TokenPolicy>,
+}
+
+impl PartialEq for EmbeddingTokenProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_input_tokens == other.max_input_tokens
+            && self.tokenizer_file == other.tokenizer_file
+            && self.tokenizer_sha256 == other.tokenizer_sha256
+    }
+}
+
+impl Eq for EmbeddingTokenProfile {}
+
 /// The search engine behind a mutex. It MUST stay a `Mutex` (not an `RwLock`): the engine
 /// owns a `rusqlite::Connection`, which is `Send` but `!Sync` — its internal statement cache
 /// mutates through a `RefCell` even on read-only SQL, so two threads may never hold `&engine`
@@ -143,6 +170,7 @@ pub(super) enum OverlayInit {
 pub(super) struct WorkspaceSearchInit {
     pub(super) engine: SearchEngine,
     pub(super) mode: WorkspaceSearchMode,
+    pub(super) semantic_failure: Option<EmbeddingFailure>,
     /// Set by the fused cold-build path: the engine is published with FTS + graph
     /// context already written but embeddings still NULL, and this carries what the
     /// background pass needs to fill them on its own connection. `None` means the

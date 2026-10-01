@@ -67,6 +67,12 @@ pub(crate) enum BaselineBootstrap {
 }
 
 impl BaselineBootstrap {
+    pub(crate) fn with_token_layout_claim(mut self, claim: Option<String>) -> Self {
+        if let Self::Connect(plan) = &mut self {
+            plan.context.token_layout_claim = claim;
+        }
+        self
+    }
     /// Run the deferred part (if any) right here. Sync callers — CLI config
     /// diagnostics, tests — keep the historical one-call behaviour through this.
     pub(crate) fn connect_now(self) -> BaselineRuntime {
@@ -580,6 +586,7 @@ impl BaselineRuntime {
         let schema = resolve_schema(schema_keys, postgres);
 
         let context = RefreshContext {
+            token_layout_claim: None,
             postgres: postgres.clone(),
             baselines: baselines.clone(),
             selection: selection.clone(),
@@ -1139,6 +1146,7 @@ pub(crate) struct ExternalBaselineSource {
 
 #[derive(Debug)]
 struct RefreshContext {
+    token_layout_claim: Option<String>,
     postgres: SearchPostgresConfig,
     baselines: Vec<BaselineRef>,
     selection: String,
@@ -1193,11 +1201,14 @@ impl RefreshableExternalBaselineSource {
         if let Some(schema) = schema {
             config = config.with_schema(schema);
         }
-        let inner = StdRwLock::new(ExternalBaselineSource::new_with_candidates(
-            config,
-            context.baselines.clone(),
-            context.selection.clone(),
-        )?);
+        let inner = StdRwLock::new(
+            ExternalBaselineSource::new_with_candidates(
+                config,
+                context.baselines.clone(),
+                context.selection.clone(),
+            )?
+            .with_token_layout_claim(context.token_layout_claim.as_deref())?,
+        );
         Ok(Self {
             inner,
             context,
@@ -1220,6 +1231,7 @@ impl RefreshableExternalBaselineSource {
             selection.clone(),
         )?);
         let context = RefreshContext {
+            token_layout_claim: None,
             postgres: SearchPostgresConfig::default(),
             baselines: vec![baseline],
             selection,
@@ -1247,8 +1259,13 @@ impl RefreshableExternalBaselineSource {
             vec![baseline.clone()],
             selection.clone(),
         )?);
-        let context =
-            RefreshContext { postgres, baselines: vec![baseline], selection, schema_keys: vec![] };
+        let context = RefreshContext {
+            postgres,
+            baselines: vec![baseline],
+            selection,
+            schema_keys: vec![],
+            token_layout_claim: None,
+        };
         Ok(Self {
             inner,
             context,
@@ -1357,6 +1374,9 @@ impl RefreshableExternalBaselineSource {
             self.context.baselines.clone(),
             self.context.selection.clone(),
         )
+        .and_then(|source| {
+            source.with_token_layout_claim(self.context.token_layout_claim.as_deref())
+        })
         .map_err(RefreshAttemptError::Build)?;
 
         {
@@ -1613,6 +1633,16 @@ fn resolve_reason_code(error: &project_model::ResolvePostgresUrlError) -> &'stat
 }
 
 impl ExternalBaselineSource {
+    fn with_token_layout_claim(
+        mut self,
+        claim: Option<&str>,
+    ) -> Result<Self, bsl_search::SearchError> {
+        if let Some(claim) = claim {
+            self.adapter =
+                self.adapter.with_token_layout_claim(bsl_search::SEGMENTATION_VERSION, claim)?;
+        }
+        Ok(self)
+    }
     #[cfg(test)]
     pub(crate) fn new(
         config: ExternalBaselineConfig,
@@ -2075,11 +2105,13 @@ mod tests {
     #[test]
     fn workspace_bootstrap_defers_only_the_network_connect() {
         let bootstrap =
-            BaselineRuntime::workspace_bootstrap(None, &resolvable_postgres_project_config());
+            BaselineRuntime::workspace_bootstrap(None, &resolvable_postgres_project_config())
+                .with_token_layout_claim(Some("profile-v1:token-layout".to_owned()));
         let BaselineBootstrap::Connect(plan) = bootstrap else {
             panic!("resolvable postgres config must classify as a deferred Connect plan");
         };
         assert!(matches!(plan.corpus(), CorpusId::WorkspaceCode));
+        assert_eq!(plan.context.token_layout_claim.as_deref(), Some("profile-v1:token-layout"));
     }
 
     #[test]

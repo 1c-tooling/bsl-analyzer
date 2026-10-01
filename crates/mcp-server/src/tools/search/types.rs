@@ -29,7 +29,7 @@ pub(super) const HYBRID_FETCH_MULTIPLIER: usize = 2;
 /// overlay's own state gives. The `reference` profile's documentation actions changed nothing
 /// and stayed on `4`: their number is independent. Structured indexing advances code to `6`
 /// and documentation to `5`; optional semantic failure diagnostics advance them to `7` and `6`.
-pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "7";
+pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "8";
 pub(super) const DOCS_SCHEMA_VERSION: &str = "6";
 
 // Schema-only mirrors keep the MCP dependency out of the native search crate.
@@ -70,6 +70,8 @@ enum SemanticFailureCodeSchema {
 pub(super) fn search_schema_version(action: &str) -> &'static str {
     if action == "search_code" {
         SEARCH_CODE_SCHEMA_VERSION
+    } else if action == "status" {
+        "4"
     } else {
         DOCS_SCHEMA_VERSION
     }
@@ -80,8 +82,8 @@ pub(super) fn search_schema_version(action: &str) -> &'static str {
 #[derive(JsonSchema, Serialize)]
 #[serde(untagged)]
 #[allow(dead_code, reason = "schema-only union published by tools/list")]
-enum SearchOutput<C> {
-    SearchCode(SearchHits<SearchCodeAction, C>),
+enum SearchOutput<C, H = Value> {
+    SearchCode(SearchHits<SearchCodeAction, C, H>),
     FindDocs(SearchHits<FindDocsAction, SearchSchemaVersion>),
     SearchDocs(SearchHits<SearchDocsAction, SearchSchemaVersion>),
     SearchCodeNotReady(SearchNotReady<SearchCodeAction, C>),
@@ -103,17 +105,19 @@ enum SearchOutput<C> {
         state: SearchState,
         indexing: crate::indexing::Indexing,
         #[serde(skip_serializing_if = "Option::is_none")]
+        embedding_profile: Option<EmbeddingProfile>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[schemars(default, with = "SemanticFailureSchema")]
         semantic_failure: Option<bsl_search::EmbeddingFailure>,
     },
 }
 
 #[derive(JsonSchema, Serialize)]
-struct SearchHits<A, V> {
+struct SearchHits<A, V, H = Value> {
     action: A,
     schema_version: V,
     indexing: crate::indexing::Indexing,
-    hits: Vec<Value>,
+    hits: Vec<H>,
     shown: usize,
     total: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +127,30 @@ struct SearchHits<A, V> {
     budget_exhausted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_hint: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct CodeHitSchema {
+    /// Original parent symbol, including when this hit is one token-bounded part.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_span: Option<SourceSpanSchema>,
+}
+
+#[derive(JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceSpanSchema {
+    /// Zero-based, half-open source byte offsets in the full file.
+    byte_start: u32,
+    byte_end: u32,
+    parent_byte_start: u32,
+    parent_byte_end: u32,
+    /// One-based part ordinal.
+    #[schemars(range(min = 1))]
+    part_index: u32,
+    #[schemars(range(min = 1))]
+    part_count: u32,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -157,10 +185,10 @@ const_enum!(FindDocsAction, FindDocs, "find_docs");
 const_enum!(SearchDocsAction, SearchDocs, "search_docs");
 const_enum!(ListPlatformAction, ListPlatform, "list_platform");
 const_enum!(StatusAction, Status, "status");
-const_enum!(SearchCodeSchemaVersion, V7, "7");
+const_enum!(SearchCodeSchemaVersion, V8, "8");
 const_enum!(SearchSchemaVersion, V6, "6");
 const_enum!(ListPlatformSchemaVersion, V1, "1");
-const_enum!(StatusSchemaVersion, V3, "3");
+const_enum!(StatusSchemaVersion, V4, "4");
 const_enum!(NotReadyStatus, NotReady, "not_ready");
 
 #[derive(JsonSchema, Serialize)]
@@ -181,9 +209,17 @@ enum SearchState {
     Failed,
 }
 
+#[derive(JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddingProfile {
+    wire_model: String,
+    storage_identity: String,
+    dimension: usize,
+}
+
 /// The `workspace` profile's `search` answers: `search_code` on its own version.
 pub(crate) fn search_output_schema() -> Arc<serde_json::Map<String, Value>> {
-    output_schema::<SearchOutput<SearchCodeSchemaVersion>>()
+    output_schema::<SearchOutput<SearchCodeSchemaVersion, CodeHitSchema>>()
 }
 
 /// The `reference` profile's `search` answers. It serves no `search_code`, and its schema is

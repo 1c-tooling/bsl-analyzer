@@ -1,6 +1,6 @@
 use crate::domain::{
     BaselineRef, CorpusId, ExternalBaselineConfig, IndexedDocument, LexicalHit, SemanticHit,
-    Snapshot, SnapshotPublishMetadata, SnapshotPublishStats,
+    Snapshot, SnapshotPublishMetadata, SnapshotPublishStats, SourceSpan,
 };
 use crate::error::{reason, ReasonCode, SearchError};
 use crate::external_baseline::{
@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 const SCHEMA_METADATA_TABLE: &str = "_schema_metadata_";
 const EMBEDDING_MODEL_SETTING: &str = "embedding_model";
 const EMBEDDING_DIMENSION_SETTING: &str = "embedding_dimension";
+const TOKEN_LAYOUT_VERSION_SETTING: &str = "token_layout_version";
+const TOKEN_LAYOUT_CLAIM_SETTING: &str = "token_layout_claim";
+const TOKEN_LAYOUT_PARTS_TABLE: &str = "file_object_parts";
 /// Whether a carrier has to be there at all.
 ///
 /// `serving_semantic` exists only where the `vector` extension does, and a database without it is
@@ -96,6 +99,7 @@ pub struct PostgresBaselineAdapter {
     schema: String,
     pool: Pool<PostgresConnectionManager<NoTls>>,
     storage_verified_at: Arc<Mutex<Option<Instant>>>,
+    token_layout_claim: Option<(String, String)>,
 }
 
 impl PostgresBaselineAdapter {
@@ -110,11 +114,237 @@ impl PostgresBaselineAdapter {
             .max_size(4)
             .connection_timeout(std::time::Duration::from_secs(5))
             .build_unchecked(manager);
-        Ok(Self { config, schema, pool, storage_verified_at: Arc::new(Mutex::new(None)) })
+        Ok(Self {
+            config,
+            schema,
+            pool,
+            storage_verified_at: Arc::new(Mutex::new(None)),
+            token_layout_claim: None,
+        })
     }
 
     pub fn config(&self) -> &ExternalBaselineConfig {
         &self.config
+    }
+
+    pub fn with_token_layout_claim(
+        mut self,
+        layout_version: impl Into<String>,
+        claim: impl Into<String>,
+    ) -> Result<Self, SearchError> {
+        let layout_version = layout_version.into();
+        let claim = claim.into();
+        if layout_version != crate::token_policy::SEGMENTATION_VERSION || claim.trim().is_empty() {
+            return Err(crate::EmbeddingFailure::new(
+                crate::EmbeddingFailureCode::EmbeddingInvalidConfig,
+            )
+            .into());
+        }
+        if self.token_layout_claim.as_ref().is_some_and(|(version, configured)| {
+            version.as_str() != layout_version || configured.as_str() != claim
+        }) {
+            return Err(crate::EmbeddingFailure::new(
+                crate::EmbeddingFailureCode::EmbeddingInvalidConfig,
+            )
+            .into());
+        }
+        self.token_layout_claim = Some((layout_version, claim));
+        if let Ok(mut verified_at) = self.storage_verified_at.lock() {
+            *verified_at = None;
+        }
+        Ok(self)
+    }
+
+    pub fn ensure_token_layout_claim(
+        &self,
+        layout_version: &str,
+        claim: &str,
+    ) -> Result<(), SearchError> {
+        if layout_version != crate::token_policy::SEGMENTATION_VERSION || claim.trim().is_empty() {
+            return Err(crate::EmbeddingFailure::new(
+                crate::EmbeddingFailureCode::EmbeddingInvalidConfig,
+            )
+            .into());
+        }
+        if !self.token_layout_claim.as_ref().is_some_and(|(version, configured)| {
+            version.as_str() == layout_version && configured.as_str() == claim
+        }) {
+            return Err(crate::EmbeddingFailure::new(
+                crate::EmbeddingFailureCode::EmbeddingInvalidConfig,
+            )
+            .into());
+        }
+        let mut client = self.connect()?;
+        let mut tx = client.transaction()?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext('bsl-token-layout-claim'))",
+            &[&self.schema],
+        )?;
+        let existing_claim = tx.query(
+            &format!(
+                "SELECT setting, value FROM {} WHERE setting = ANY($1)",
+                self.table(SCHEMA_METADATA_TABLE)
+            ),
+            &[&&[TOKEN_LAYOUT_VERSION_SETTING, TOKEN_LAYOUT_CLAIM_SETTING][..]],
+        )?;
+        if !existing_claim.is_empty() {
+            let found = existing_claim
+                .into_iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                .collect::<HashMap<_, _>>();
+            if found.get(TOKEN_LAYOUT_VERSION_SETTING).map(String::as_str) != Some(layout_version)
+                || found.get(TOKEN_LAYOUT_CLAIM_SETTING).map(String::as_str) != Some(claim)
+                || !self.storage_table_exists(&mut tx, TOKEN_LAYOUT_PARTS_TABLE)?
+            {
+                return Err(SearchError::ExternalBaseline(
+                    "token_layout_claim_mismatch: schema claim or companion table differs"
+                        .to_owned(),
+                ));
+            }
+            self.check_layout_claim_rows(&mut tx, Some((layout_version, claim)))?;
+            tx.commit()?;
+            return Ok(());
+        }
+        if self.storage_table_exists(&mut tx, TOKEN_LAYOUT_PARTS_TABLE)? {
+            return Err(SearchError::ExternalBaseline(
+                "token_layout_claim_mismatch: companion table exists without a claim".to_owned(),
+            ));
+        }
+        if !self.storage_table_exists(&mut tx, "snapshots")? {
+            return Err(SearchError::StorageNotInitialized { schema: self.schema.clone() });
+        }
+        let rows: i64 = tx
+            .query_one(
+                &format!(
+                    "SELECT
+                       (SELECT COUNT(*) FROM {}) +
+                       (SELECT COUNT(*) FROM {}) +
+                       (SELECT COUNT(*) FROM {}) +
+                       (SELECT COUNT(*) FROM {}) +
+                       (SELECT COUNT(*) FROM {}) +
+                       (SELECT COUNT(*) FROM {})",
+                    self.table("snapshots"),
+                    self.table("file_objects"),
+                    self.table("file_object_items"),
+                    self.table("serving_lexical"),
+                    self.table("content_objects"),
+                    self.table("semantic_embeddings"),
+                ),
+                &[],
+            )?
+            .get(0);
+        if rows != 0 {
+            return Err(SearchError::ExternalBaseline(format!(
+                "token_layout_claim_required: schema '{}' contains legacy rows and cannot be claimed",
+                self.schema
+            )));
+        }
+        tx.batch_execute(&format!(
+            "CREATE TABLE {} (
+                file_object_id TEXT NOT NULL REFERENCES {}(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                parent_symbol TEXT NOT NULL,
+                byte_start BIGINT NOT NULL,
+                byte_end BIGINT NOT NULL,
+                parent_byte_start BIGINT NOT NULL,
+                parent_byte_end BIGINT NOT NULL,
+                part_index BIGINT NOT NULL,
+                part_count BIGINT NOT NULL,
+                PRIMARY KEY (file_object_id, ordinal),
+                CHECK (byte_start >= parent_byte_start AND byte_end <= parent_byte_end),
+                CHECK (byte_start < byte_end AND parent_byte_start < parent_byte_end),
+                CHECK (part_index > 0 AND part_count >= part_index)
+            )",
+            self.table(TOKEN_LAYOUT_PARTS_TABLE),
+            self.table("file_objects"),
+        ))?;
+        let insert = format!(
+            "INSERT INTO {} (setting, value) VALUES ($1, $2)",
+            self.table(SCHEMA_METADATA_TABLE)
+        );
+        tx.execute(&insert, &[&TOKEN_LAYOUT_VERSION_SETTING, &layout_version])?;
+        tx.execute(&insert, &[&TOKEN_LAYOUT_CLAIM_SETTING, &claim])?;
+        tx.commit()?;
+        if let Ok(mut verified_at) = self.storage_verified_at.lock() {
+            *verified_at = None;
+        }
+        Ok(())
+    }
+
+    fn check_layout_claim_rows(
+        &self,
+        client: &mut impl GenericClient,
+        expected: Option<(&str, &str)>,
+    ) -> Result<(), SearchError> {
+        let rows = client.query(
+            &format!(
+                "SELECT setting, value FROM {} WHERE setting = ANY($1)",
+                self.table(SCHEMA_METADATA_TABLE)
+            ),
+            &[&&[TOKEN_LAYOUT_VERSION_SETTING, TOKEN_LAYOUT_CLAIM_SETTING][..]],
+        )?;
+        let found = rows
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect::<HashMap<_, _>>();
+        if found.len() == 1 {
+            return Err(SearchError::ExternalBaseline(
+                "token_layout_claim_missing: schema has only part of the layout claim".to_owned(),
+            ));
+        }
+        let actual =
+            found.get(TOKEN_LAYOUT_VERSION_SETTING).zip(found.get(TOKEN_LAYOUT_CLAIM_SETTING));
+        let expected = expected.or(self
+            .token_layout_claim
+            .as_ref()
+            .map(|(version, claim)| (version.as_str(), claim.as_str())));
+        match (expected, actual) {
+            (None, None) => {
+                if self.storage_table_exists(client, TOKEN_LAYOUT_PARTS_TABLE)? {
+                    return Err(SearchError::ExternalBaseline(
+                        "token_layout_claim_mismatch: unclaimed schema has a companion parts table".to_owned(),
+                    ));
+                }
+            }
+            (None, Some(_)) => return Err(SearchError::ExternalBaseline(
+                "token_layout_claim_mismatch: token-bound schema requires a configured layout claim".to_owned(),
+            )),
+            (Some(_), None) => return Err(SearchError::ExternalBaseline(
+                "token_layout_claim_missing: token-bound schema has no complete layout claim".to_owned(),
+            )),
+            (Some((version, claim)), Some((actual_version, actual_claim))) => {
+                if version != actual_version || claim != actual_claim
+                    || !self.storage_table_exists(client, TOKEN_LAYOUT_PARTS_TABLE)?
+                {
+                    return Err(SearchError::ExternalBaseline(
+                        "token_layout_claim_mismatch: schema claim or companion table differs".to_owned(),
+                    ));
+                }
+                let incomplete: i64 = client
+                    .query_one(
+                        &format!(
+                            "SELECT COUNT(*)
+                             FROM {} foi
+                             JOIN {} fo ON fo.id = foi.file_object_id
+                             LEFT JOIN {} part
+                               ON part.file_object_id = foi.file_object_id
+                              AND part.ordinal = foi.ordinal
+                             WHERE fo.collection = 'code' AND part.file_object_id IS NULL",
+                            self.table("file_object_items"),
+                            self.table("file_objects"),
+                            self.table(TOKEN_LAYOUT_PARTS_TABLE),
+                        ),
+                        &[],
+                    )?
+                    .get(0);
+                if incomplete != 0 {
+                    return Err(SearchError::ExternalBaseline(
+                        "token_layout_provenance_missing: code documents lack part metadata".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn connect(&self) -> Result<PgPooledConnection, SearchError> {
@@ -128,6 +358,16 @@ impl PostgresBaselineAdapter {
 
     fn table(&self, table: &str) -> String {
         format!("{}.{}", self.schema, table)
+    }
+
+    fn check_embedding_claim_model(&self, model_id: &str) -> Result<(), SearchError> {
+        if self.token_layout_claim.as_ref().is_some_and(|(_, claim)| claim.as_str() != model_id) {
+            return Err(SearchError::ExternalBaseline(
+                "token_layout_claim_mismatch: embedding identity differs from configured layout"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn storage_table_exists(
@@ -196,6 +436,12 @@ impl PostgresBaselineAdapter {
         // heals a not-ready schema without waiting out the TTL.
         if let Ok(verified_at) = self.storage_verified_at.lock() {
             if verified_at.is_some_and(|at| at.elapsed() < STORAGE_READINESS_TTL) {
+                let mut client = self.connect()?;
+                let expected = self
+                    .token_layout_claim
+                    .as_ref()
+                    .map(|(version, claim)| (version.as_str(), claim.as_str()));
+                self.check_layout_claim_rows(&mut *client, expected)?;
                 return Ok(());
             }
         }
@@ -233,6 +479,12 @@ impl PostgresBaselineAdapter {
         } else {
             return Err(SearchError::StorageNotInitialized { schema: self.schema.clone() });
         }
+
+        let expected = self
+            .token_layout_claim
+            .as_ref()
+            .map(|(version, claim)| (version.as_str(), claim.as_str()));
+        self.check_layout_claim_rows(&mut *client, expected)?;
 
         self.check_carriers_key_by_root(&mut client)?;
 
@@ -370,6 +622,8 @@ impl PostgresBaselineAdapter {
         model_id: &str,
         dimension: usize,
     ) -> Result<(), SearchError> {
+        self.check_embedding_claim_model(model_id)?;
+        self.check_storage_readiness()?;
         let mut client = self.connect()?;
         let mut tx = client.transaction()?;
         // Claim the identity if unset, atomically. `DO NOTHING` (not `DO UPDATE`) means
@@ -1008,6 +1262,7 @@ impl PostgresBaselineAdapter {
         dimension: usize,
         embeddings: &[(String, Vec<f32>)],
     ) -> Result<BaselineEmbeddingStats, SearchError> {
+        self.check_embedding_claim_model(model_id)?;
         self.check_storage_readiness()?;
         if embeddings.is_empty() {
             return Ok(BaselineEmbeddingStats { stored: 0, reused: 0 });
@@ -1044,6 +1299,7 @@ impl PostgresBaselineAdapter {
         model_id: &str,
         dimension: usize,
     ) -> Result<HashMap<String, Vec<f32>>, SearchError> {
+        self.check_embedding_claim_model(model_id)?;
         self.check_storage_readiness()?;
         let mut client = self.connect()?;
         load_embeddings_from_client(&mut *client, self, embedding_keys, model_id, dimension)
@@ -1271,6 +1527,7 @@ impl PostgresBaselineAdapter {
         dimension: usize,
         progress: Option<&dyn Fn(SemanticPublishProgress)>,
     ) -> Result<usize, SearchError> {
+        self.check_embedding_claim_model(model_id)?;
         self.check_storage_readiness()?;
         let mut client = self.connect()?;
         if !self.storage_table_exists(&mut *client, "serving_semantic")? {
@@ -1688,8 +1945,37 @@ impl SnapshotContentStore for PostgresBaselineAdapter {
 
         let file_object_ids =
             visible_files.iter().map(|file| file.file_object_id.clone()).collect::<Vec<_>>();
-        let items_query = format!(
+        let items_query = if self.token_layout_claim.is_some() {
+            format!(
             "SELECT foi.file_object_id,
+                    foi.ordinal,
+                    foi.symbol_name,
+                    foi.kind,
+                    foi.line_start,
+                    foi.line_end,
+                    co.text,
+                    foi.content_hash,
+                    foi.graph_context,
+                    part.parent_symbol,
+                    part.byte_start,
+                    part.byte_end,
+                    part.parent_byte_start,
+                    part.parent_byte_end,
+                    part.part_index,
+                    part.part_count
+             FROM {} foi
+             JOIN {} co ON co.content_hash = foi.content_hash
+             LEFT JOIN {} part ON part.file_object_id = foi.file_object_id AND part.ordinal = foi.ordinal
+             WHERE foi.file_object_id = ANY($1)
+             ORDER BY foi.file_object_id, foi.ordinal",
+            self.table("file_object_items"),
+            self.table("content_objects"),
+            self.table(TOKEN_LAYOUT_PARTS_TABLE)
+            )
+        } else {
+            format!(
+                "SELECT foi.file_object_id,
+                    foi.ordinal,
                     foi.symbol_name,
                     foi.kind,
                     foi.line_start,
@@ -1701,12 +1987,18 @@ impl SnapshotContentStore for PostgresBaselineAdapter {
              JOIN {} co ON co.content_hash = foi.content_hash
              WHERE foi.file_object_id = ANY($1)
              ORDER BY foi.file_object_id, foi.ordinal",
-            self.table("file_object_items"),
-            self.table("content_objects")
-        );
+                self.table("file_object_items"),
+                self.table("content_objects")
+            )
+        };
         let mut items_by_file_object = HashMap::<String, Vec<FileObjectItem>>::new();
         for row in client.query(&items_query, &[&file_object_ids])? {
             let file_object_id: String = row.get("file_object_id");
+            let source_span = if self.token_layout_claim.is_some() {
+                Some(source_span_from_row(&row)?)
+            } else {
+                None
+            };
             items_by_file_object.entry(file_object_id).or_default().push(FileObjectItem {
                 symbol_name: row.get("symbol_name"),
                 kind: row.get("kind"),
@@ -1715,6 +2007,7 @@ impl SnapshotContentStore for PostgresBaselineAdapter {
                 text: row.get("text"),
                 content_hash: row.get("content_hash"),
                 graph_context: row.get("graph_context"),
+                source_span,
             });
         }
 
@@ -1733,6 +2026,7 @@ impl SnapshotContentStore for PostgresBaselineAdapter {
                         text: item.text.clone(),
                         content_hash: item.content_hash.clone(),
                         graph_context: item.graph_context.clone(),
+                        source_span: item.source_span.clone(),
                     });
                 }
             }
@@ -1753,8 +2047,56 @@ impl SnapshotContentStore for PostgresBaselineAdapter {
                     rhs.symbol_name.as_str(),
                 ))
         });
+        if self.token_layout_claim.is_some() {
+            crate::publish::validate_source_span_layout(&documents, true)?;
+        }
         Ok(documents)
     }
+}
+
+type ServingRowKey = (String, String, String, i32);
+
+fn serving_row_key(row: &Row) -> ServingRowKey {
+    (row.get("collection"), row.get("root_id"), row.get("path"), row.get("ordinal"))
+}
+
+fn source_spans_for_serving_rows(
+    adapter: &PostgresBaselineAdapter,
+    client: &mut impl GenericClient,
+    snapshot_id: &str,
+    rows: &[Row],
+) -> Result<HashMap<ServingRowKey, SourceSpan>, SearchError> {
+    if adapter.token_layout_claim.is_none() || rows.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let visible = materialize_visible_snapshot_file_map(client, adapter, snapshot_id)?;
+    let query = format!(
+        "SELECT parent_symbol, byte_start, byte_end, parent_byte_start,
+                parent_byte_end, part_index, part_count
+         FROM {} WHERE file_object_id = $1 AND ordinal = $2",
+        adapter.table(TOKEN_LAYOUT_PARTS_TABLE)
+    );
+    let mut spans = HashMap::new();
+    for row in rows {
+        let key = serving_row_key(row);
+        if key.0 != "code" {
+            continue;
+        }
+        let file =
+            visible.get(&(key.0.clone(), key.1.clone(), key.2.clone())).ok_or_else(|| {
+                SearchError::ExternalBaseline(
+                    "token_layout_provenance_missing: serving row has no visible file object"
+                        .to_owned(),
+                )
+            })?;
+        let part = client.query_opt(&query, &[&file.file_object_id, &key.3])?.ok_or_else(|| {
+            SearchError::ExternalBaseline(
+                "token_layout_provenance_missing: serving document has no part metadata".to_owned(),
+            )
+        })?;
+        spans.insert(key, source_span_from_row(&part)?);
+    }
+    Ok(spans)
 }
 
 impl BaselineLexicalSearch for PostgresBaselineAdapter {
@@ -1798,6 +2140,7 @@ impl BaselineLexicalSearch for PostgresBaselineAdapter {
             "SELECT collection,
                     root_id,
                     path,
+                    ordinal,
                     symbol_name,
                     kind,
                     line_start,
@@ -1832,9 +2175,11 @@ impl BaselineLexicalSearch for PostgresBaselineAdapter {
             ));
         }
 
+        let source_spans = source_spans_for_serving_rows(self, &mut *client, &snapshot_id, &rows)?;
         Ok(rows
             .into_iter()
             .map(|row| LexicalHit {
+                source_span: source_spans.get(&serving_row_key(&row)).cloned(),
                 collection: row.get("collection"),
                 root_id: row.get("root_id"),
                 path: row.get("path"),
@@ -1863,6 +2208,7 @@ impl BaselineSemanticSearch for PostgresBaselineAdapter {
             return Ok(Vec::new());
         }
 
+        self.check_embedding_claim_model(model_id)?;
         self.check_storage_readiness()?;
         let collection =
             collection.map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned);
@@ -1879,6 +2225,7 @@ impl BaselineSemanticSearch for PostgresBaselineAdapter {
             "SELECT collection,
                     root_id,
                     path,
+                    ordinal,
                     symbol_name,
                     kind,
                     line_start,
@@ -1924,9 +2271,11 @@ impl BaselineSemanticSearch for PostgresBaselineAdapter {
             ));
         }
 
+        let source_spans = source_spans_for_serving_rows(self, &mut *client, &snapshot_id, &rows)?;
         Ok(rows
             .into_iter()
             .map(|row| SemanticHit {
+                source_span: source_spans.get(&serving_row_key(&row)).cloned(),
                 collection: row.get("collection"),
                 root_id: row.get("root_id"),
                 path: row.get("path"),
@@ -1996,6 +2345,19 @@ impl PostgresBaselineAdapter {
         // extension is fully usable for everything but semantic serving, which refuses by name.
         for statement in self.pgvector_schema_statements() {
             if let Err(e) = client.batch_execute(&statement) {
+                let concurrent_extension_install = statement
+                    == "CREATE EXTENSION IF NOT EXISTS vector"
+                    && e.as_db_error().is_some_and(|error| {
+                        error.code().code() == "23505"
+                            && error.constraint() == Some("pg_extension_name_index")
+                    });
+                if concurrent_extension_install {
+                    // Two independent workspace schemas can migrate concurrently in one
+                    // database. `IF NOT EXISTS` can still lose the unique-index race while
+                    // both sessions install this database-wide extension. The winner has
+                    // installed it; continue with this schema's serving table and index.
+                    continue;
+                }
                 tracing::warn!("pgvector DDL skipped (semantic serving will be unavailable): {e}");
                 break;
             }
@@ -2155,6 +2517,10 @@ impl SnapshotPublisher for PostgresBaselineAdapter {
         // Before the readiness check, which connects: an identity this baseline cannot share is
         // refused without touching the database at all.
         ensure_the_roots_mean_the_same_elsewhere(documents)?;
+        crate::publish::validate_source_span_layout(documents, self.token_layout_claim.is_some())?;
+        if let Some((version, claim)) = &self.token_layout_claim {
+            self.ensure_token_layout_claim(version, claim)?;
+        }
 
         self.check_storage_readiness()?;
 
@@ -2392,6 +2758,7 @@ struct FileObjectItem {
     text: String,
     content_hash: String,
     graph_context: Option<String>,
+    source_span: Option<SourceSpan>,
 }
 
 #[derive(Debug, Clone)]
@@ -2410,6 +2777,36 @@ struct FileObjectItemRow {
     line_end: i32,
     content_hash: String,
     graph_context: Option<String>,
+    source_span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone)]
+struct FileObjectPartRow {
+    file_object_id: String,
+    ordinal: i32,
+    source_span: SourceSpan,
+}
+
+fn source_span_from_row(row: &Row) -> Result<SourceSpan, SearchError> {
+    let missing = || {
+        SearchError::ExternalBaseline(
+            "token_layout_provenance_missing: file object part row is incomplete".to_owned(),
+        )
+    };
+    let parent_symbol = row.try_get::<_, Option<String>>("parent_symbol")?.ok_or_else(missing)?;
+    let to_u32 = |column: &str| -> Result<u32, SearchError> {
+        let value = row.try_get::<_, Option<i64>>(column)?.ok_or_else(missing)?;
+        u32::try_from(value).map_err(|_| missing())
+    };
+    Ok(SourceSpan {
+        parent_symbol,
+        byte_start: to_u32("byte_start")?,
+        byte_end: to_u32("byte_end")?,
+        parent_byte_start: to_u32("parent_byte_start")?,
+        parent_byte_end: to_u32("parent_byte_end")?,
+        part_index: to_u32("part_index")?,
+        part_count: to_u32("part_count")?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -3075,6 +3472,16 @@ fn fingerprint_file_documents(documents: &[IndexedDocument]) -> String {
                 hasher.update(&[0]);
             }
         }
+        if let Some(span) = &document.source_span {
+            hasher.update(&[1]);
+            hasher.update(span.parent_symbol.as_bytes());
+            hasher.update(&span.byte_start.to_le_bytes());
+            hasher.update(&span.byte_end.to_le_bytes());
+            hasher.update(&span.parent_byte_start.to_le_bytes());
+            hasher.update(&span.parent_byte_end.to_le_bytes());
+            hasher.update(&span.part_index.to_le_bytes());
+            hasher.update(&span.part_count.to_le_bytes());
+        }
         hasher.update(&[0xff]);
     }
     hasher.finalize().to_hex().to_string()
@@ -3129,12 +3536,86 @@ fn try_insert_file_object(
             line_end: document.line_end as i32,
             content_hash: document.content_hash.clone(),
             graph_context: document.graph_context.clone(),
+            source_span: document.source_span.clone(),
         });
     }
 
     upsert_content_objects(tx, adapter, &content_rows)?;
     insert_file_object_items(tx, adapter, &item_rows)?;
+    if adapter.token_layout_claim.is_some() {
+        let part_rows = item_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, row)| {
+                row.source_span.clone().map(|source_span| FileObjectPartRow {
+                    file_object_id: file_object_id.to_owned(),
+                    ordinal: ordinal as i32,
+                    source_span,
+                })
+            })
+            .collect::<Vec<_>>();
+        insert_file_object_parts(tx, adapter, &part_rows)?;
+    }
     Ok(true)
+}
+
+fn insert_file_object_parts(
+    tx: &mut Transaction<'_>,
+    adapter: &PostgresBaselineAdapter,
+    rows: &[FileObjectPartRow],
+) -> Result<(), SearchError> {
+    for batch in rows.chunks(FILE_OBJECT_ITEM_BATCH_SIZE) {
+        let mut values = Vec::with_capacity(batch.len());
+        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            Vec::with_capacity(batch.len() * 9);
+        let numeric = batch
+            .iter()
+            .map(|row| {
+                [
+                    row.source_span.byte_start as i64,
+                    row.source_span.byte_end as i64,
+                    row.source_span.parent_byte_start as i64,
+                    row.source_span.parent_byte_end as i64,
+                    row.source_span.part_index as i64,
+                    row.source_span.part_count as i64,
+                ]
+            })
+            .collect::<Vec<_>>();
+        for (index, row) in batch.iter().enumerate() {
+            let base = index * 9;
+            values.push(format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+                base + 9
+            ));
+            params.push(&row.file_object_id);
+            params.push(&row.ordinal);
+            params.push(&row.source_span.parent_symbol);
+            params.push(&numeric[index][0]);
+            params.push(&numeric[index][1]);
+            params.push(&numeric[index][2]);
+            params.push(&numeric[index][3]);
+            params.push(&numeric[index][4]);
+            params.push(&numeric[index][5]);
+        }
+        let query = format!(
+            "INSERT INTO {} (
+                file_object_id, ordinal, parent_symbol, byte_start, byte_end,
+                parent_byte_start, parent_byte_end, part_index, part_count
+             ) VALUES {}",
+            adapter.table(TOKEN_LAYOUT_PARTS_TABLE),
+            values.join(", ")
+        );
+        tx.execute(&query, &params)?;
+    }
+    Ok(())
 }
 
 fn unique_content_object_rows(
@@ -3850,8 +4331,11 @@ mod tests {
         semantic_publish_strategy, unique_content_object_rows, CarrierObligation, ContentObjectRow,
         EffectiveSnapshotSummary, PostgresBaselineAdapter, SemanticPublishPlan,
         SemanticPublishStrategy, VisibleFileKey, VisibleSnapshotFile, ROOTED_CARRIER_KEYS,
+        TOKEN_LAYOUT_PARTS_TABLE,
     };
-    use crate::domain::{CorpusId, ExternalBaselineConfig, Snapshot, SnapshotPublishMetadata};
+    use crate::domain::{
+        CorpusId, ExternalBaselineConfig, Snapshot, SnapshotPublishMetadata, SourceSpan,
+    };
     use crate::external_baseline::BaselineCollectionRecord;
     use crate::ports::{
         BaselineLexicalSearch, BaselineSemanticSearch, SnapshotCatalog, SnapshotContentStore,
@@ -4138,6 +4622,31 @@ mod tests {
 
         assert_eq!(adapter.config().schema, None);
         assert_eq!(adapter.table("snapshots"), "bsl_search.snapshots");
+        assert!(adapter.token_layout_claim.is_none());
+    }
+
+    #[test]
+    fn companion_layout_is_opt_in_and_not_part_of_legacy_migration() {
+        let adapter = PostgresBaselineAdapter::new(
+            ExternalBaselineConfig::postgres("postgres://example").with_schema("layout_test"),
+        )
+        .unwrap();
+        assert!(adapter
+            .ensure_schema_statements()
+            .iter()
+            .all(|statement| !statement.contains(TOKEN_LAYOUT_PARTS_TABLE)));
+
+        let configured = adapter
+            .with_token_layout_claim(crate::token_policy::SEGMENTATION_VERSION, "frozen-claim")
+            .unwrap();
+        assert_eq!(
+            configured
+                .token_layout_claim
+                .as_ref()
+                .map(|(version, claim)| (version.as_str(), claim.as_str())),
+            Some((crate::token_policy::SEGMENTATION_VERSION, "frozen-claim"))
+        );
+        assert!(configured.with_token_layout_claim("unknown-layout", "frozen-claim").is_err());
     }
 
     #[test]
@@ -4413,6 +4922,37 @@ mod tests {
         assert_ne!(fingerprint_file_documents(&documents), fingerprint_file_documents(&changed));
     }
 
+    #[test]
+    fn file_fingerprint_changes_when_source_part_provenance_changes() {
+        let mut document = indexed_document("code", "src/A.bsl", "A", 10, "hash-a", "text-a");
+        document.source_span = Some(SourceSpan {
+            parent_symbol: "A".to_owned(),
+            byte_start: 10,
+            byte_end: 20,
+            parent_byte_start: 10,
+            parent_byte_end: 20,
+            part_index: 1,
+            part_count: 1,
+        });
+        let original = fingerprint_file_documents(std::slice::from_ref(&document));
+        document.source_span.as_mut().unwrap().parent_symbol = "renamed".to_owned();
+        assert_ne!(original, fingerprint_file_documents(&[document]));
+    }
+
+    #[test]
+    fn file_fingerprint_preserves_legacy_graph_context_recipe() {
+        const NO_CONTEXT: &str = "de50ce142750232ee9a57e75f9fe9bb483b596deec09dedea9a0c29c69007b01";
+        const WITH_CONTEXT: &str =
+            "75f07ad2e7b8dd93e20110ceeb47e9e75cf387943d361f0d674c3c61893025f1";
+        let document = indexed_document("code", "src/A.bsl", "A", 10, "hash-a", "text-a");
+        let no_context = fingerprint_file_documents(std::slice::from_ref(&document));
+        let mut with_context = document;
+        with_context.graph_context = Some("Calls: B".to_owned());
+        let with_context = fingerprint_file_documents(&[with_context]);
+        assert_eq!(no_context, NO_CONTEXT);
+        assert_eq!(with_context, WITH_CONTEXT);
+    }
+
     /// The manifest carries the fingerprint computed here, and the working-tree
     /// side recomputes its own to decide whether a file differs from the
     /// baseline. Disagreeing recipes make every file read as locally changed,
@@ -4560,6 +5100,7 @@ mod tests {
             text: text.to_owned(),
             content_hash: content_hash.to_owned(),
             graph_context: None,
+            source_span: None,
         }
     }
 
@@ -4744,6 +5285,188 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
                 as u64;
         format!("bsl_{prefix}_{:02x}{:08x}", std::process::id() % 256, nanos as u32)
+    }
+
+    #[test]
+    #[ignore = "requires an isolated live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn token_layout_claim_provenance_is_atomic_and_fails_closed() {
+        let url = std::env::var("BSL_TEST_PG_URL")
+            .expect("BSL_TEST_PG_URL must point to an isolated live Postgres");
+        let layout = crate::token_policy::SEGMENTATION_VERSION;
+        let claim = "profile-v1:runtime-fixture";
+
+        let schema = unique_schema("tokenlayout");
+        let legacy_schema = unique_schema("tokenlegacy");
+        let legacy = PostgresBaselineAdapter::new(
+            ExternalBaselineConfig::postgres(url.clone()).with_schema(&legacy_schema),
+        )
+        .unwrap();
+        let _legacy_guard =
+            TestSchemaGuard { adapter: legacy.clone(), schema: legacy_schema.clone() };
+        legacy.migrate_storage().unwrap();
+        legacy
+            .publish_snapshot(
+                &Snapshot::new("legacy", CorpusId::WorkspaceCode),
+                &SnapshotPublishMetadata::default(),
+                &[indexed_document("code", "src/Legacy.bsl", "Legacy", 1, "legacy-hash", "body")],
+            )
+            .unwrap();
+        let legacy_claimed = legacy.clone().with_token_layout_claim(layout, claim).unwrap();
+        let legacy_error = legacy_claimed.ensure_token_layout_claim(layout, claim).unwrap_err();
+        assert!(legacy_error.to_string().contains("token_layout_claim_required"));
+        assert_eq!(legacy.list_snapshots(None, None, None, 10).unwrap().len(), 1);
+        let mut legacy_client = legacy.connect().unwrap();
+        let legacy_row = legacy_client
+            .query_one(
+                &format!(
+                    "SELECT (SELECT COUNT(*) FROM {legacy_schema}.snapshots),
+                            (SELECT COUNT(*) FROM {legacy_schema}.file_objects),
+                            (SELECT COUNT(*) FROM {legacy_schema}.file_object_items)"
+                ),
+                &[],
+            )
+            .unwrap();
+        let legacy_rows: (i64, i64, i64) =
+            (legacy_row.get(0), legacy_row.get(1), legacy_row.get(2));
+        assert_eq!(legacy_rows, (1, 1, 1), "legacy rows survive claim refusal");
+        let claim_rows: i64 = legacy_client
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {legacy_schema}._schema_metadata_
+                     WHERE setting IN ('token_layout_version', 'token_layout_claim')"
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(claim_rows, 0, "legacy refusal must not write a partial claim");
+        assert!(!legacy
+            .storage_table_exists(&mut *legacy_client, TOKEN_LAYOUT_PARTS_TABLE)
+            .unwrap());
+
+        let base = PostgresBaselineAdapter::new(
+            ExternalBaselineConfig::postgres(url).with_schema(&schema),
+        )
+        .unwrap();
+        let _guard = TestSchemaGuard { adapter: base.clone(), schema: schema.clone() };
+        base.migrate_storage().unwrap();
+        let adapter = base.clone().with_token_layout_claim(layout, claim).unwrap();
+        adapter.ensure_token_layout_claim(layout, claim).unwrap();
+
+        let parts = || {
+            let mut first =
+                indexed_document("code", "src/A.bsl", "A (часть 1)", 1, "part-1", "abc");
+            first.source_span = Some(SourceSpan {
+                parent_symbol: "A".to_owned(),
+                byte_start: 0,
+                byte_end: 3,
+                parent_byte_start: 0,
+                parent_byte_end: 6,
+                part_index: 1,
+                part_count: 2,
+            });
+            let mut second =
+                indexed_document("code", "src/A.bsl", "A (часть 2)", 2, "part-2", "def");
+            second.source_span = Some(SourceSpan {
+                parent_symbol: "A".to_owned(),
+                byte_start: 3,
+                byte_end: 6,
+                parent_byte_start: 0,
+                parent_byte_end: 6,
+                part_index: 2,
+                part_count: 2,
+            });
+            [first, second]
+        };
+
+        let mut client = adapter.connect().unwrap();
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {schema}.reject_lexical_insert() RETURNS trigger
+                   LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected lexical failure'; END $$;
+                 CREATE TRIGGER reject_lexical_insert BEFORE INSERT ON {schema}.serving_lexical
+                   FOR EACH ROW EXECUTE FUNCTION {schema}.reject_lexical_insert();"
+            ))
+            .unwrap();
+        assert!(adapter
+            .publish_snapshot(
+                &Snapshot::new("partial", CorpusId::WorkspaceCode),
+                &SnapshotPublishMetadata::default(),
+                &parts(),
+            )
+            .is_err());
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER reject_lexical_insert ON {schema}.serving_lexical;
+                 DROP FUNCTION {schema}.reject_lexical_insert();"
+            ))
+            .unwrap();
+        for table in ["snapshots", "file_objects", "file_object_items", TOKEN_LAYOUT_PARTS_TABLE] {
+            let count: i64 = client
+                .query_one(&format!("SELECT COUNT(*) FROM {schema}.{table}"), &[])
+                .unwrap()
+                .get(0);
+            assert_eq!(count, 0, "failed publish must roll back {table}");
+        }
+        assert!(adapter.snapshot_details("partial").unwrap().is_none());
+        let marker_count: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {schema}._schema_metadata_
+                     WHERE setting LIKE 'semantic_publication_complete:%'"
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(marker_count, 0, "a partial snapshot cannot become semantically complete");
+
+        adapter
+            .publish_snapshot(
+                &Snapshot::new("complete", CorpusId::WorkspaceCode),
+                &SnapshotPublishMetadata::default(),
+                &parts(),
+            )
+            .unwrap();
+        let loaded = adapter
+            .load_snapshot_documents(&Snapshot::new("complete", CorpusId::WorkspaceCode))
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].source_span.as_ref().unwrap().parent_symbol, "A");
+        assert_eq!(loaded[0].source_span.as_ref().unwrap().part_index, 1);
+        assert_eq!(loaded[1].source_span.as_ref().unwrap().part_index, 2);
+        assert!(adapter
+            .snapshot_details("complete")
+            .unwrap()
+            .unwrap()
+            .semantic_publication
+            .is_none());
+
+        let mut counts = || -> (i64, i64, i64, i64) {
+            let row = client
+                .query_one(
+                    &format!(
+                        "SELECT (SELECT COUNT(*) FROM {schema}.snapshots),
+                                (SELECT COUNT(*) FROM {schema}.file_objects),
+                                (SELECT COUNT(*) FROM {schema}.file_object_items),
+                                (SELECT COUNT(*) FROM {schema}.file_object_parts)"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            (row.get(0), row.get(1), row.get(2), row.get(3))
+        };
+        let before = counts();
+        let unconfigured =
+            base.load_snapshot_documents(&Snapshot::new("complete", CorpusId::WorkspaceCode));
+        assert!(unconfigured.is_err());
+        let mismatched = base
+            .with_token_layout_claim(layout, "profile-v1:other")
+            .unwrap()
+            .load_snapshot_documents(&Snapshot::new("complete", CorpusId::WorkspaceCode));
+        assert!(mismatched.is_err());
+        let after = counts();
+        assert_eq!(before, after, "foreign and mismatched claims must preserve published rows");
     }
 
     #[test]

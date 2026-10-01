@@ -548,6 +548,61 @@ publish_branches = ["vendor", "develop"]
 - `docs/central-postgres-search/README.md`
 - `docs/central-postgres-search/13-cli-commands.md`
 
+### Префиксы входа эмбеддера
+
+Для модели, различающей вопрос и документ, задайте литеральные префиксы:
+
+```toml
+[search.baseline.embedding]
+queryPrefix = "search_query: "
+documentPrefix = "search_document: "
+```
+
+MCP и CLI публикации разрешают каждый префикс независимо: явно заданное поле
+проекта → `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_DOCUMENT_PREFIX` → пустая строка.
+Явное `documentPrefix = ""` отключает префикс документа даже при непустом
+значении окружения. Пробелы и переводы строк сохраняются буквально. Вопрос
+получает префикс вопроса, background и interactive batches — префикс документа;
+lexical-поиск продолжает использовать исходный текст вопроса.
+
+Без новых настроек HTTP-вход и идентификатор модели в legacy cache сохраняются.
+При непустом префиксе storage identity учитывает оба префикса и wire model alias;
+изменение любого префикса требует совместимого индекса. Используйте отдельный
+cache для пилота. Непустой cache неизвестного или чужого профиля не очищается
+автоматически и не принимается как источник новых векторов.
+
+Имя модели, отправляемое HTTP-сервису, должно закреплять checkpoint, tokenizer,
+pooling, dtype, нормализацию и token policy. При изменении этих условий задавайте
+новый alias. Префиксы готовит клиент: server default prompt должен быть отключён.
+Существующий порядок разрешения model/URL этим дополнением не меняется.
+
+### Ограничение code embedding по токенам
+
+Полностью заданная тройка включает разбиение кода с сохранением исходных байтов:
+
+```toml
+[search.baseline.embedding]
+maxInputTokens = 8192
+tokenizerFile = "artifacts/tokenizer.json"
+tokenizerSha256 = "80d0433a2cfc55a4561b0e98b6f822decc48c9d457db498837223f9385ef3aff"
+```
+
+Каждое поле разрешается независимо: значение проекта → `EMBEDDING_MAX_INPUT_TOKENS`,
+`EMBEDDING_TOKENIZER_FILE`, `EMBEDDING_TOKENIZER_SHA256` → отсутствие. Путь проекта
+относится к каталогу TOML, путь окружения — к source workspace. Отсутствие всей
+тройки сохраняет прежнее поведение. Частичная тройка, пустое значение, неверный лимит,
+отсутствующий файл или несовпадение SHA256 дают `embedding_invalid_config` до HTTP.
+Файл загружается локально, без скачивания; tokenizer и транспортные лимиты
+фиксируются на время процесса. Truncation и padding выключены, special tokens
+учитываются вместе с префиксом, заголовком и graph context.
+
+Большие методы делятся на адресуемые UTF-8 части без обрезки исходного текста.
+Query не разбивается: превышение лимита возвращает `embedding_input_too_large`,
+сохраняя lexical fallback. Документация платформы не сегментируется.
+Профиль включает tokenizer hash, лимит, алгоритм и byte envelope в storage identity.
+Используйте отдельные cache и PostgreSQL schema; чужой непустой layout отвергается
+до записи данных. Возврат к профилю без token policy требует прежнего отдельного cache.
+
 ## Проверка конфигурации
 
 ### Быстрая проверка через `check-config`

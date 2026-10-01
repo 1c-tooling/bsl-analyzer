@@ -38,6 +38,20 @@ pub(super) fn embedder_config(
 ) -> Result<Option<bsl_search::EmbedderConfig>, bsl_search::SearchError> {
     let emb = &project.config.search.baseline.embedding;
 
+    // Resolve the opt-in triple before checking whether an embedding endpoint is configured.
+    // A partial or invalid request must not silently downgrade a requested bounded publish.
+    let token_policy = mcp_server::resolve_embedding_token_profile_values(
+        Some(&project.config),
+        Some(&project.root),
+        [None, None, None],
+        [
+            env::var_os("EMBEDDING_MAX_INPUT_TOKENS"),
+            env::var_os("EMBEDDING_TOKENIZER_FILE"),
+            env::var_os("EMBEDDING_TOKENIZER_SHA256"),
+        ],
+    )?
+    .and_then(|profile| profile.token_policy);
+
     let Some(model) = emb.model.clone().or_else(|| env::var("EMBEDDING_MODEL").ok()) else {
         return Ok(None);
     };
@@ -56,7 +70,11 @@ pub(super) fn embedder_config(
         dim,
         api_key: env::var("EMBEDDING_API_KEY").ok(),
         provider: emb.provider.clone().or_else(|| env::var("EMBEDDING_PROVIDER").ok()),
+        query_prefix: emb.resolve_query_prefix(env::var("EMBEDDING_QUERY_PREFIX").ok().as_deref()),
+        document_prefix: emb
+            .resolve_document_prefix(env::var("EMBEDDING_DOCUMENT_PREFIX").ok().as_deref()),
         max_request_bytes,
+        token_policy,
     }))
 }
 

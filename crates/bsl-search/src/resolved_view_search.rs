@@ -36,6 +36,7 @@ mod tests {
                     text: "body".to_owned(),
                     content_hash: "a".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 },
                 IndexedDocument {
                     collection: "platform".to_owned(),
@@ -48,6 +49,7 @@ mod tests {
                     text: "docs".to_owned(),
                     content_hash: "b".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 },
             ],
         );

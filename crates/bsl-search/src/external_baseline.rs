@@ -165,6 +165,31 @@ impl ExternalBaselineAdapter {
         }
     }
 
+    /// Return an adapter clone configured to require one explicit token-bound file layout.
+    pub fn with_token_layout_claim(
+        &self,
+        layout_version: impl Into<String>,
+        claim: impl Into<String>,
+    ) -> Result<Self, SearchError> {
+        let layout_version = layout_version.into();
+        let claim = claim.into();
+        match self {
+            Self::Postgres(adapter) => {
+                Ok(Self::Postgres(adapter.clone().with_token_layout_claim(layout_version, claim)?))
+            }
+        }
+    }
+
+    pub fn ensure_token_layout_claim(
+        &self,
+        layout_version: &str,
+        claim: &str,
+    ) -> Result<(), SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.ensure_token_layout_claim(layout_version, claim),
+        }
+    }
+
     pub fn list_snapshots(
         &self,
         corpus: Option<&str>,
@@ -383,6 +408,14 @@ impl EmbeddingStore for ExternalBaselineAdapter {
         dimension: usize,
     ) -> Result<(), SearchError> {
         ExternalBaselineAdapter::ensure_embedding_identity(self, model_id, dimension)
+    }
+
+    fn ensure_token_layout_claim(
+        &self,
+        layout_version: &str,
+        claim: &str,
+    ) -> Result<(), SearchError> {
+        ExternalBaselineAdapter::ensure_token_layout_claim(self, layout_version, claim)
     }
 }
 

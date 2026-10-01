@@ -183,9 +183,9 @@ pub use graph_db::{
 };
 pub use graph_query::{GraphDb, GraphDbContextProvider};
 pub use http::{serve_http, wildcard_allowed_hosts, MAX_HTTP_REQUEST_BODY_BYTES};
-pub use state::WorkspaceInitError;
 use state::WorkspaceSearchMode;
-pub use state::{OnecConnection, SharedState};
+pub use state::{resolve_embedding_token_profile_values, WorkspaceInitError};
+pub use state::{EmbeddingPrefixes, EmbeddingTokenProfile, OnecConnection, SharedState};
 pub use tools::platform::{
     build_reference_documents, reference_documents_fingerprint, REFERENCE_DOCUMENT_SCHEMA_VERSION,
 };
@@ -3216,7 +3216,7 @@ mod surface_guards {
         assert_eq!(version_of_hits(&workspace, code), "#/$defs/SearchCodeSchemaVersion");
         assert_eq!(version_of_hits(&workspace, docs), "#/$defs/SearchSchemaVersion");
         assert_eq!(version_of_hits(&reference, code), "#/$defs/SearchSchemaVersion");
-        assert_eq!(workspace["$defs"]["SearchCodeSchemaVersion"]["enum"], serde_json::json!(["7"]));
+        assert_eq!(workspace["$defs"]["SearchCodeSchemaVersion"]["enum"], serde_json::json!(["8"]));
         assert_eq!(reference["$defs"]["SearchSchemaVersion"]["enum"], serde_json::json!(["6"]));
     }
 

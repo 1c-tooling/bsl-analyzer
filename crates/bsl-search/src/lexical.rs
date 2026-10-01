@@ -46,6 +46,7 @@ pub(crate) fn lexical_hits_for_documents<'a>(
     let mut hits: Vec<SearchHit> = documents
         .filter_map(|document| lexical_score(document, query).map(|score| (document, score)))
         .map(|(document, score)| SearchHit {
+            source_span: document.source_span.clone(),
             collection: document.collection.clone(),
             root_id: document.root_id.clone(),
             file_path: document.path.clone(),
@@ -124,6 +125,7 @@ mod tests {
             text: text.to_owned(),
             content_hash: format!("hash-{symbol_name}"),
             graph_context: None,
+            source_span: None,
         }
     }
 

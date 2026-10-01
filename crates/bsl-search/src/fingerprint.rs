@@ -49,7 +49,7 @@ pub fn fingerprint_indexed_documents(documents: &[IndexedDocument]) -> String {
         .map(|document| {
             let line_start = document.line_start.to_string();
             let line_end = document.line_end.to_string();
-            entry_of(&[
+            let mut entry = entry_of(&[
                 document.collection.as_str(),
                 document.root_id.as_str(),
                 document.path.as_str(),
@@ -59,7 +59,19 @@ pub fn fingerprint_indexed_documents(documents: &[IndexedDocument]) -> String {
                 line_end.as_str(),
                 document.content_hash.as_str(),
                 document.text.as_str(),
-            ])
+            ]);
+            if let Some(span) = &document.source_span {
+                entry.push_str(&entry_of(&[
+                    &span.parent_symbol,
+                    &span.byte_start.to_string(),
+                    &span.byte_end.to_string(),
+                    &span.parent_byte_start.to_string(),
+                    &span.parent_byte_end.to_string(),
+                    &span.part_index.to_string(),
+                    &span.part_count.to_string(),
+                ]));
+            }
+            entry
         })
         .collect();
     entries.sort();
@@ -102,6 +114,7 @@ mod tests {
             text: "Процедура Первый()".to_owned(),
             content_hash: "hash-1".to_owned(),
             graph_context: None,
+            source_span: None,
         };
         let two = IndexedDocument {
             path: "CommonModules/Второй/Ext/Module.bsl".to_owned(),
@@ -110,13 +123,27 @@ mod tests {
             ..one.clone()
         };
         let forwards = vec![one.clone(), two.clone()];
-        let backwards = vec![two, one];
+        let backwards = vec![two, one.clone()];
 
         assert_eq!(
             fingerprint_indexed_documents(&forwards),
             fingerprint_indexed_documents(&backwards),
             "the same corpus in a different order is the same corpus"
         );
+        let mut part = one.clone();
+        part.source_span = Some(crate::SourceSpan {
+            parent_symbol: one.symbol_name.clone(),
+            byte_start: 0,
+            byte_end: one.text.len() as u32,
+            parent_byte_start: 0,
+            parent_byte_end: one.text.len() as u32,
+            part_index: 1,
+            part_count: 1,
+        });
+        let claimed = fingerprint_indexed_documents(&[part.clone()]);
+        assert_ne!(claimed, fingerprint_indexed_documents(&[one]));
+        part.source_span.as_mut().unwrap().parent_byte_start = 1;
+        assert_ne!(claimed, fingerprint_indexed_documents(&[part]));
     }
 
     /// The snapshot fingerprint answers one question — is this the same corpus? — and two
@@ -137,6 +164,7 @@ mod tests {
             text: "Процедура Общий()".to_owned(),
             content_hash: "hash-1".to_owned(),
             graph_context: None,
+            source_span: None,
         }];
         let docs_b = vec![IndexedDocument {
             root_id: "Расширение".to_owned(),
@@ -166,6 +194,7 @@ mod tests {
             text: "Процедура Общий()".to_owned(),
             content_hash: "hash-1".to_owned(),
             graph_context: None,
+            source_span: None,
         };
         let boundary_moved = IndexedDocument {
             root_id: "src/cfe/a\nb".to_owned(),
@@ -193,6 +222,7 @@ mod tests {
             text: "body".to_owned(),
             content_hash: "hash-a".to_owned(),
             graph_context: None,
+            source_span: None,
         }];
         let docs_b = vec![IndexedDocument { text: "changed".to_owned(), ..docs_a[0].clone() }];
 

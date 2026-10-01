@@ -2,6 +2,85 @@ use super::*;
 use serde_json::Value;
 use std::io::{Read, Write};
 
+#[test]
+fn profiled_constructor_blocks_unproven_vectors_but_keeps_lexical_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("search.db");
+    let mut store = crate::Store::open(&db_path).unwrap();
+    let chunks = code_chunk::Chunker::chunk("Процедура Needle()\nКонецПроцедуры");
+    store
+        .reindex_file(
+            crate::CONFIGURATION_ROOT_ID,
+            "M.bsl",
+            b"legacy",
+            &chunks,
+            Some(&[vec![1.0_f32, 0.0]]),
+        )
+        .unwrap();
+    drop(store);
+
+    let embedder = EmbedderConfig {
+        dim: Some(2),
+        query_prefix: "query: ".to_owned(),
+        ..EmbedderConfig::default()
+    };
+    let engine = SearchEngine::new(
+        &db_path,
+        SearchConfig { embedder, execution: EmbeddingExecutionPolicy::default() },
+    )
+    .unwrap();
+
+    assert_eq!(engine.index.len(), 0, "legacy vectors must not enter a profiled HNSW");
+    assert!(!engine.store.text_search("Needle", 1, Some("code")).unwrap().is_empty());
+    assert!(!engine.store.embedding_profile_matches("profile-v1:foreign", 2).unwrap());
+}
+
+#[test]
+fn profiled_embedding_pass_refuses_unproven_vectors_without_claiming_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("search.db");
+    let mut store = crate::Store::open(&db_path).unwrap();
+    let chunks = code_chunk::Chunker::chunk("Процедура Needle()\nКонецПроцедуры");
+    store
+        .reindex_file(
+            crate::CONFIGURATION_ROOT_ID,
+            "M.bsl",
+            b"legacy",
+            &chunks,
+            Some(&[vec![1.0_f32, 0.0]]),
+        )
+        .unwrap();
+    let before = store.load_all_embeddings(2).unwrap();
+
+    let config = EmbedderConfig {
+        dim: Some(2),
+        query_prefix: "query: ".to_owned(),
+        ..EmbedderConfig::default()
+    };
+    let embedder = Embedder::new(config);
+    let mut apply =
+        |operation: &mut dyn FnMut() -> Result<(), SearchError>| FenceOutcome::Applied(operation());
+    let mut retry = || false;
+    let result = SearchEngine::run_embedding_pass_owned(
+        &store,
+        &embedder,
+        2,
+        32,
+        1,
+        None,
+        None,
+        &mut apply,
+        Some(&mut retry),
+    );
+
+    assert!(
+        matches!(result, Err(SearchError::Index(message)) if message == "embedding profile mismatch")
+    );
+    assert_eq!(store.load_all_embeddings(2).unwrap(), before);
+    assert!(!store.text_search("Needle", 1, Some("code")).unwrap().is_empty());
+    assert!(!store.embedding_profile_matches("profile-v1:new-inputs", 2).unwrap());
+}
+
 fn capture(f: impl FnOnce()) -> Vec<Value> {
     capture_level(tracing::level_filters::LevelFilter::DEBUG, f)
 }
@@ -983,7 +1062,10 @@ fn vector_lifecycle_full_index_that_skipped_a_rejected_file_is_failed() {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
                 max_request_bytes: EmbedderConfig::DEFAULT_MAX_REQUEST_BYTES,
+                token_policy: None,
             },
             execution: crate::EmbeddingExecutionPolicy::default(),
         },
@@ -1033,6 +1115,7 @@ fn indexing_pass_lifecycle_sync_counts_batches_per_file() {
             text: format!("Процедура Method{i}() КонецПроцедуры"),
             content_hash: format!("hash{i}"),
             graph_context: None,
+            source_span: None,
         })
         .collect();
     engine.sync_indexed_documents_in_collection("code", &documents, Some(&progress)).unwrap();
