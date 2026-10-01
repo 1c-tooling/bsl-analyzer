@@ -3135,6 +3135,12 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf()).with_publish_hook(hook);
         graph.ensure_loading();
         wait_ready(&graph);
+        // Ready precedes the initial publish hook; count only offers after that pass.
+        super::super::test_support::wait_publish_pass_within(
+            &graph,
+            super::super::test_support::WAIT_CEILING,
+            1,
+        );
         armed.store(true, Ordering::SeqCst);
         assert!(!graph.hook_debt().any(), "the fixture needs a graph that owes the hook nothing");
 
