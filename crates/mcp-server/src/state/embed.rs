@@ -824,6 +824,7 @@ impl SharedState {
                 return super::WorkspaceSearchApply::Released;
             }
             #[cfg(test)]
+            #[allow(deprecated, reason = "test fault injection retains Rust 1.91 compatibility")]
             if FORCE_OVERLAY_PUBLICATION_REFUSALS
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
@@ -1307,6 +1308,7 @@ impl SharedState {
                                 } else {
                                     &FORCE_EMBED_PUBLICATION_REFUSALS
                                 };
+                                #[allow(deprecated, reason = "test fault injection retains Rust 1.91 compatibility")]
                                 if forced
                                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                                         remaining.checked_sub(1)
