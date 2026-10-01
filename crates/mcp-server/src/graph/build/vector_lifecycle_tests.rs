@@ -193,12 +193,36 @@ fn vector_lifecycle_cleared_hash_and_missing_record_keep_distinct_causes() {
 
 #[test]
 fn vector_lifecycle_read_error_preserves_rows_and_vectors() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut engine, rows) = seed(dir.path());
+    for registered in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        assert_read_error_preserves_rows_and_vectors(dir.path(), registered);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn vector_lifecycle_read_error_through_symlinked_root_preserves_rows_and_vectors() {
+    for registered in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let alias = dir.path().join("walked-root");
+        std::fs::create_dir(&source).unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert_read_error_preserves_rows_and_vectors(&alias, registered);
+    }
+}
+
+fn assert_read_error_preserves_rows_and_vectors(source: &Path, registered: bool) {
+    let (mut engine, rows) = seed(source);
+    if registered {
+        let (roots, rejected) = bsl_search::WorkspaceRoots::build(source, source, &[]);
+        assert!(rejected.is_empty());
+        engine.set_workspace_roots(roots);
+    }
     let before = engine.store().load_all_embeddings(2).unwrap();
     let generation = engine.store().embedding_generation().unwrap();
-    std::fs::remove_file(dir.path().join("Module.bsl")).unwrap();
-    let records = capture(|| emit(&mut engine, dir.path(), &rows));
+    std::fs::remove_file(source.join("Module.bsl")).unwrap();
+    let records = capture(|| emit(&mut engine, source, &rows));
     let decision = records.iter().find(|r| r["kind"] == "decision").unwrap();
     assert_eq!(decision["reason"], "read_error");
     assert!(!records.iter().any(|r| r["kind"] == "mutation"));
