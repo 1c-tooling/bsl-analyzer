@@ -3,12 +3,15 @@ use crate::{MethodId, VariableId};
 use std::sync::Arc;
 use stdx::case::CaseExt;
 use syntax::{
-    extract_leading_comments_at_offset, extract_variable_comments_at_offset, Parse, SyntaxKind,
-    SyntaxNode,
+    extract_leading_comment_lines_at_offset, extract_variable_comments_at_offset, Parse,
+    SyntaxKind, SyntaxNode,
 };
 
+mod fields;
+mod tokens;
 mod type_expr;
 
+pub use tokens::{doc_comment_tokens, DocCommentToken, DocCommentTokenKind};
 pub use type_expr::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +114,46 @@ impl TypeDoc {
     pub fn hyperlink(link: String) -> Self {
         Self { name: link, description: None, parameters: Vec::new(), is_hyperlink: true }
     }
+
+    /// Separates the full documented type from prose without changing the legacy representation
+    /// used by type inference, where a collection's element can be stored in `description`.
+    pub fn type_label_and_description(&self) -> (String, Option<&str>) {
+        let description = self.description.as_deref().filter(|text| !text.trim().is_empty());
+        let Some(text) = description else {
+            return (self.name.clone(), None);
+        };
+        if !matches!(
+            self.name.fold_lower().as_str(),
+            "массив"
+                | "фиксированныймассив"
+                | "соответствие"
+                | "фиксированноесоответствие"
+                | "структура"
+                | "фиксированнаяструктура"
+                | "таблицазначений"
+                | "списокзначений"
+                | "деревозначений"
+                | "array"
+                | "fixedarray"
+                | "map"
+                | "fixedmap"
+                | "structure"
+                | "fixedstructure"
+                | "valuetable"
+                | "valuelist"
+                | "valuetree"
+        ) {
+            return (self.name.clone(), description);
+        }
+        let (element, prose) = split_type_description(text)
+            .map_or((text, None), |(element, prose)| (element, Some(prose)));
+        let label = format!("{} {}", self.name, element.trim());
+        if parse_collection_type(&label).is_some() {
+            (label, prose.filter(|text| !text.is_empty()))
+        } else {
+            (self.name.clone(), description)
+        }
+    }
 }
 
 pub fn compute_method_docs(
@@ -122,7 +165,7 @@ pub fn compute_method_docs(
     let source_range = tree.method(method_id.local_id)?.source_range();
 
     let offset: usize = source_range.start().into();
-    let comments = extract_leading_comments_at_offset(offset, file_text)?;
+    let comments = extract_leading_comment_lines_at_offset(offset, file_text)?;
 
     let docs = parse_method_docs(&comments)?;
 
@@ -299,30 +342,9 @@ fn parse_method_docs(comments: &[String]) -> Option<MethodDocs> {
     let mut prev_blank = false;
     for (i, line) in comments.iter().enumerate() {
         let trimmed = line.trim();
-        let lower = trimmed.fold_lower();
-
-        let returns_header = returns_section_header(trimmed);
-        if is_parameters_keyword(&lower) {
-            in_parameters = true;
-            section_indices.push(SectionMarker::new(i, Section::Parameters, None));
-        } else if returns_header != ReturnsHeader::NotReturns
-            && !is_parameter_named_like_returns(in_parameters, prev_blank, &lower, trimmed)
-        {
-            in_parameters = false;
-            let inline_payload = match returns_header {
-                ReturnsHeader::WithPayload(payload) => Some(payload),
-                _ => None,
-            };
-            section_indices.push(SectionMarker::new(i, Section::Returns, inline_payload));
-        } else if is_example_keyword(&lower) {
-            in_parameters = false;
-            section_indices.push(SectionMarker::new(i, Section::Examples, None));
-        } else if is_call_options_keyword(&lower) {
-            in_parameters = false;
-            section_indices.push(SectionMarker::new(i, Section::CallOptions, None));
-        } else if is_deprecated_keyword(&lower) {
-            in_parameters = false;
-            section_indices.push(SectionMarker::new(i, Section::Deprecated, None));
+        if let Some((section, payload)) = section_header(trimmed, in_parameters, prev_blank) {
+            in_parameters = section == Section::Parameters;
+            section_indices.push(SectionMarker::new(i, section, payload));
         }
 
         prev_blank = trimmed.is_empty();
@@ -360,10 +382,10 @@ fn parse_method_docs(comments: &[String]) -> Option<MethodDocs> {
                 docs.returned_value = parse_returns(&section_lines);
             }
             Section::Examples => {
-                docs.examples = parse_simple_section(&section_lines);
+                docs.examples = parse_code_section(&section_lines);
             }
             Section::CallOptions => {
-                docs.call_options = parse_simple_section(&section_lines);
+                docs.call_options = parse_code_section(&section_lines);
             }
             Section::Deprecated => {
                 docs.deprecation =
@@ -382,6 +404,35 @@ enum Section {
     Examples,
     CallOptions,
     Deprecated,
+}
+
+/// Keeps structural documentation and its source tokens on the same section rules.
+fn section_header(
+    line: &str,
+    in_parameters: bool,
+    prev_blank: bool,
+) -> Option<(Section, Option<String>)> {
+    let lower = line.fold_lower();
+    let returns_header = returns_section_header(line);
+    if is_parameters_keyword(&lower) {
+        Some((Section::Parameters, None))
+    } else if returns_header != ReturnsHeader::NotReturns
+        && !is_parameter_named_like_returns(in_parameters, prev_blank, &lower, line)
+    {
+        let payload = match returns_header {
+            ReturnsHeader::WithPayload(payload) => Some(payload),
+            _ => None,
+        };
+        Some((Section::Returns, payload))
+    } else if is_example_keyword(&lower) {
+        Some((Section::Examples, None))
+    } else if is_call_options_keyword(&lower) {
+        Some((Section::CallOptions, None))
+    } else if is_deprecated_keyword(&lower) {
+        Some((Section::Deprecated, None))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,6 +616,13 @@ fn contains_see_reference(text: &str) -> bool {
 /// plausible target; the English `see` only at line start, so the common
 /// verb mid-sentence is not matched.
 fn append_see_targets(line: &str, out: &mut Vec<String>) {
+    out.extend(see_reference_ranges(line).into_iter().map(|(_, target)| line[target].to_string()));
+}
+
+/// Byte ranges keep link detection and editor highlighting on the same boundaries.
+fn see_reference_ranges(line: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let mut out = Vec::new();
+    let offsets: Vec<_> = line.char_indices().map(|(i, _)| i).chain([line.len()]).collect();
     let chars: Vec<char> = line.chars().collect();
 
     let mut i = 0;
@@ -603,7 +661,7 @@ fn append_see_targets(line: &str, out: &mut Vec<String>) {
         let target: String = chars[start..j].iter().collect();
         let target = target.trim_end_matches('.');
         if !target.is_empty() {
-            out.push(target.to_string());
+            out.push((offsets[i]..offsets[i + 3], offsets[start]..offsets[start] + target.len()));
         }
         i = j;
     }
@@ -617,28 +675,33 @@ fn append_see_targets(line: &str, out: &mut Vec<String>) {
             .collect();
         let target = target.trim_end_matches('.');
         if target.chars().next().is_some_and(char::is_alphabetic) {
-            out.push(target.to_string());
+            let marker_start = line.len() - trimmed.len();
+            let target_start = line.len() - trimmed[4..].trim_start().len();
+            out.push((marker_start..marker_start + 3, target_start..target_start + target.len()));
         }
     }
+    out
 }
 
 fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
     let mut parameters = Vec::new();
     let mut current_param: Option<(String, Vec<TypeDoc>)> = None;
 
-    for line in lines {
+    let mut cursor = 0;
+    while let Some(line) = lines.get(cursor) {
         let trimmed = line.trim();
+        cursor += 1;
 
         if trimmed.is_empty() {
             continue;
         }
 
         if trimmed.starts_with('*') {
+            cursor -= 1;
+            let fields = fields::parse_fields(lines, &mut cursor);
             if let Some((_, types)) = &mut current_param {
                 if let Some(last_type) = types.last_mut() {
-                    if let Some(sub_param) = parse_sub_parameter(trimmed) {
-                        last_type.parameters.push(sub_param);
-                    }
+                    last_type.parameters.extend(fields);
                 }
             }
             continue;
@@ -675,6 +738,11 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
                 parameters.push(ParameterDoc { name, types });
             }
             current_param = Some((param_name, types));
+            continue;
+        }
+
+        if let Some((_, types)) = &mut current_param {
+            append_type_description(types, trimmed);
         }
     }
 
@@ -706,6 +774,7 @@ fn parse_parameter_line(line: &str) -> Option<(String, Vec<TypeDoc>)> {
     let types = if type_part.contains(',') {
         type_part
             .split(',')
+            .filter(|t| !t.trim().is_empty())
             .map(|t| TypeDoc::simple(t.trim().to_string(), description.clone()))
             .collect()
     } else {
@@ -736,12 +805,6 @@ pub fn is_dotted_type_reference(name: &str) -> bool {
     name.contains('.') && is_likely_type_name(name)
 }
 
-fn parse_sub_parameter(line: &str) -> Option<ParameterDoc> {
-    let without_star = line.strip_prefix('*')?.trim();
-    let (name, types) = parse_parameter_line(without_star)?;
-    Some(ParameterDoc { name, types })
-}
-
 fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
     let mut types = Vec::new();
     let mut current_type: Option<TypeDoc> = None;
@@ -757,18 +820,20 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
         break;
     }
 
-    for line in lines {
+    let mut cursor = 0;
+    while let Some(line) = lines.get(cursor) {
         let trimmed = line.trim();
+        cursor += 1;
 
         if trimmed.is_empty() {
             continue;
         }
 
         if trimmed.starts_with('*') {
+            cursor -= 1;
+            let fields = fields::parse_fields(lines, &mut cursor);
             if let Some(ref mut type_doc) = current_type {
-                if let Some(sub_param) = parse_sub_parameter(trimmed) {
-                    type_doc.parameters.push(sub_param);
-                }
+                type_doc.parameters.extend(fields);
             }
             continue;
         }
@@ -795,6 +860,8 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
             if !stripped.is_empty() && is_likely_type_name(stripped) {
                 current_type = Some(TypeDoc::simple(stripped.to_string(), None));
             }
+        } else if let Some(type_doc) = &mut current_type {
+            append_description(&mut type_doc.description, trimmed);
         }
     }
 
@@ -803,6 +870,25 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
     }
 
     types
+}
+
+/// Wrapped source lines extend the last declared alternative instead of disappearing from hover.
+fn append_type_description(types: &mut [TypeDoc], continuation: &str) {
+    if let Some(last) = types.last_mut() {
+        append_description(&mut last.description, continuation);
+    }
+}
+
+fn append_description(description: &mut Option<String>, continuation: &str) {
+    let continuation = continuation.trim().trim_start_matches('-').trim();
+    if continuation.is_empty() {
+        return;
+    }
+    let description = description.get_or_insert_with(String::new);
+    if !description.is_empty() {
+        description.push('\n');
+    }
+    description.push_str(continuation);
 }
 
 fn parse_type_line(line: &str) -> Option<(String, Option<String>)> {
@@ -1012,6 +1098,32 @@ fn parse_simple_section(lines: &[String]) -> Vec<String> {
     lines.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
 }
 
+/// Only the common comment margin is layout; indentation within example code is meaningful.
+fn parse_code_section(lines: &[String]) -> Vec<String> {
+    let Some(first) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let last = lines.iter().rposition(|line| !line.trim().is_empty()).unwrap();
+    let lines = &lines[first..=last];
+    let margin = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| fields::indentation(line))
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                // Expand only the leading tabs, so tab stops remain aligned after dedenting.
+                format!("{}{}", " ".repeat(fields::indentation(line) - margin), line.trim())
+            }
+        })
+        .collect()
+}
+
 fn parse_deprecated_section(keyword_line: &str, following_lines: &[String]) -> Option<String> {
     let after_keyword = ["устарела", "deprecated"]
         .iter()
@@ -1037,6 +1149,29 @@ fn parse_deprecated_section(keyword_line: &str, following_lines: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Presentation uses the same bilingual collection syntax as return-type parsing.
+    #[test]
+    fn collection_labels_keep_element_types_separate_from_prose() {
+        for declaration in [
+            "ФиксированныйМассив из Строка",
+            "Array из Строка",
+            "Соответствие of KeyAndValue",
+            "FixedMap of KeyAndValue",
+            "ТаблицаЗначений из СтрокаТаблицыЗначений",
+        ] {
+            let comments = ["Returns:".to_owned(), format!("{declaration} - values")];
+            let docs = parse_method_docs(&comments).unwrap();
+            assert_eq!(
+                docs.returned_value[0].type_label_and_description(),
+                (declaration.to_owned(), Some("values"))
+            );
+        }
+        let prose = TypeDoc::simple("String".into(), Some("of the object".into()));
+        assert_eq!(prose.type_label_and_description(), ("String".into(), Some("of the object")));
+        let bare = TypeDoc::simple("Array".into(), Some("of String".into()));
+        assert_eq!(bare.type_label_and_description(), ("Array of String".into(), None));
+    }
 
     #[test]
     fn test_method_docs_empty() {
@@ -1486,6 +1621,12 @@ mod tests {
             docs.returned_value
         );
         assert_eq!(docs.returned_value[0].name, "Произвольный");
+        assert_eq!(
+            docs.returned_value[0].description.as_deref(),
+            Some(
+                "если передана пустая ссылка, возвращается Неопределено.\nЕсли передана ссылка несуществующего объекта (битая ссылка),\nто возвращается Неопределено."
+            )
+        );
     }
 
     #[test]
@@ -1574,6 +1715,12 @@ mod tests {
 
         assert_eq!(docs.parameters.len(), 2);
         assert_eq!(docs.parameters[0].name, "ОтборПоИзмерениям");
+        assert_eq!(
+            docs.parameters[0].types[0].description.as_deref(),
+            Some(
+                "Ключ структуры определяет имя измерения,\nа значение структуры - искомое значение."
+            )
+        );
         assert_eq!(docs.parameters[1].name, "ИсключитьЗаказ");
     }
 

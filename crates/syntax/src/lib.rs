@@ -13,9 +13,9 @@ use parser_error::ParseError;
 
 pub use crate::{
     ast_utils::{
-        extract_leading_comments, extract_leading_comments_at_offset,
-        extract_variable_comments_at_offset, has_trailing_comment, has_variable_description,
-        trailing_semicolon,
+        extract_leading_comment_lines_at_offset, extract_leading_comments,
+        extract_leading_comments_at_offset, extract_variable_comments_at_offset,
+        has_trailing_comment, has_variable_description, trailing_semicolon,
     },
     comment_run::{comment_runs, comment_runs_of, CommentLine, CommentRun},
     sdbl_query::{extract_sdbl_with_corrections, SdblQuery, SdblQueryInfo},
