@@ -455,7 +455,7 @@ jobs:
           run_nonempty -p mcp-server graph::state::tests::superseded_late_publish_is_fenced
           run_nonempty -p mcp-server graph::build::tests::superseded_fused_writer_stops_mutating
           run_nonempty -p mcp-server graph::build::tests::superseded_build_is_discarded_after_owner_release
-          run_nonempty -p mcp-server graph::snapshot::tests::superseded_graph_serves_only_preopened_snapshot
+          run_nonempty -p mcp-server graph::state::tests::a_superseded_owner_lets_the_file_go_once_its_reads_finish
           run_nonempty -p mcp-server graph::state::tests::superseded_status_truth_table
           run_nonempty -p mcp-server graph_actions_fail_when_superseded_snapshot_is_gone
       - name: Terminal retry embedding and broker lifecycle
