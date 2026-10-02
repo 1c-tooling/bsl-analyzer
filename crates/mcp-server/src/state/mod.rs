@@ -528,6 +528,11 @@ impl SharedState {
         self.workspace_lease.owns_caches()
     }
 
+    /// Whether this backend has handed the graph over after losing the workspace.
+    pub(crate) fn graph_released(&self) -> bool {
+        self.graph.released()
+    }
+
     /// The unthrottled refresh the graph's owners make per pass ([`crate::graph`] reaches it
     /// through `is_superseded`). A stand about what a COMPLETED refresh leaves behind needs
     /// the check to actually run: the paced entry point above returns the cached verdict for

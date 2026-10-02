@@ -243,6 +243,7 @@ pub async fn serve_http(
     cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     let allowed_hosts = effective_allowed_hosts(address, allowed_hosts);
+    let released = server.clone();
     let config = StreamableHttpServerConfig::default()
         .with_cancellation_token(cancellation.clone())
         .with_allowed_hosts(allowed_hosts.iter().cloned());
@@ -252,6 +253,24 @@ pub async fn serve_http(
         config,
     );
     let health_state = HealthState { profile, address, started_at: Instant::now() };
+    // A superseded server stops listening once its graph reads are done — the address is the
+    // current owner's to serve — and the requests still in flight drain under the usual grace.
+    let release_watch = cancellation.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = release_watch.cancelled() => return,
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+            if released.graph_released() {
+                tracing::info!(
+                    "MCP HTTP server superseded and its graph released; stopping to listen"
+                );
+                release_watch.cancel();
+                return;
+            }
+        }
+    });
 
     let app = Router::new()
         .route_service("/mcp", mcp)

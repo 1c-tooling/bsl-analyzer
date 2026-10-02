@@ -269,7 +269,8 @@ impl SharedState {
     pub(super) fn build_publish_hook(
         search_engine: SharedSearchEngine,
         stop: super::OwnerStop,
-        cache: crate::cache::WorkspaceCacheLayout,
+        graph_store: crate::graph::GraphStore,
+        owed_context_marks: crate::graph::OwedContextMarks,
         semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: Arc<IndexProgress>,
         embed_flight: Arc<EmbedFlight>,
@@ -288,15 +289,16 @@ impl SharedState {
                 Self::refresh_search_roots_after_graph(
                     &search_engine,
                     &stop,
-                    &cache,
+                    &graph_store,
+                    Some(&owed_context_marks),
                     &root_drift_epoch,
                     &lease,
                     &signal,
                 );
-            let topology_handled = Self::refresh_search_contexts_after_graph_with_cache(
+            let topology_handled = Self::refresh_search_contexts_after_graph_with_store(
                 &search_engine,
                 &stop,
-                &cache,
+                &graph_store,
                 &semantic_runtime,
                 &index_progress,
                 &embed_flight,
@@ -334,7 +336,8 @@ impl SharedState {
     fn refresh_search_roots_after_graph(
         engine: &SharedSearchEngine,
         stop: &super::OwnerStop,
-        cache: &crate::cache::WorkspaceCacheLayout,
+        store: &crate::graph::GraphStore,
+        owed: Option<&crate::graph::OwedContextMarks>,
         root_drift_epoch: &AtomicU64,
         lease: &crate::workspace_lease::WorkspaceLease,
         signal: &crate::graph::GraphPublishSignal,
@@ -355,7 +358,8 @@ impl SharedState {
             return (false, false, false);
         };
         let Some(provider) = Self::published_graph_context_provider(
-            cache,
+            store,
+            owed,
             signal.revision,
             signal.fingerprint,
             Some(&roots),
@@ -558,33 +562,50 @@ impl SharedState {
     }
 
     fn published_graph_context_provider(
-        cache: &crate::cache::WorkspaceCacheLayout,
+        store: &crate::graph::GraphStore,
+        owed: Option<&crate::graph::OwedContextMarks>,
         revision: u64,
         expected_fingerprint: crate::graph_db::GraphFp,
         roots: Option<&bsl_search::WorkspaceRoots>,
     ) -> Option<Arc<crate::graph_query::GraphDbContextProvider>> {
-        let graph_path = cache.graph_db_path();
-        let graph_db = match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
-            Ok(db) => db,
+        match Self::read_published_generation(store, revision, expected_fingerprint) {
+            Ok(()) => Some(Arc::new(crate::graph_query::GraphDbContextProvider::new(
+                store.clone(),
+                revision,
+                roots,
+                owed.cloned(),
+            ))),
             Err(error) => {
-                tracing::debug!("graph unavailable for search root transition: {error}");
-                return None;
-            }
-        };
-        match graph_db.freshness_token() {
-            Ok((actual_revision, fingerprint, _))
-                if actual_revision == revision && fingerprint == expected_fingerprint =>
-            {
-                Some(Arc::new(crate::graph_query::GraphDbContextProvider::new(graph_db, roots)))
-            }
-            _ => {
                 tracing::warn!(
                     published_revision = revision,
                     published_topology = expected_fingerprint.topology,
-                    "graph database on disk is not the published generation; skipping root transition"
+                    "published graph generation is not readable ({error}); skipping root transition"
                 );
                 None
             }
+        }
+    }
+
+    /// Whether the store serves exactly the generation a publish signal announced. A graph
+    /// another daemon generation renamed into the shared path meanwhile is not this
+    /// workspace's publication: contexts rendered from it would carry a foreign topology.
+    fn read_published_generation(
+        store: &crate::graph::GraphStore,
+        revision: u64,
+        expected_fingerprint: crate::graph_db::GraphFp,
+    ) -> Result<(), String> {
+        let read = store.read(Some(revision), crate::graph::BACKGROUND_READ_WAIT, |snapshot| {
+            snapshot.graph.freshness_token()
+        });
+        match read {
+            Ok(Ok((actual_revision, fingerprint, _)))
+                if actual_revision == revision && fingerprint == expected_fingerprint =>
+            {
+                Ok(())
+            }
+            Ok(Ok(_)) => Err("the served database is another generation".to_owned()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(error) => Err(error.to_string()),
         }
     }
     /// The outcome of one warmup pass, from what its plan proved. A pass whose scan left
@@ -951,10 +972,15 @@ impl SharedState {
         signal: crate::graph::GraphPublishSignal,
     ) -> bool {
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(workspace_root);
-        Self::refresh_search_contexts_after_graph_with_cache(
+        let Ok(store) =
+            crate::graph::GraphStore::serving_file_for_test(&cache.graph_db_path(), None)
+        else {
+            return false;
+        };
+        Self::refresh_search_contexts_after_graph_with_store(
             engine,
             stop,
-            &cache,
+            &store,
             semantic_runtime,
             index_progress,
             embed_flight,
@@ -970,10 +996,10 @@ impl SharedState {
         clippy::type_complexity,
         reason = "the host passes one retry budget to the existing worker contract; a wrapper would only rename these inputs"
     )]
-    fn refresh_search_contexts_after_graph_with_cache(
+    fn refresh_search_contexts_after_graph_with_store(
         engine: &SharedSearchEngine,
         stop: &super::OwnerStop,
-        cache: &crate::cache::WorkspaceCacheLayout,
+        store: &crate::graph::GraphStore,
         semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: &Arc<IndexProgress>,
         embed_flight: &Arc<EmbedFlight>,
@@ -1003,30 +1029,17 @@ impl SharedState {
             );
             return false;
         }
-        let graph_path = cache.graph_db_path();
-        let graph_db = match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::debug!("graph unavailable for search context refresh: {e}");
-                return false;
-            }
-        };
-        // The file we just opened is not necessarily the build that fired this hook: a
-        // daemon of another generation may have renamed ITS graph into the same path
-        // meanwhile. Contexts rendered from a foreign topology would be persisted as this
-        // workspace's answers, so treat the mismatch like an unavailable graph — the marks
-        // stay dirty and a later publish re-renders them from our own build.
-        match graph_db.freshness_token() {
-            Ok((actual_revision, actual_fingerprint, _))
-                if actual_revision == revision && actual_fingerprint == fingerprint => {}
-            _ => {
-                tracing::warn!(
-                    published_revision = revision,
-                    published_topology = topology,
-                    "graph database on disk is not the published generation; skipping context refresh"
-                );
-                return false;
-            }
+        // The generation served now is not necessarily the build that fired this hook: a
+        // newer publication may have been installed meanwhile. Contexts rendered from another
+        // topology would be persisted as this build's answers, so treat the mismatch like an
+        // unavailable graph — the marks stay dirty and a later publish re-renders them.
+        if let Err(error) = Self::read_published_generation(store, revision, fingerprint) {
+            tracing::warn!(
+                published_revision = revision,
+                published_topology = topology,
+                "published graph generation is not readable ({error}); skipping context refresh"
+            );
+            return false;
         }
         let refreshed = match engine.acquire_for_owner(stop) {
             Ok(guard) => match guard.as_ref() {
@@ -1041,8 +1054,12 @@ impl SharedState {
                         );
                         return false;
                     };
-                    let provider =
-                        crate::graph_query::GraphDbContextProvider::new(graph_db, Some(roots));
+                    let provider = crate::graph_query::GraphDbContextProvider::new(
+                        store.clone(),
+                        revision,
+                        Some(roots),
+                        None,
+                    );
                     let mut apply = |operation: &mut dyn FnMut(
                         &mut dyn FnMut() -> std::ops::ControlFlow<()>,
                     )
@@ -2156,10 +2173,12 @@ mod tests {
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Disabled));
         let progress = bsl_search::IndexProgress::new();
         let flight = super::EmbedFlight::new();
+        let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         let hook = SharedState::build_publish_hook(
             Arc::clone(&engine),
             crate::state::OwnerStop::default(),
-            crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
+            graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&progress),
             Arc::clone(&flight),
@@ -2169,8 +2188,7 @@ mod tests {
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
-        let graph =
-            crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
+        let graph = graph.with_publish_hook(hook);
         graph.ensure_loading();
         wait_for_root_count(&engine, 2);
         let guard = engine.lock().unwrap();
@@ -2215,10 +2233,12 @@ mod tests {
         engine.initialize_workspace_roots(boot_roots).unwrap();
         engine.set_graph_context_provider(Arc::new(BootGraphProvider));
         let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
+        let graph = crate::graph::GraphState::for_workspace_with_cache(workspace.clone(), cache);
         let hook = SharedState::build_publish_hook(
             Arc::clone(&engine),
             crate::state::OwnerStop::default(),
-            cache.clone(),
+            graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Disabled)),
             bsl_search::IndexProgress::new(),
             super::EmbedFlight::new(),
@@ -2228,8 +2248,7 @@ mod tests {
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
-        let graph = crate::graph::GraphState::for_workspace_with_cache(workspace.clone(), cache)
-            .with_publish_hook(hook);
+        let graph = graph.with_publish_hook(hook);
         graph.ensure_loading();
 
         wait_for_root_count(&engine, 2);
@@ -2296,7 +2315,12 @@ mod tests {
         let outcome = SharedState::refresh_search_roots_after_graph(
             &engine,
             &crate::state::OwnerStop::default(),
-            &crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
+            &crate::graph::GraphStore::serving_file_for_test(
+                &crate::cache::graph_db_path(&workspace),
+                None,
+            )
+            .unwrap(),
+            None,
             &AtomicU64::new(0),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &signal,
@@ -2358,7 +2382,12 @@ mod tests {
         let outcome = SharedState::refresh_search_roots_after_graph(
             &engine,
             &crate::state::OwnerStop::default(),
-            &crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
+            &crate::graph::GraphStore::serving_file_for_test(
+                &crate::cache::graph_db_path(&workspace),
+                None,
+            )
+            .unwrap(),
+            None,
             root_drift_epoch.as_ref(),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &signal,
@@ -2809,10 +2838,12 @@ mod tests {
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let index_progress = bsl_search::IndexProgress::new();
         let embed_flight = super::EmbedFlight::new();
+        let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         let hook = SharedState::build_publish_hook(
             Arc::clone(&engine_arc),
             crate::state::OwnerStop::default(),
-            crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
+            graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),
@@ -2822,8 +2853,7 @@ mod tests {
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
-        let graph =
-            crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
+        let graph = graph.with_publish_hook(hook);
 
         // The xml drift marks the owned module context-dirty and nudges the graph; the nudged
         // build publishes and fires the hook automatically.

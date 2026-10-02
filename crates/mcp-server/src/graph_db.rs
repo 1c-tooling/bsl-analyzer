@@ -79,7 +79,9 @@ use crate::graph::input::{build_source_root, db_for_files};
 // identity cannot survive as the current format.
 // 22: the files table records the stat identity each content hash was taken under, so a
 // later process reuses the hash of an unchanged file instead of reading it again.
-pub(crate) const SCHEMA_VERSION: u32 = 22;
+// 23: every publication records a `publication_id`, so the result of a write is established
+// from the database itself; an older database has none and is rebuilt, never stamped.
+pub(crate) const SCHEMA_VERSION: u32 = 23;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -128,6 +130,39 @@ pub struct GraphMeta {
     pub files: usize,
     /// RFC 3339 build timestamp.
     pub built_at: String,
+    /// This publication's identity: the publishing owner's token and its monotonic
+    /// publication number. It differs between two publications even when their fingerprints
+    /// are equal, and a moved database keeps the one it was published with.
+    pub publication_id: String,
+}
+
+/// Full replacements of the graph database written by this process. A point patch writes into
+/// the published file in one transaction and copies nothing, so it never appears here: an audit
+/// sets these figures against the process's disk writes and the size of the database.
+static CANDIDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CANDIDATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`copy_audit`] has counted so far in this process.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CopyAudit {
+    pub(crate) candidates: u64,
+    pub(crate) candidate_bytes: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn copy_audit() -> CopyAudit {
+    use std::sync::atomic::Ordering::SeqCst;
+    CopyAudit { candidates: CANDIDATES.load(SeqCst), candidate_bytes: CANDIDATE_BYTES.load(SeqCst) }
+}
+
+/// Count a full replacement database written for installation. It is new content, not a copy
+/// of the published one.
+pub(crate) fn record_candidate(bytes: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let candidates = CANDIDATES.fetch_add(1, SeqCst) + 1;
+    let total = CANDIDATE_BYTES.fetch_add(bytes, SeqCst) + bytes;
+    tracing::info!(bytes, candidates, total, "full graph replacement written");
 }
 
 /// Read the canonical method-call digest from an existing bounded-build SQLite graph.
@@ -494,8 +529,9 @@ impl GraphDbWriter {
         let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
 
-        let rows: [(&str, String); 8] = [
+        let rows: [(&str, String); 9] = [
             ("schema_version", SCHEMA_VERSION.to_string()),
+            ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
@@ -540,19 +576,78 @@ fn observation_columns(
     ]
 }
 
-/// The content hashes the graph at `db_path` recorded together with the stat identity they
-/// were read under, addressed through the current roots. A row whose file was not read, or
-/// whose stat columns are incomplete, carries nothing to reuse.
+/// The content hash stored for every indexed file, by durable key. Empty when the rows will
+/// not read: the body-only fast path then rebuilds in full.
+pub(crate) fn stored_fingerprints_in(
+    conn: &Connection,
+) -> std::collections::HashMap<bsl_search::FileKey, [u8; 32]> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare("SELECT root_id, path, content_hash FROM files") else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?))
+    }) else {
+        return map;
+    };
+    for row in rows {
+        let Ok((root_id, path, bytes)) = row else { return std::collections::HashMap::new() };
+        let bytes: [u8; 32] = match bytes.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+        map.insert(bsl_search::FileKey::new(root_id, path), bytes);
+    }
+    map
+}
+
+/// Read the stored per-file signature hashes (`None` for `.xml`, and for `.bsl` built
+/// before signature persistence). A query failure yields an empty map → the body-only
+/// fast path treats every module as ineligible (full rebuild). Keep the durable key:
+/// resolving it to a declared path can differ from the canonical path used by the
+/// current scan, especially on Windows.
+pub(crate) fn stored_sig_hashes_in(
+    conn: &Connection,
+) -> std::collections::HashMap<bsl_search::FileKey, Option<u64>> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare("SELECT root_id, path, sig_hash FROM files") else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+            r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+        ))
+    }) else {
+        return map;
+    };
+    map.extend(rows.flatten());
+    map
+}
+
+/// [`read_stored_observations_in`] over a file opened by path, for a test inspecting a
+/// database it built by hand.
+#[cfg(test)]
 pub(crate) fn read_stored_observations(
     db_path: &Path,
     roots: &bsl_search::WorkspaceRoots,
 ) -> Vec<(PathBuf, crate::graph::content_hash::Observation)> {
-    use crate::graph::content_hash::{ChangeIdentity, Observation, StatIdentity};
     let Ok(conn) =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return Vec::new();
     };
+    read_stored_observations_in(&conn, roots)
+}
+
+/// The content hashes the graph recorded together with the stat identity they were read
+/// under, addressed through the current roots. A row whose file was not read, or whose stat
+/// columns are incomplete, carries nothing to reuse.
+pub(crate) fn read_stored_observations_in(
+    conn: &Connection,
+    roots: &bsl_search::WorkspaceRoots,
+) -> Vec<(PathBuf, crate::graph::content_hash::Observation)> {
+    use crate::graph::content_hash::{ChangeIdentity, Observation, StatIdentity};
     let Ok(mut stmt) = conn.prepare(
         "SELECT root_id, path, content_hash, stat_len, stat_mtime_ns, stat_ctime_ns, stat_ino, \
                 stat_dev, stat_observed_ns \
@@ -639,8 +734,10 @@ fn install_changed_file_keys(
     changed_files: &[String],
     roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> anyhow::Result<()> {
+    // A pooled read handle outlives one plan; the table from the last plan on it is dropped.
     conn.execute_batch(
-        "CREATE TEMP TABLE changed_file_keys (
+        "DROP TABLE IF EXISTS temp.changed_file_keys;
+         CREATE TEMP TABLE changed_file_keys (
              root_id TEXT NOT NULL,
              path TEXT NOT NULL,
              PRIMARY KEY (root_id, path)
@@ -1277,7 +1374,7 @@ fn incremental_safety_check(
 /// Insert one node row, overriding only its `id` (for aux-id canonicalisation).
 /// `INSERT OR IGNORE` keeps the first-seen spelling, exactly like the bulk writer.
 fn insert_node_row(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     row: &NodeRow,
     id: &str,
     roots: Option<&bsl_search::WorkspaceRoots>,
@@ -1315,27 +1412,38 @@ fn insert_node_row(
     Ok(())
 }
 
-/// Apply an incremental update: reproject ONLY the modules at `changed_paths` and
-/// patch a COPY of `src_path` written to `out_path`, leaving every unchanged module's
-/// rows in place. `changed_paths` is the FULL reprojection set the caller proved
-/// sufficient — either the edited body-only modules (signature unchanged), or, for a
-/// signature change, the changed modules PLUS their resolved callers (the
-/// caller-delta set). The result is byte-identical to a full rebuild of the edited
-/// tree. This function does not re-validate eligibility — the caller
-/// (`try_incremental_reload`) owns the sig/caller-delta-safety gates.
-///
-/// Concurrency: the patch lands on a copy and the caller atomically renames it into
-/// place — the same model the full build uses, so a live reader keeps its open
-/// snapshot until it reopens and no in-place mutation races a query.
-pub(crate) fn update_graph_database_bodies(
+/// What a point patch has worked out before it writes anything: the reprojected rows of the
+/// modules at `changed_paths`. Computed from the sources and the model without a write
+/// transaction open, so the file is locked for the writing alone.
+pub(crate) struct BodyPatch {
+    rows: ide::ReprojectedRows,
+    changed_modules: Vec<ModuleId>,
+    changed_paths: Vec<PathBuf>,
+    file_paths: FxHashMap<FileId, PathBuf>,
+    unread: BTreeSet<PathBuf>,
+    modules: usize,
+}
+
+impl BodyPatch {
+    /// How many modules the graph holds once the patch is applied.
+    pub(crate) fn modules(&self) -> usize {
+        self.modules
+    }
+}
+
+/// Reproject ONLY the modules at `changed_paths` against the graph database at `src_path`.
+/// `changed_paths` is the FULL reprojection set the caller proved sufficient — either the edited
+/// body-only modules (signature unchanged), or, for a signature change, the changed modules PLUS
+/// their resolved callers (the caller-delta set). Once [`begin_body_patch`] applies it, the
+/// database holds what a full rebuild of the edited tree would. Eligibility is not re-validated
+/// here: the caller (`try_incremental_reload`) owns the sig/caller-delta-safety gates.
+pub(crate) fn compute_body_patch(
     project: &crate::graph::ProjectSnapshot,
     universe: &crate::graph::universe::ScannedUniverse,
     src_path: &Path,
-    out_path: &Path,
     changed_paths: &[PathBuf],
     batch_size: usize,
-    meta: &GraphMeta,
-) -> anyhow::Result<GraphBuildSummary> {
+) -> anyhow::Result<BodyPatch> {
     if !project.validated || project.search_roots.is_none() {
         anyhow::bail!("cannot patch a portable graph without validated workspace roots");
     }
@@ -1390,7 +1498,7 @@ pub(crate) fn update_graph_database_bodies(
     // build, so it gets the same heartbeat + stall watchdog.
     let ticker = Arc::new(GraphBuildTicker::default());
     let _watchdog =
-        spawn_build_watchdog(Arc::clone(&ticker), out_path.parent().map(Path::to_path_buf));
+        spawn_build_watchdog(Arc::clone(&ticker), src_path.parent().map(Path::to_path_buf));
 
     let rows = ide::reproject_changed_modules(
         &all_modules,
@@ -1417,21 +1525,172 @@ pub(crate) fn update_graph_database_bodies(
         incremental_safety_check(&src, &changed_files, &rows, project.search_roots.as_ref())?;
     }
 
-    // Patch a copy, never the published file (a reader keeps its snapshot until the
-    // caller renames `out_path` into place).
-    std::fs::copy(src_path, out_path).with_context(|| {
-        format!("copying graph db {} → {}", src_path.display(), out_path.display())
-    })?;
+    Ok(BodyPatch {
+        rows,
+        changed_modules,
+        changed_paths: changed_paths.to_vec(),
+        file_paths,
+        unread,
+        modules: all_modules.len(),
+    })
+}
 
+/// Why a patch transaction was not written.
+#[derive(Debug)]
+pub(crate) enum PatchError {
+    /// Another process holds the file's write lock past the wait: nothing was written.
+    Busy,
+    /// Applying the SQL outlasted its budget; it was interrupted and rolled back.
+    Budget,
+    Failed(anyhow::Error),
+}
+
+/// How long applying a patch's SQL may take, and how long the write lock is waited for.
+pub(crate) const PATCH_SQL_BUDGET: Duration = Duration::from_secs(5);
+const PATCH_LOCK_WAIT: Duration = Duration::from_millis(250);
+
+/// A patch written to the graph database and not yet committed. Dropping it rolls the
+/// transaction back before the connection closes.
+pub(crate) struct PatchTransaction {
+    conn: Option<Connection>,
+    summary: Option<GraphBuildSummary>,
+}
+
+impl PatchTransaction {
+    /// Make the patch durable. On failure the transaction is rolled back where it can be; the
+    /// caller settles what the file holds by its `publication_id`.
+    pub(crate) fn commit(mut self) -> rusqlite::Result<GraphBuildSummary> {
+        let conn = self.conn.take().expect("a patch transaction commits once");
+        let summary = self.summary.take().expect("a patch transaction holds its summary");
+        match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(summary),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for PatchTransaction {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+/// Write `patch` into the published graph database `db_path` inside one transaction, without
+/// committing it. Nothing else has the file open in this process (the caller holds reads back).
+/// The journal is kept between transactions and truncated to nothing, so a crash leaves a
+/// journal the next open rolls back: the file holds the old publication or the new one, never
+/// a mix. Data, derived counts, unread files, `publication_id`, revision, fingerprints and the
+/// final `force_stale` are all in this transaction; nothing is written after it.
+pub(crate) fn begin_body_patch(
+    db_path: &Path,
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    patch: &BodyPatch,
+    meta: &GraphMeta,
+    force_stale: bool,
+    budget: Duration,
+) -> Result<PatchTransaction, PatchError> {
+    let failed = |error: rusqlite::Error| PatchError::Failed(error.into());
+    let conn = Connection::open(db_path).map_err(failed)?;
+    conn.busy_timeout(PATCH_LOCK_WAIT).map_err(failed)?;
+    // The settings that make a commit durable are read back: a connection that silently kept
+    // another journal mode or `synchronous` would weaken the file it writes into.
+    let mode: String =
+        conn.query_row("PRAGMA journal_mode = PERSIST", [], |r| r.get(0)).map_err(failed)?;
+    conn.execute_batch("PRAGMA journal_size_limit = 0; PRAGMA synchronous = FULL;")
+        .map_err(failed)?;
+    let synchronous: i64 =
+        conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).map_err(failed)?;
+    if !mode.eq_ignore_ascii_case("persist") || synchronous != 2 {
+        return Err(PatchError::Failed(anyhow::anyhow!(
+            "graph database refused durable settings: journal_mode={mode}, synchronous={synchronous}"
+        )));
+    }
+    match conn.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => {}
+        Err(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            return Err(PatchError::Busy);
+        }
+        Err(error) => return Err(failed(error)),
+    }
+    let interrupt = conn.get_interrupt_handle();
+    let transaction = PatchTransaction { conn: Some(conn), summary: None };
+
+    // The budget interrupts the statement in flight; the rollback follows when the
+    // transaction is dropped.
+    let (finished, timeout) = std::sync::mpsc::channel::<()>();
+    let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let expired = Arc::clone(&expired);
+        std::thread::spawn(move || {
+            if timeout.recv_timeout(budget) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                expired.store(true, std::sync::atomic::Ordering::SeqCst);
+                interrupt.interrupt();
+            }
+        })
+    };
+    let conn = transaction.conn.as_ref().expect("the connection is open until commit");
+    let started = std::time::Instant::now();
+    let written = write_body_patch(conn, project, universe, patch, meta, force_stale);
+    drop(finished);
+    let _ = watchdog.join();
+    // Finishing late is an overrun too: the budget bounds how long the file is held.
+    let overran = expired.load(std::sync::atomic::Ordering::SeqCst) || started.elapsed() > budget;
+    match written {
+        Ok(_) | Err(_) if overran => Err(PatchError::Budget),
+        Ok(summary) => {
+            let mut transaction = transaction;
+            transaction.summary = Some(summary);
+            Ok(transaction)
+        }
+        Err(error) => Err(PatchError::Failed(error)),
+    }
+}
+
+/// A patch applied to a COPY of `src_path` written to `out_path`: the shape the equivalence
+/// tests compare against a full rebuild.
+#[cfg(test)]
+pub(crate) fn update_graph_database_bodies(
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    src_path: &Path,
+    out_path: &Path,
+    changed_paths: &[PathBuf],
+    batch_size: usize,
+    meta: &GraphMeta,
+) -> anyhow::Result<GraphBuildSummary> {
+    let patch = compute_body_patch(project, universe, src_path, changed_paths, batch_size)?;
+    std::fs::copy(src_path, out_path)?;
+    let transaction =
+        begin_body_patch(out_path, project, universe, &patch, meta, false, PATCH_SQL_BUDGET)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    Ok(transaction.commit()?)
+}
+
+fn write_body_patch(
+    conn: &Connection,
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    patch: &BodyPatch,
+    meta: &GraphMeta,
+    force_stale: bool,
+) -> anyhow::Result<GraphBuildSummary> {
+    let BodyPatch { rows, changed_modules, changed_paths, file_paths, unread, modules } = patch;
     let stat_by_path: FxHashMap<String, &crate::graph::scan::FileStat> =
         universe.stats.iter().map(|s| (s.path.clone(), s)).collect();
 
-    let mut conn = Connection::open(out_path)?;
     let changed_path_strings: Vec<String> =
         changed_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-    install_changed_file_keys(&conn, &changed_path_strings, project.search_roots.as_ref())?;
+    install_changed_file_keys(conn, &changed_path_strings, project.search_roots.as_ref())?;
     {
-        let tx = conn.transaction().context("begin incremental patch")?;
+        let tx = conn;
 
         // The first-seen object spellings the store already owns (Unicode-lowercased
         // key → actual id), loaded before inserting so new objects keep their casing.
@@ -1471,9 +1730,9 @@ pub(crate) fn update_graph_database_bodies(
             match row.kind {
                 "mdo" | "attribute" => {
                     let id = canonicalize_aux_id(&existing_mdo, &row.id);
-                    insert_node_row(&tx, row, &id, project.search_roots.as_ref())?;
+                    insert_node_row(tx, row, &id, project.search_roots.as_ref())?;
                 }
-                _ => insert_node_row(&tx, row, &row.id, project.search_roots.as_ref())?,
+                _ => insert_node_row(tx, row, &row.id, project.search_roots.as_ref())?,
             }
         }
         // Re-insert the edges, canonicalising aux `to_id`s the same way.
@@ -1536,7 +1795,7 @@ pub(crate) fn update_graph_database_bodies(
         }
 
         // Refresh the changed modules' persisted fingerprint + signature hash.
-        for module in &changed_modules {
+        for module in changed_modules {
             let canonical = file_paths[&module.file_id].to_string_lossy().into_owned();
             let Some(stat) = stat_by_path.get(&canonical).copied() else {
                 anyhow::bail!(
@@ -1597,14 +1856,14 @@ pub(crate) fn update_graph_database_bodies(
                     root_id.zip(key_path).map(|(root, key)| bsl_search::FileKey::new(root, key))
                 })
                 .collect();
-            let mut carried: BTreeSet<bsl_search::FileKey> = read_unread_keys_strict(&tx)?
+            let mut carried: BTreeSet<bsl_search::FileKey> = read_unread_keys_strict(tx)?
                 .into_iter()
                 .filter(|key| !rewritten.contains(key))
                 .collect();
             let unread_keys =
-                unread_keys_from_paths(&unread, project.search_roots.as_ref(), Some(universe))?;
+                unread_keys_from_paths(unread, project.search_roots.as_ref(), Some(universe))?;
             carried.extend(unread_keys.into_iter().filter(|key| rewritten.contains(key)));
-            write_unread_keys(&tx, &carried)?;
+            write_unread_keys(tx, &carried)?;
         }
 
         // Refresh the reverse index of unresolved calls for the reprojected modules:
@@ -1639,15 +1898,16 @@ pub(crate) fn update_graph_database_bodies(
         // never force-stale.
         let node_count: i64 = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edge_count: i64 = tx.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-        let meta_rows: [(&str, String); 8] = [
+        let meta_rows: [(&str, String); 9] = [
+            ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
-            ("files", all_modules.len().to_string()),
+            ("files", modules.to_string()),
             ("built_at", meta.built_at.clone()),
             ("nodes", node_count.to_string()),
             ("edges", edge_count.to_string()),
-            ("force_stale", "0".to_string()),
+            ("force_stale", (if force_stale { "1" } else { "0" }).to_string()),
         ];
         for (key, value) in &meta_rows {
             tx.execute(
@@ -1655,22 +1915,20 @@ pub(crate) fn update_graph_database_bodies(
                 params![key, value],
             )?;
         }
-
-        tx.commit().context("commit incremental patch")?;
     }
 
     let node_rows = rows.nodes.len();
     let edges: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
     Ok(GraphBuildSummary {
-        modules: all_modules.len(),
+        modules: *modules,
         node_rows,
         edges: edges as usize,
-        module_sig_hashes: rows.sig_hashes,
+        module_sig_hashes: rows.sig_hashes.clone(),
         // Variants observed among the changed modules (merged into the persisted set
         // above); pre-existing variants for untouched objects remain in the copied db.
-        casing_variant_objects: rows.casing_variant_objects,
+        casing_variant_objects: rows.casing_variant_objects.clone(),
         // The reprojected modules' unresolved refs were refreshed in the patch above.
-        unresolved_calls: rows.unresolved_calls,
+        unresolved_calls: rows.unresolved_calls.clone(),
     })
 }
 
@@ -1760,15 +2018,39 @@ pub fn recompute_module_profiles(
 ///
 /// `sig_changed` pairs each changed module's normalised `(file_root_id, file_path)` key with its
 /// freshly-recomputed [`ModuleProfile`].
+pub(crate) fn caller_delta_plan_in(
+    conn: &Connection,
+    sig_changed: &[(&str, &ModuleProfile)],
+    roots: Option<&bsl_search::WorkspaceRoots>,
+) -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let plan = plan_caller_delta(conn, sig_changed, roots);
+    // The handle goes back to its pool; the keys of this plan must not ride along.
+    let dropped = conn.execute_batch("DROP TABLE IF EXISTS temp.changed_file_keys;");
+    let plan = plan?;
+    dropped?;
+    Ok(plan)
+}
+
+/// [`caller_delta_plan_in`] over a file opened by path, for a test planning against a
+/// database it built by hand.
+#[cfg(test)]
 pub fn caller_delta_plan(
     db_path: &Path,
     sig_changed: &[(&str, &ModuleProfile)],
     roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> anyhow::Result<Option<Vec<PathBuf>>> {
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    caller_delta_plan_in(&conn, sig_changed, roots)
+}
+
+fn plan_caller_delta(
+    conn: &Connection,
+    sig_changed: &[(&str, &ModuleProfile)],
+    roots: Option<&bsl_search::WorkspaceRoots>,
+) -> anyhow::Result<Option<Vec<PathBuf>>> {
     let changed_file_names: Vec<String> =
         sig_changed.iter().map(|(file, _)| (*file).to_owned()).collect();
-    install_changed_file_keys(&conn, &changed_file_names, roots)?;
+    install_changed_file_keys(conn, &changed_file_names, roots)?;
 
     // What the stored artefact recorded as unreadable. Compared verbatim: both this and
     // the keys of `sig_changed` are the raw canonical spelling of the same scanned
@@ -1776,7 +2058,7 @@ pub fn caller_delta_plan(
     // `files.path`. Normalising either side would break the match on the one platform
     // where the two spellings could differ at all.
     let was_unread: std::collections::HashSet<bsl_search::FileKey> =
-        read_unread_keys_strict(&conn)?.into_iter().collect();
+        read_unread_keys_strict(conn)?.into_iter().collect();
 
     let mut index_callers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (file, profile) in sig_changed {
@@ -2001,6 +2283,7 @@ mod tests {
             fingerprint: GraphFp { files: 42, topology: 7 },
             files: 1,
             built_at: "2026-06-01T00:00:00Z".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2052,6 +2335,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2093,6 +2377,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2133,6 +2418,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2171,6 +2457,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2201,6 +2488,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2211,6 +2499,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
 
@@ -2246,6 +2535,7 @@ mod tests {
             fingerprint: GraphFp { files: 1, topology: 0 },
             files: 1,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         })
         .unwrap();
         open(&path)
@@ -2303,6 +2593,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         }
     }
 
@@ -2444,6 +2735,7 @@ mod tests {
             fingerprint: GraphFp::default(),
             files: 0,
             built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
         };
         let scanned = |root: &Path| {
             let project = crate::graph::ProjectSnapshot::load(root);
@@ -2613,6 +2905,7 @@ mod tests {
                 fingerprint: GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             },
         )
         .unwrap();
@@ -2700,6 +2993,7 @@ mod tests {
                 fingerprint: GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
 
@@ -2761,6 +3055,7 @@ mod tests {
                 fingerprint: GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
 

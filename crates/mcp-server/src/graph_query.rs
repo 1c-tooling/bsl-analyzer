@@ -373,22 +373,10 @@ fn provenance(p: &str) -> &'static str {
     }
 }
 
-// Windows SQLite handles omit FILE_SHARE_DELETE. Keep the canonical publication path
-// free of long-lived readers while sharing one disk copy among all handles in a pool.
-// ponytail: one full copy per pool or provider; use a delete-sharing VFS only if copying is a measured bottleneck.
-#[cfg(windows)]
-pub(crate) fn detached_snapshot(path: &Path) -> anyhow::Result<std::sync::Arc<tempfile::TempPath>> {
-    let copy = tempfile::NamedTempFile::new()?.into_temp_path();
-    std::fs::copy(path, &copy)?;
-    Ok(std::sync::Arc::new(copy))
-}
-
-/// A read-only handle to a built graph database.
-pub struct GraphDb {
+/// A read-only handle to a built graph database. Handles onto the published file are lent
+/// by [`crate::graph::GraphStore`]; nothing else opens that file.
+pub(crate) struct GraphDb {
     conn: Connection,
-    // Close SQLite before the last owner removes its detached Windows file.
-    #[cfg(windows)]
-    _backing: Option<std::sync::Arc<tempfile::TempPath>>,
 }
 
 /// The graph-derived usage summary for a symbol: total inbound edges and the top calling
@@ -406,25 +394,12 @@ impl GraphDb {
     /// schema. A truncated build (e.g. a crash mid-write, which leaves no `meta`
     /// rows because they are written last) or a stale schema version is rejected so
     /// the caller rebuilds rather than serving a partial graph.
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening graph database at {}", path.display()))?;
         let db = Self::from_connection(conn);
         db.validate_meta()?;
         Ok(db)
-    }
-
-    /// Open a reader that may outlive replacement of the canonical graph file.
-    pub(crate) fn open_snapshot(path: &Path) -> anyhow::Result<Self> {
-        #[cfg(windows)]
-        {
-            let backing = detached_snapshot(path)?;
-            let mut db = Self::open(backing.as_ref())?;
-            db._backing = Some(backing);
-            Ok(db)
-        }
-        #[cfg(not(windows))]
-        Self::open(path)
     }
 
     fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -438,9 +413,19 @@ impl GraphDb {
         let version = self
             .meta("schema_version")?
             .context("graph database has no schema_version (incomplete build)")?;
+        match version.parse::<u32>() {
+            Ok(version) if version == SCHEMA_VERSION => {}
+            Ok(version) if version > SCHEMA_VERSION => anyhow::bail!(
+                "graph database schema_version {version} is newer than this program's \
+                 {SCHEMA_VERSION}"
+            ),
+            _ => anyhow::bail!(
+                "graph database schema_version {version} != expected {SCHEMA_VERSION}"
+            ),
+        }
         anyhow::ensure!(
-            version == SCHEMA_VERSION.to_string(),
-            "graph database schema_version {version} != expected {SCHEMA_VERSION}"
+            self.meta("publication_id")?.is_some_and(|id| !id.is_empty()),
+            "graph database has no publication_id"
         );
         // `nodes`/`edges` are the last meta rows finalize writes; their presence
         // means the build ran to completion.
@@ -448,6 +433,13 @@ impl GraphDb {
             self.meta("nodes")?.is_some() && self.meta("edges")?.is_some(),
             "graph database is missing node/edge counts (incomplete build)"
         );
+        Ok(())
+    }
+
+    /// SQLite's own consistency check of the whole file.
+    pub(crate) fn quick_check(&self) -> anyhow::Result<()> {
+        let verdict: String = self.conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        anyhow::ensure!(verdict == "ok", "quick_check: {verdict}");
         Ok(())
     }
 
@@ -474,6 +466,12 @@ impl GraphDb {
         Ok((revision, crate::graph_db::GraphFp { files, topology }, force_stale))
     }
 
+    /// The identity of the publication this database holds.
+    #[cfg(test)]
+    pub(crate) fn publication_id(&self) -> anyhow::Result<String> {
+        self.meta("publication_id")?.context("graph database has no publication_id")
+    }
+
     /// The indexed `.bsl` file count recorded at build time, for status display.
     /// Defaults to 0 when absent (an older build without the row).
     pub fn files(&self) -> anyhow::Result<usize> {
@@ -498,6 +496,40 @@ impl GraphDb {
     /// not an empty set. Only this form may speak for what a publication still owes.
     pub fn unread_keys_strict(&self) -> anyhow::Result<Vec<bsl_search::FileKey>> {
         crate::graph_db::read_unread_keys_strict(&self.conn)
+    }
+
+    /// The content hash stored for every indexed file, by durable key; empty when the rows
+    /// will not read.
+    pub(crate) fn stored_fingerprints(
+        &self,
+    ) -> std::collections::HashMap<bsl_search::FileKey, [u8; 32]> {
+        crate::graph_db::stored_fingerprints_in(&self.conn)
+    }
+
+    /// The signature hash stored for every indexed file, by durable key; empty when the rows
+    /// will not read.
+    pub(crate) fn stored_sig_hashes(
+        &self,
+    ) -> std::collections::HashMap<bsl_search::FileKey, Option<u64>> {
+        crate::graph_db::stored_sig_hashes_in(&self.conn)
+    }
+
+    /// The content hashes recorded with the stat identity they were read under.
+    pub(crate) fn stored_observations(
+        &self,
+        roots: &bsl_search::WorkspaceRoots,
+    ) -> Vec<(std::path::PathBuf, crate::graph::content_hash::Observation)> {
+        crate::graph_db::read_stored_observations_in(&self.conn, roots)
+    }
+
+    /// The callers a signature change must re-project with, or `None` when a point patch
+    /// cannot be proven equal to a full rebuild. See [`crate::graph_db::caller_delta_plan_in`].
+    pub(crate) fn caller_delta_plan(
+        &self,
+        sig_changed: &[(&str, &crate::graph_db::ModuleProfile)],
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> anyhow::Result<Option<Vec<std::path::PathBuf>>> {
+        crate::graph_db::caller_delta_plan_in(&self.conn, sig_changed, roots)
     }
 
     fn count(&self, sql: &str) -> anyhow::Result<usize> {
@@ -1104,11 +1136,7 @@ impl GraphDb {
 
     /// Wrap an open connection.
     fn from_connection(conn: Connection) -> Self {
-        Self {
-            conn,
-            #[cfg(windows)]
-            _backing: None,
-        }
+        Self { conn }
     }
 
     /// Cold-start overview: node/edge tallies, the most-called nodes, and the
@@ -1619,28 +1647,45 @@ impl GraphDb {
     }
 }
 
-/// A [`bsl_search::GraphContextProvider`] backed by the on-disk graph
-/// ([`GraphDb`]). This is the production source for bulk index enrichment: reading a
-/// method's outbound facts from the prebuilt `bsl-graph.db` is RAM-bounded and
-/// shares the graph's freshness, unlike rendering from a whole-workspace `Analysis`.
+/// A [`bsl_search::GraphContextProvider`] backed by the published on-disk graph. This is
+/// the production source for bulk index enrichment: reading a method's outbound facts from
+/// the prebuilt `bsl-graph.db` is RAM-bounded and shares the graph's freshness, unlike
+/// rendering from a whole-workspace `Analysis`.
 ///
-/// `GraphDb` holds a non-`Sync` rusqlite connection; the [`Mutex`] makes the provider
-/// `Sync` for the trait. Calls are sequential at the chunk-text stage, so contention
-/// is nil.
-pub struct GraphDbContextProvider {
-    db: std::sync::Mutex<GraphDb>,
+/// It holds no handle of its own. Every render borrows one from the [`GraphStore`] for the
+/// generation the provider was made for and returns it before the search engine goes on, so
+/// no graph handle is held across embedding, queueing or a write to the search store.
+///
+/// [`GraphStore`]: crate::graph::GraphStore
+pub(crate) struct GraphDbContextProvider {
+    store: crate::graph::GraphStore,
+    generation: u64,
     roots: Option<bsl_search::WorkspaceRoots>,
+    owed: Option<crate::graph::OwedContextMarks>,
 }
 
 impl GraphDbContextProvider {
-    pub fn new(db: GraphDb, roots: Option<&bsl_search::WorkspaceRoots>) -> Self {
-        Self { db: std::sync::Mutex::new(db), roots: roots.cloned() }
+    /// `owed` is where marks for renders this provider failed are reported; without it they
+    /// wait in the search store for the next consumption of leftover marks.
+    pub(crate) fn new(
+        store: crate::graph::GraphStore,
+        generation: u64,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+        owed: Option<crate::graph::OwedContextMarks>,
+    ) -> Self {
+        Self { store, generation, roots: roots.cloned(), owed }
     }
 }
 
 impl bsl_search::GraphContextProvider for GraphDbContextProvider {
     fn graph_context(&self, rel_path: &str, symbol_name: &str, kind: &str) -> Option<String> {
         self.try_graph_context(rel_path, symbol_name, kind).ok().flatten()
+    }
+
+    fn context_marks_owed(&self, mark_high: i64) {
+        if let Some(owed) = &self.owed {
+            owed.record(mark_high);
+        }
     }
 
     fn try_graph_context(
@@ -1655,14 +1700,15 @@ impl bsl_search::GraphContextProvider for GraphDbContextProvider {
         let Some(id) = ide::method_id_for_path(rel_path, symbol_name) else {
             return Ok(None);
         };
-        // A poisoned lock or a graph-DB read error is a transient FAILURE: surface it as
-        // `Err` so the context refresh keeps the dirty mark and retries on the next
-        // publish, rather than clearing the mark against a render that never ran.
-        let db = self
-            .db
-            .lock()
-            .map_err(|e| bsl_search::GraphContextError(format!("graph db lock poisoned: {e}")))?;
-        db.graph_context(&id, self.roots.as_ref())
+        // An unavailable graph, a newer publication or a graph-DB read error is a transient
+        // FAILURE: surface it as `Err` so the context refresh keeps the dirty mark and
+        // retries on the next publish, rather than clearing the mark against a render that
+        // never ran or ran against another publication's roots.
+        self.store
+            .read(Some(self.generation), crate::graph::BACKGROUND_READ_WAIT, |snapshot| {
+                snapshot.graph.graph_context(&id, self.roots.as_ref())
+            })
+            .map_err(|e| bsl_search::GraphContextError(e.to_string()))?
             .map_err(|e| bsl_search::GraphContextError(e.to_string()))
     }
 }
@@ -1759,6 +1805,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
         Connection::open(&path)
@@ -1771,6 +1818,48 @@ mod tests {
 
         // Then: a graph from the prior projection schema is rejected for rebuilding.
         assert!(result.is_err(), "prior projection graphs must be rebuilt");
+    }
+
+    /// A database that cannot say which publication it holds is not stamped with an invented
+    /// identity: it is rebuilt. One of a newer format is refused as newer, not as broken.
+    #[test]
+    fn a_database_without_identity_or_of_a_newer_format_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db");
+        let create = || {
+            let _ = std::fs::remove_file(&path);
+            GraphDbWriter::create(&path)
+                .unwrap()
+                .finalize(&GraphMeta {
+                    revision: 1,
+                    fingerprint: crate::graph_db::GraphFp::default(),
+                    files: 0,
+                    built_at: "t".to_string(),
+                    publication_id: "test-1".to_owned(),
+                })
+                .unwrap();
+        };
+
+        create();
+        assert_eq!(GraphDb::open(&path).unwrap().publication_id().unwrap(), "test-1");
+
+        Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM meta WHERE key = 'publication_id'", [])
+            .unwrap();
+        let missing = GraphDb::open(&path).err().expect("no identity, no service").to_string();
+        assert!(missing.contains("publication_id"), "{missing}");
+
+        create();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                params![(crate::graph_db::SCHEMA_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        let newer = GraphDb::open(&path).err().expect("a newer format is refused").to_string();
+        assert!(newer.contains("newer"), "{newer}");
     }
 
     /// A subsystem's `<Content>` puts a common module into the graph as an `mdo`
@@ -1860,6 +1949,7 @@ mod tests {
                 fingerprint: crate::graph_db::GraphFp::default(),
                 files: 0,
                 built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
             })
             .unwrap();
 

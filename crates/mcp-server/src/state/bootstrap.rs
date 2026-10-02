@@ -778,10 +778,14 @@ impl SharedState {
         // validation→apply window without making an unrelated watched file reject the plan.
         let embed_flight = EmbedFlight::new();
         let root_drift_epoch = Arc::new(AtomicU64::new(0));
+        // The hub first: the provider this hook installs reports owed marks through it.
+        let graph = GraphState::for_workspace_with_cache(source_dir.clone(), cache.clone())
+            .with_change_hub(change_hub.clone());
         let publish_hook = Self::build_publish_hook(
             Arc::clone(&search_engine),
             owners.clone(),
-            cache.clone(),
+            graph.store().clone(),
+            graph.owed_context_marks(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),
@@ -791,8 +795,7 @@ impl SharedState {
             workspace_lease.clone(),
             embedding_publish_retry_budget,
         );
-        let graph = GraphState::for_workspace_with_cache(source_dir.clone(), cache.clone())
-            .with_change_hub(change_hub.clone())
+        let graph = graph
             .with_publish_hook(publish_hook)
             .with_lease(workspace_lease.clone())
             .with_owner_stop(owners.clone());
@@ -2139,30 +2142,34 @@ impl SharedState {
         // already built; if absent (still building) the embeddings are graph-free this
         // run and pick up context on a later reindex.
         if engine.has_semantic() {
-            let graph_path = cache.graph_db_path();
             // Load the project snapshot once and keep its roots paired with the graph
             // validation below. Loading topology and roots separately leaves a window in
             // which a config/root move can make the provider read a different generation
             // from the one that passed the check.
             let graph_project =
                 crate::graph::ProjectSnapshot::load_excluding(workspace_root, &excluded);
-            match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
-                Ok(graph_db)
-                    if !crate::graph::scan::graph_matches_live_project_strict(
-                        &graph_db,
+            let current =
+                graph.store().read(None, crate::graph::BACKGROUND_READ_WAIT, |snapshot| {
+                    crate::graph::scan::graph_matches_live_project_strict(
+                        &snapshot.graph,
                         &graph_project,
-                    ) =>
-                {
+                    )
+                    .then(|| snapshot.generation())
+                });
+            match current {
+                Ok(None) => {
                     tracing::warn!(
                         "graph database is not current for the live project; \
                          embeddings without graph context"
                     );
                 }
-                Ok(graph_db) => {
+                Ok(Some(generation)) => {
                     engine.set_graph_context_provider(Arc::new(
                         crate::graph_query::GraphDbContextProvider::new(
-                            graph_db,
+                            graph.store().clone(),
+                            generation,
                             graph_project.search_roots.as_ref(),
+                            Some(graph.owed_context_marks()),
                         ),
                     ));
                     tracing::info!("graph-enriched embeddings enabled");
@@ -5065,7 +5072,7 @@ mod tests {
         assert!(eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Unobserved)));
         assert!(eventually(&|| {
             let report = state.graph().status_report();
-            report.drift_watch == Some("unobserved") && report.stale == Some(true)
+            report.drift_watch == Some("unobserved") && report.stale != Some(false)
         }));
     }
 
@@ -5131,7 +5138,14 @@ mod tests {
         wait_until_graph_ready(state.graph());
         assert!(eventually(&|| state.graph().status_report().drift_watch == Some("watching")));
         let hub = state.change_hub().expect("a workspace boot owns a hub").clone();
-        let revision = state.graph().status_report().revision;
+        // The report leaves the revision out while a background read holds the graph's lock
+        // or every handle, so the sample is waited for rather than taken once.
+        let sampled = std::cell::Cell::new(None);
+        assert!(eventually(&|| {
+            sampled.set(state.graph().status_report().revision);
+            sampled.get().is_some()
+        }));
+        let revision = sampled.get();
         let cursors = hub.active_cursor_count();
 
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
@@ -5174,7 +5188,14 @@ mod tests {
                 "an edit was applied"
             );
         }
-        assert_eq!(state.graph().status_report().revision, revision, "the graph was rebuilt");
+        assert!(
+            eventually(&|| state.graph().released()),
+            "the superseded graph kept the file from the owner"
+        );
+        let report = state.graph().status_report();
+        assert_eq!((report.state, report.superseded), ("failed", Some(true)), "it serves nothing");
+        let on_disk = crate::graph::test_support::meta_string(&cache.graph_db_path(), "revision");
+        assert_eq!(Some(on_disk.parse::<u64>().unwrap()), revision, "the graph was rebuilt");
         state.shutdown();
     }
 

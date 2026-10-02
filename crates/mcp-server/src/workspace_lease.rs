@@ -9,18 +9,16 @@
 //! contexts: convergent, but wasteful, and each publish flickers the generation the other's
 //! clients see.
 //!
-//! The lease makes that ownership explicit and single. Every daemon claims it at startup under
-//! a file lock, taking a generation one above whatever it found, so the newest process owns the
-//! workspace and the ones it superseded stop writing derived caches — the right way round,
-//! since a client whose config or binary just changed is served by the newest daemon while the
-//! older ones drain. Ownership by claim order is enough: a daemon that outlives a config edit
-//! rebuilds against the live configuration like any other, so the generations do not disagree
-//! about what the workspace *is*, only about who writes it down.
+//! The lease makes that ownership explicit and single. A daemon claims it at startup under a
+//! file lock when the directory is free, its owner stopped reporting, or its owner is an older
+//! program: a newer version takes the workspace over, and the one it superseded stops writing
+//! derived caches. A live owner of the same version, or of a version this program cannot
+//! compare, keeps the workspace; the second daemon does not open the graph and says which
+//! process holds the directory, until that owner stops reporting.
 //!
-//! Losing the lease is not a failure. A superseded daemon keeps serving everything it already
-//! holds — its resident host, its published graph snapshot, its search index — and simply
-//! stops producing new derived state. Once its last session leaves it exits immediately
-//! instead of idling out, because a warm backend that may not write is worth little.
+//! A superseded daemon finishes the graph reads in flight, lets the graph file go, frees its
+//! endpoint and exits, whether or not clients are still connected: they get `owner_changed`
+//! and open a new session.
 //!
 //! What the lease deliberately does NOT gate is the search index's lexical side: chunks and
 //! FTS text. Both generations derive those from the same files, SQLite serializes the writes
@@ -88,6 +86,10 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// ownership check retries the claim.
 const UNCLAIMED: u64 = 0;
 
+/// The version a record names its owner by. Two live processes of one version do not take a
+/// workspace from each other; a newer version takes it from an older one.
+const PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug)]
 pub(crate) enum LeaseOperationError<E> {
     Lease(io::Error),
@@ -120,6 +122,49 @@ struct LeaseRecord {
     pid: u32,
     /// Unix seconds of the owner's last heartbeat.
     heartbeat_secs: u64,
+    /// The owner's program version. Absent in a record of a program that did not write it,
+    /// which proves nothing about who is newer.
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// What an ownership check of this lease found, as the graph needs to tell it apart: a lost
+/// workspace is left for good, while a check that could not answer only holds new work back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnershipCheck {
+    Owned,
+    /// The check could not answer: the record would not read or the claim could not be made.
+    Unknown,
+    /// Superseded by another owner, or released by this process. Never followed by `Owned`.
+    Lost,
+}
+
+type OwnershipObserver = Arc<dyn Fn(OwnershipCheck) + Send + Sync>;
+
+/// The live owner a claim found and would not take the workspace from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BusyOwner {
+    pub(crate) pid: u32,
+    pub(crate) version: Option<String>,
+}
+
+/// Whether a claim may take the workspace from the record found under the lock: a free
+/// workspace (no record, or an owner that stopped reporting), a successor within this same
+/// process, or an owner of an older program version. A live owner of the same version — or of
+/// a version this program cannot compare — keeps the workspace.
+fn claimable(found: Option<&LeaseRecord>) -> bool {
+    let Some(record) = found else { return true };
+    if is_stale(record) || record.pid == std::process::id() {
+        return true;
+    }
+    match (record.version.as_deref().and_then(parse_version), parse_version(PROGRAM_VERSION)) {
+        (Some(theirs), Some(ours)) => theirs < ours,
+        _ => false,
+    }
+}
+
+fn parse_version(version: &str) -> Option<Vec<u64>> {
+    version.split('.').map(|part| part.parse().ok()).collect()
 }
 
 /// An identity for one claim: a 64-bit digest of this process's id, the instant of the claim,
@@ -127,7 +172,7 @@ struct LeaseRecord {
 /// Distinctness is probabilistic in the digest, which at a handful of claims per workspace is a
 /// collision chance no one will meet; what it must not be is DERIVABLE, as the generation is,
 /// since that is what let two daemons read one record as both of theirs.
-fn new_token() -> u64 {
+pub(crate) fn new_token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos =
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0) as u64;
@@ -175,6 +220,17 @@ struct Inner {
     /// read — seconds of it, by design — and a reader that had to take that lock would queue
     /// behind I/O it is forbidden to do itself.
     established: AtomicBool,
+    /// The live owner the last refused claim found; `None` once a claim succeeds.
+    busy: Mutex<Option<BusyOwner>>,
+    /// Told whenever an ownership check finds something other than what the last one found.
+    /// Called with lease locks held: an observer records and wakes, it never waits.
+    observers: Mutex<Vec<OwnershipObserver>>,
+    /// What the last reported check found; `None` before the first.
+    last_check: Mutex<Option<OwnershipCheck>>,
+    /// Set on the lease handed out when a managed claim could not be made at all. Such a lease
+    /// lets the search index work as before, but the graph is not opened over it: two
+    /// processes that could not coordinate must not both hold the graph file.
+    coordination_failed: bool,
     /// Every lease read or claim that went to disk, by the thread that made it.
     ///
     /// Threads rather than a count, and that is the whole point: "the answer came back quickly"
@@ -272,9 +328,13 @@ impl WorkspaceLease {
                     error = %e,
                     root = %cache.root().display(),
                     "could not claim the workspace cache lease; this daemon will not coordinate \
-                     with another generation over the same caches"
+                     with another generation over the same caches, and will not open the graph"
                 );
-                Self::unmanaged()
+                let mut lease = Self::unmanaged();
+                Arc::get_mut(&mut lease.inner)
+                    .expect("a lease just built has one holder")
+                    .coordination_failed = true;
+                lease
             }
         }
     }
@@ -293,6 +353,10 @@ impl WorkspaceLease {
                 checked_at: Mutex::new(None),
                 established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
+                busy: Mutex::new(None),
+                observers: Mutex::new(Vec::new()),
+                last_check: Mutex::new(None),
+                coordination_failed: false,
                 #[cfg(test)]
                 disk_check_threads: Mutex::new(Vec::new()),
                 #[cfg(test)]
@@ -325,6 +389,10 @@ impl WorkspaceLease {
             checked_at: Mutex::new(None),
             established: AtomicBool::new(false),
             stamped_at: Mutex::new(None),
+            busy: Mutex::new(None),
+            observers: Mutex::new(Vec::new()),
+            last_check: Mutex::new(None),
+            coordination_failed: false,
             #[cfg(test)]
             disk_check_threads: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -339,12 +407,21 @@ impl WorkspaceLease {
             fail_checkpoint_lock_countdown: std::sync::atomic::AtomicU64::new(0),
         });
         let lease = Self { inner };
-        // A starting daemon outbids whatever it finds — newest wins is the whole rule.
-        if !lease.take_generation(|_| true) {
-            tracing::warn!(
-                root = %cache.root().display(),
-                "workspace cache lease is locked by a peer; retrying on the next check"
-            );
+        if !lease.take_generation(claimable) {
+            match lock_recover(&lease.inner.busy).clone() {
+                Some(owner) => tracing::warn!(
+                    cache_dir = %cache.root().display(),
+                    owner_pid = owner.pid,
+                    owner_version = owner.version.as_deref().unwrap_or("unknown"),
+                    "the graph is busy: another live process owns this cache directory and this \
+                     version does not take it over (same, newer or unknown version); give this \
+                     process a separate --cache-dir, or stop sharing the directory"
+                ),
+                None => tracing::warn!(
+                    root = %cache.root().display(),
+                    "workspace cache lease is locked by a peer; retrying on the next check"
+                ),
+            }
         }
         spawn_heartbeat(Arc::downgrade(&lease.inner));
         Ok(lease)
@@ -398,10 +475,29 @@ impl WorkspaceLease {
         if self.inner.released.load(Ordering::SeqCst) {
             return false;
         }
-        let found = read_record(path);
+        let found = match read_record_result(path) {
+            Ok(found) => found,
+            // A record that will not read says nothing about whether its owner lives. Only one
+            // nobody has rewritten for longer than a live owner's heartbeat allows is taken.
+            Err(_) if written_before_stale(path) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "the workspace lease record will not read; not taking the workspace from \
+                     an owner that may be alive"
+                );
+                *lock_recover(&self.inner.busy) = None;
+                return false;
+            }
+        };
         if !claimable(found.as_ref()) {
+            *lock_recover(&self.inner.busy) = found
+                .filter(|record| !is_stale(record))
+                .map(|record| BusyOwner { pid: record.pid, version: record.version });
             return false;
         }
+        *lock_recover(&self.inner.busy) = None;
         let generation = found.map(|r| r.generation).unwrap_or(0) + 1;
         let token = new_token();
         if write_record(path, generation, token).is_err() {
@@ -446,7 +542,7 @@ impl WorkspaceLease {
         // daemon permanently outside the coordination — which, since an unclaimed lease never
         // owns anything, would otherwise mean it never maintains the caches at all.
         if self.inner.generation.load(Ordering::SeqCst) == UNCLAIMED {
-            return self.take_generation_locked(&mut checked_at, |_| true);
+            return self.take_generation_locked(&mut checked_at, claimable);
         }
         self.settle(self.recheck_locked(path, &mut checked_at))
     }
@@ -494,6 +590,47 @@ impl WorkspaceLease {
     fn establish(&self, owns: bool) {
         self.inner.owns.store(owns, Ordering::SeqCst);
         self.inner.established.store(true, Ordering::SeqCst);
+        self.report(if self.terminal_outcome::<(), ()>().is_some() {
+            OwnershipCheck::Lost
+        } else if owns {
+            OwnershipCheck::Owned
+        } else {
+            OwnershipCheck::Unknown
+        });
+    }
+
+    /// Watch this lease's ownership checks. An observer added after the workspace was lost
+    /// hears so at once.
+    ///
+    /// A new observer is told the last check's finding at once, under the same lock the next
+    /// report takes: nothing reported before it joined is lost, and nothing reported after it
+    /// joined reaches it out of order.
+    pub(crate) fn observe(&self, observer: OwnershipObserver) {
+        let last = lock_recover(&self.inner.last_check);
+        let found = if self.terminal_outcome::<(), ()>().is_some() {
+            Some(OwnershipCheck::Lost)
+        } else {
+            *last
+        };
+        lock_recover(&self.inner.observers).push(Arc::clone(&observer));
+        if let Some(found) = found {
+            observer(found);
+        }
+        drop(last);
+    }
+
+    /// Tell the observers what a check found, when it differs from the last finding. Delivered
+    /// with the finding's lock held, so two checks finishing together cannot reach an observer
+    /// in the opposite order from the one they were recorded in.
+    fn report(&self, check: OwnershipCheck) {
+        let mut last = lock_recover(&self.inner.last_check);
+        if *last == Some(check) || *last == Some(OwnershipCheck::Lost) {
+            return;
+        }
+        *last = Some(check);
+        for observer in lock_recover(&self.inner.observers).iter() {
+            observer(check);
+        }
     }
 
     /// Last process-local ownership verdict, without lock-file or lease-record I/O.
@@ -528,7 +665,7 @@ impl WorkspaceLease {
         }
         *checked_at = Some(Instant::now());
         if self.inner.generation.load(Ordering::SeqCst) == UNCLAIMED {
-            return self.take_generation_locked(&mut checked_at, |_| true);
+            return self.take_generation_locked(&mut checked_at, claimable);
         }
         self.settle(self.recheck_locked(path, &mut checked_at))
     }
@@ -541,7 +678,10 @@ impl WorkspaceLease {
                 self.establish(owns);
                 owns
             }
-            None => false,
+            None => {
+                self.report(OwnershipCheck::Unknown);
+                false
+            }
         }
     }
 
@@ -757,6 +897,21 @@ impl WorkspaceLease {
         Ok(())
     }
 
+    /// The live owner that kept this lease from claiming the workspace, while it does.
+    pub(crate) fn busy_owner(&self) -> Option<BusyOwner> {
+        lock_recover(&self.inner.busy).clone()
+    }
+
+    /// Whether this lease coordinates through a directory at all.
+    pub(crate) fn is_managed(&self) -> bool {
+        self.inner.path.is_some()
+    }
+
+    /// Whether this lease stands in for a managed claim that could not be made.
+    pub(crate) fn coordination_failed(&self) -> bool {
+        self.inner.coordination_failed
+    }
+
     pub(crate) fn is_superseded(&self) -> bool {
         self.inner.superseded.load(Ordering::SeqCst)
     }
@@ -812,6 +967,7 @@ impl WorkspaceLease {
     /// that took the workspace over in the meantime keeps it.
     pub(crate) fn release(&self) {
         self.inner.released.store(true, Ordering::SeqCst);
+        self.report(OwnershipCheck::Lost);
         let mut checked_at = lock_recover(&self.inner.checked_at);
         // Handing the workspace back IS a verdict, and one a status answer must be able to
         // publish at once: this daemon owns nothing from here on.
@@ -892,6 +1048,7 @@ impl WorkspaceLease {
             return;
         }
         if !self.inner.superseded.swap(true, Ordering::SeqCst) {
+            self.report(OwnershipCheck::Lost);
             tracing::info!(
                 mine = self.inner.generation.load(Ordering::SeqCst),
                 owner = owner.generation,
@@ -983,8 +1140,13 @@ fn read_record(path: &Path) -> Option<LeaseRecord> {
 /// Replace the record atomically: a reader takes no lock, so it must never observe a
 /// half-written file. The temp name carries the pid so two writers cannot share one.
 fn write_record(path: &Path, generation: u64, token: u64) -> io::Result<()> {
-    let record =
-        LeaseRecord { generation, token, pid: std::process::id(), heartbeat_secs: now_secs() };
+    let record = LeaseRecord {
+        generation,
+        token,
+        pid: std::process::id(),
+        heartbeat_secs: now_secs(),
+        version: Some(PROGRAM_VERSION.to_owned()),
+    };
     let body = serde_json::to_string(&record)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
@@ -998,6 +1160,16 @@ fn write_record(path: &Path, generation: u64, token: u64) -> io::Result<()> {
     }
 }
 
+/// Whether the record file at `path` was last written longer ago than a live owner's heartbeat
+/// allows — the only staleness a record that will not parse can still show.
+fn written_before_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > STALE_AFTER)
+}
+
 fn is_stale(record: &LeaseRecord) -> bool {
     now_secs().saturating_sub(record.heartbeat_secs) > STALE_AFTER.as_secs()
 }
@@ -1008,6 +1180,23 @@ fn now_secs() -> u64 {
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An exclusive cross-process lock on a file, held until dropped — and released by the OS when
+/// a crashed holder's handle closes, so no file or recorded pid has to be cleaned up after it.
+pub(crate) struct ExclusiveFileLock {
+    _guard: LockGuard,
+}
+
+impl ExclusiveFileLock {
+    /// The lock, or `None` while another holder has it.
+    pub(crate) fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        match LockGuard::try_acquire(path) {
+            Ok(guard) => Ok(Some(Self { _guard: guard })),
+            Err(error) if is_lock_contention(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// An advisory cross-process lock held for the duration of a claim, released when dropped
@@ -1312,6 +1501,10 @@ mod tests {
                 checked_at: Mutex::new(None),
                 established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
+                busy: Mutex::new(None),
+                observers: Mutex::new(Vec::new()),
+                last_check: Mutex::new(None),
+                coordination_failed: false,
                 #[cfg(test)]
                 disk_check_threads: Mutex::new(Vec::new()),
                 fail_managed_lock: AtomicBool::new(false),
@@ -1431,6 +1624,7 @@ mod tests {
             token: new_token(),
             pid: 424242,
             heartbeat_secs: now_secs(),
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(lease_path(dir.path()), serde_json::to_string(&foreign).unwrap()).unwrap();
         let mut prepared = ();
@@ -1558,6 +1752,7 @@ mod tests {
             token: lease.inner.token.load(Ordering::SeqCst),
             pid: std::process::id(),
             heartbeat_secs: now_secs() - STALE_AFTER.as_secs() - 1,
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(lease_path(dir.path()), serde_json::to_string(&stale_mine).unwrap())
             .unwrap();
@@ -1607,6 +1802,7 @@ mod tests {
             token: new_token(),
             pid: 424242,
             heartbeat_secs: now_secs(),
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(lease_path(dir.path()), serde_json::to_string(&newer).unwrap()).unwrap();
 
@@ -1645,6 +1841,10 @@ mod tests {
                 checked_at: Mutex::new(None),
                 established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
+                busy: Mutex::new(None),
+                observers: Mutex::new(Vec::new()),
+                last_check: Mutex::new(None),
+                coordination_failed: false,
                 #[cfg(test)]
                 disk_check_threads: Mutex::new(Vec::new()),
                 fail_managed_lock: AtomicBool::new(false),
@@ -1667,6 +1867,7 @@ mod tests {
             token: new_token(),
             pid: 424242,
             heartbeat_secs: now_secs(),
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(lease_path(foreign_dir.path()), serde_json::to_string(&newer).unwrap())
             .unwrap();
@@ -1689,6 +1890,7 @@ mod tests {
             token: lease.inner.token.load(Ordering::SeqCst),
             pid: std::process::id(),
             heartbeat_secs: 0,
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
 
@@ -2051,6 +2253,7 @@ mod tests {
             token: new_token(),
             pid: 424242,
             heartbeat_secs: now_secs(),
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(&path, serde_json::to_string(&newer).unwrap()).unwrap();
 
@@ -2086,6 +2289,7 @@ mod tests {
             token: new_token(),
             pid: 424242,
             heartbeat_secs: now_secs() - STALE_AFTER.as_secs() - 1,
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(&path, serde_json::to_string(&ghost).unwrap()).unwrap();
 
@@ -2097,7 +2301,14 @@ mod tests {
         let corrupt_dir = tempfile::tempdir().unwrap();
         let corrupt = WorkspaceLease::claim(corrupt_dir.path());
         std::fs::write(lease_path(corrupt_dir.path()), "not a lease record").unwrap();
-        assert!(corrupt.owns_caches_now(), "a corrupt record remains recoverable");
+        assert!(!corrupt.owns_caches_now(), "a corrupt record may still belong to a live owner");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(lease_path(corrupt_dir.path()))
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_AFTER - Duration::from_secs(5))
+            .unwrap();
+        assert!(corrupt.owns_caches_now(), "a corrupt record remains recoverable once stale");
         assert!(!corrupt.is_superseded());
 
         let brief_dir = tempfile::tempdir().unwrap();
@@ -2120,6 +2331,7 @@ mod tests {
             token: new_token(),
             pid: 424242,
             heartbeat_secs: now_secs(),
+            version: Some(PROGRAM_VERSION.to_owned()),
         };
         std::fs::write(&path, serde_json::to_string(&owner).unwrap()).unwrap();
 
@@ -2170,5 +2382,150 @@ mod tests {
         // And the loser's writes are refused at the fence, not merely by its cached verdict.
         let loser = if older_owns { &newer } else { &older };
         assert!(matches!(publish_test(loser, || "published"), LeaseOperationOutcome::Superseded));
+    }
+    /// The graph access lock is the operating system's, not a file's or a pid's: another
+    /// process holding it keeps this one out, and that process dying — no clean exit, no
+    /// cleanup — hands it over.
+    #[test]
+    fn the_access_lock_of_a_crashed_process_is_free_without_cleanup() {
+        const CHILD: &str = "BSL_ACCESS_LOCK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let _held = ExclusiveFileLock::try_acquire(Path::new(&path))
+                .unwrap()
+                .expect("the child takes a free lock");
+            println!("held");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.access.lock");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_lease::tests::the_access_lock_of_a_crashed_process_is_free_without_cleanup",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(CHILD, &path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("held") {
+            line.clear();
+            assert_ne!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap(), 0);
+        }
+        assert!(ExclusiveFileLock::try_acquire(&path).unwrap().is_none(), "held by the child");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(path.exists(), "nothing cleaned the file up");
+        assert!(ExclusiveFileLock::try_acquire(&path).unwrap().is_some(), "free after the crash");
+    }
+
+    /// A record that will not read is not a free workspace: it is taken only once nobody has
+    /// rewritten it for longer than a live owner's heartbeat allows.
+    #[test]
+    fn an_unreadable_record_is_taken_only_once_it_has_gone_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        cache.ensure().unwrap();
+        std::fs::write(cache.lease_path(), b"{ not a record").unwrap();
+
+        let lease = WorkspaceLease::claim(dir.path());
+        assert!(!lease.owns_caches_now(), "an owner that may be alive keeps the workspace");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cache.lease_path())
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_AFTER - Duration::from_secs(5))
+            .unwrap();
+        assert!(lease.owns_caches_now(), "a record nobody has kept up is taken");
+    }
+
+    /// An observer that joins after a check could not answer hears so at once, instead of
+    /// waiting for a finding that differs from one it never received.
+    #[test]
+    fn a_late_observer_hears_the_last_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = WorkspaceLease::claim(dir.path());
+        let held = lease.hold_file_lock_for_test();
+        std::fs::remove_file(lease_path(dir.path())).unwrap();
+        assert!(!lease.owns_caches_now());
+        drop(held);
+
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        lease.observe(Arc::new(move |check| lock_recover(&sink).push(check)));
+        assert_eq!(*lock_recover(&heard), vec![OwnershipCheck::Unknown]);
+        lease.release();
+        assert_eq!(*lock_recover(&heard), vec![OwnershipCheck::Unknown, OwnershipCheck::Lost]);
+    }
+
+    fn foreign_owner(root: &Path, version: Option<&str>, heartbeat_secs: u64) -> LeaseRecord {
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let record = LeaseRecord {
+            generation: 3,
+            token: new_token(),
+            pid: 424242,
+            heartbeat_secs,
+            version: version.map(str::to_owned),
+        };
+        std::fs::write(lease_path(root), serde_json::to_string(&record).unwrap()).unwrap();
+        record
+    }
+
+    /// A second live process of the same version does not take the workspace, whatever its
+    /// key: the first keeps serving, and the second says who holds the directory.
+    #[test]
+    fn a_live_owner_of_the_same_version_keeps_the_workspace_until_it_stops_reporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = foreign_owner(dir.path(), Some(PROGRAM_VERSION), now_secs());
+
+        let second = WorkspaceLease::claim(dir.path());
+        assert!(!second.owns_caches_now());
+        assert!(!second.is_superseded(), "refused, not superseded: it never owned anything");
+        assert_eq!(
+            second.busy_owner(),
+            Some(BusyOwner { pid: 424242, version: Some(PROGRAM_VERSION.to_owned()) })
+        );
+        assert_eq!(record_at(&lease_path(dir.path())).token, owner.token, "the record stands");
+
+        foreign_owner(dir.path(), Some(PROGRAM_VERSION), 0);
+        assert!(second.owns_caches_now(), "a directory its owner left is taken without cleanup");
+        assert_eq!(second.busy_owner(), None);
+    }
+
+    /// Only a newer program takes a live owner's workspace; a version this program cannot
+    /// compare is not permission.
+    #[test]
+    fn only_an_older_live_owner_is_outbid() {
+        for (theirs, taken) in
+            [(Some("0.0.1"), true), (Some("999.0.0"), false), (Some("dev"), false), (None, false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            foreign_owner(dir.path(), theirs, now_secs());
+            let lease = WorkspaceLease::claim(dir.path());
+            assert_eq!(lease.owns_caches_now(), taken, "owner version {theirs:?}");
+            assert_eq!(lease.busy_owner().is_some(), !taken, "owner version {theirs:?}");
+        }
+    }
+
+    /// A lease handed out because no managed claim could be made at all says so.
+    #[test]
+    fn a_claim_that_cannot_be_made_is_marked_as_uncoordinated() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::from_root(blocker.join("cache"));
+        let lease = WorkspaceLease::claim_cache(&cache);
+        assert!(lease.coordination_failed());
+        assert!(!WorkspaceLease::unmanaged().coordination_failed());
     }
 }

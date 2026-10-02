@@ -324,12 +324,20 @@ impl WorkspaceRootsTransitionSeed {
                 unread_files.push(PlannedUnreadWorkspaceFile { key, identity });
                 continue;
             };
-            let documents = crate::document::prepare_indexed_documents(
+            let (documents, context_failed) = crate::document::prepare_indexed_documents(
                 &key,
                 content,
                 self.graph_context_provider.as_deref(),
                 self.embedder.as_ref(),
             )?;
+            // A transition applied without some contexts would publish files that no mark
+            // owes a render; the plan fails instead and its owner retries the transition.
+            if context_failed {
+                return Err(SearchError::Index(format!(
+                    "graph context unavailable for {}; root transition deferred",
+                    key.path
+                )));
+            }
             let (chunks, graph_contexts, source_spans) =
                 crate::document::chunks_contexts_and_spans(&documents);
             let embedding_inputs =
@@ -1292,7 +1300,7 @@ impl SearchEngine {
             let (_, reason) = self.observed_file_hash(key, hash.as_bytes())?;
             if reason == Reason::Unchanged { continue; }
 
-            let documents = crate::document::prepare_indexed_documents(
+            let (documents, context_owed) = crate::document::prepare_indexed_documents(
                 key,
                 &content,
                 self.graph_context_provider.as_deref(),
@@ -1317,6 +1325,7 @@ impl SearchEngine {
                 texts,
                 ranges,
                 graph_contexts,
+                context_owed,
                 source_spans,
             });
         }
@@ -1383,6 +1392,7 @@ impl SearchEngine {
                             hash: task.hash,
                             chunks: task.chunks,
                             graph_contexts: task.graph_contexts,
+                            context_owed: task.context_owed,
                             source_spans: task.source_spans,
                             embeddings: match error {
                                 None => Ok(embeddings),
@@ -1424,6 +1434,11 @@ impl SearchEngine {
                     )) {
                         first_error.get_or_insert(error);
                         continue;
+                    }
+                    if result.context_owed {
+                        if let Err(error) = self.owe_graph_contexts([&result.key]) {
+                            first_error.get_or_insert(error);
+                        }
                     }
                     indexed += 1;
                     debug!(file = %result.key.path, chunks = result.chunks.len(), "file indexed");
@@ -2297,7 +2312,7 @@ impl SearchEngine {
         };
         let provider =
             if with_graph_context { self.graph_context_provider.as_deref() } else { None };
-        let documents = crate::document::prepare_indexed_documents(
+        let (documents, context_owed) = crate::document::prepare_indexed_documents(
             key,
             &content,
             provider,
@@ -2319,6 +2334,7 @@ impl SearchEngine {
             hash: hash.as_bytes().to_vec(),
             chunks,
             graph_contexts,
+            context_owed,
             source_spans,
         })
     }
@@ -2351,6 +2367,7 @@ impl SearchEngine {
                 chunks,
                 reason,
                 graph_contexts: Some(contexts),
+                context_owed,
                 source_spans,
             } => {
                 match lifecycle::with_reason(*reason, || {
@@ -2370,6 +2387,11 @@ impl SearchEngine {
                         checkpoint,
                     )
                 }) {
+                    // Marked only once the rows exist: a refresh that ran in between would find
+                    // no chunks and clear a mark placed ahead of them.
+                    Ok(ControlFlow::Continue(_)) if *context_owed => {
+                        ControlFlow::Continue(self.owe_graph_contexts([key]))
+                    }
                     Ok(ControlFlow::Continue(_)) => ControlFlow::Continue(Ok(())),
                     Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
                     Err(error) => ControlFlow::Continue(Err(error)),
@@ -2382,6 +2404,7 @@ impl SearchEngine {
                 reason,
                 graph_contexts: None,
                 source_spans,
+                ..
             } => {
                 match lifecycle::with_reason(*reason, || {
                     self.store.reindex_file_in_collection_checkpointed_with_source_spans(
@@ -2637,7 +2660,7 @@ impl SearchEngine {
                     None => false,
                 };
 
-                let documents = crate::document::prepare_indexed_documents(
+                let (documents, context_owed) = crate::document::prepare_indexed_documents(
                     key,
                     &content,
                     self.graph_context_provider.as_deref(),
@@ -2689,6 +2712,10 @@ impl SearchEngine {
                     ControlFlow::Break(()) => {
                         unreachable!("permit-all ingest checkpoint cannot cancel")
                     }
+                }
+                // Marked only once the rows exist, so a refresh in between cannot clear it.
+                if context_owed {
+                    self.owe_graph_contexts([key])?;
                 }
                 indexed += 1;
             }
@@ -3728,6 +3755,22 @@ impl SearchEngine {
         };
         self.mark_workspace_key_context_dirty(&key)?;
         Ok(true)
+    }
+
+    /// Mark files just written without a context the provider failed to render, so a context
+    /// refresh renders them, and tell the provider's owner which marks are owed.
+    fn owe_graph_contexts<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k FileKey>,
+    ) -> Result<(), SearchError> {
+        let mut high = None;
+        for key in keys {
+            high = Some(self.store.mark_context_dirty("code", &key.root_id, &key.path)?);
+        }
+        if let (Some(high), Some(provider)) = (high, self.graph_context_provider.as_deref()) {
+            provider.context_marks_owed(high);
+        }
+        Ok(())
     }
 
     pub fn mark_workspace_key_context_dirty(&self, key: &FileKey) -> Result<(), SearchError> {
@@ -6058,6 +6101,8 @@ enum PreparedBootFile {
         hash: Vec<u8>,
         chunks: Vec<code_chunk::Chunk>,
         graph_contexts: Option<Vec<Option<String>>>,
+        /// Some context failed to render; the file owes a re-render once written.
+        context_owed: bool,
         source_spans: Vec<Option<crate::SourceSpan>>,
     },
 }
@@ -6072,6 +6117,8 @@ struct FileTask {
     /// Per-chunk graph context (parallel to `chunks`), persisted so a later
     /// reconstruction-from-storage re-embeds with the same enriched text.
     graph_contexts: Vec<Option<String>>,
+    /// Some context failed to render; the file owes a re-render once written.
+    context_owed: bool,
     source_spans: Vec<Option<crate::SourceSpan>>,
 }
 
@@ -6081,6 +6128,7 @@ struct FileResult {
     hash: Vec<u8>,
     chunks: Vec<code_chunk::Chunk>,
     graph_contexts: Vec<Option<String>>,
+    context_owed: bool,
     source_spans: Vec<Option<crate::SourceSpan>>,
     embeddings: Result<Vec<Vec<f32>>, SearchError>,
 }
@@ -7491,6 +7539,57 @@ mod tests {
             .find(|(_, doc)| doc.symbol_name == "Тест")
             .expect("method chunk should be pending embedding");
         assert_eq!(method.1.graph_context.as_deref(), Some("calls: Тест_helper"));
+    }
+
+    /// A context the provider failed to render is indexed as owed, not as "no context": the
+    /// file is marked for the next context refresh and the provider's owner is told the mark.
+    #[test]
+    fn index_directory_deferred_owes_a_context_the_provider_failed_to_render() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        #[derive(Default)]
+        struct Unreadable {
+            owed: AtomicI64,
+        }
+        impl crate::ports::GraphContextProvider for Unreadable {
+            fn graph_context(&self, _: &str, _: &str, _: &str) -> Option<String> {
+                None
+            }
+            fn try_graph_context(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<String>, crate::GraphContextError> {
+                Err(crate::GraphContextError("graph unavailable".to_owned()))
+            }
+            fn context_marks_owed(&self, mark_high: i64) {
+                self.owed.fetch_max(mark_high, Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        fs::write(workspace.join("CommonModule.bsl"), "Процедура Тест()\nКонецПроцедуры").unwrap();
+
+        let db_path = workspace.join("bsl-search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        let provider = std::sync::Arc::new(Unreadable::default());
+        engine.set_graph_context_provider(provider.clone());
+
+        assert_eq!(engine.index_directory_deferred(workspace).unwrap(), 1, "the file is indexed");
+        let key = FileKey::configuration("CommonModule.bsl");
+        assert!(
+            engine.context_dirty_paths("code").unwrap().contains(&key),
+            "the file owes the render it could not get"
+        );
+        let owed = provider.owed.load(Ordering::SeqCst);
+        assert!(owed > 0, "the provider's owner is told which mark is owed");
+        assert_eq!(
+            engine.store().context_dirty_paths_bounded("code", owed).unwrap().len(),
+            1,
+            "the reported mark covers the file"
+        );
     }
 
     #[test]

@@ -104,6 +104,12 @@ pub trait GraphContextProvider: Send + Sync {
     ) -> Result<Option<String>, GraphContextError> {
         Ok(self.graph_context(rel_path, symbol_name, kind))
     }
+
+    /// Files written without a context this provider failed to render have been marked
+    /// context-dirty, the highest of those marks being `mark_high`. The provider's owner decides
+    /// when the marks are rendered; the call must not block, since the engine is held while it
+    /// runs. The default ignores it, for providers that cannot fail.
+    fn context_marks_owed(&self, _mark_high: i64) {}
 }
 
 /// A transient failure rendering graph context. The message is opaque to this crate.

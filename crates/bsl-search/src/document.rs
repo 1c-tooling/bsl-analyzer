@@ -71,22 +71,37 @@ pub fn semantic_key_from_parts(
 /// fields (and the same graph context). Graph context is requested from `provider`
 /// only for method chunks (procedure / function); module headers and absent
 /// providers yield `None`, leaving the embedding text unenriched.
+///
+/// The flag says the provider failed to render this chunk's context. The document then
+/// carries none, and the caller owes the render: a failure stored as "no context" would
+/// never be asked for again.
 pub(crate) fn indexed_document_for_chunk(
     key: &FileKey,
     chunk: &Chunk,
     provider: Option<&dyn GraphContextProvider>,
-) -> IndexedDocument {
+) -> (IndexedDocument, bool) {
     let kind = chunk.kind.label();
-    let graph_context = match chunk.kind {
+    let (graph_context, context_failed) = match (chunk.kind, provider) {
         // The graph reads a module's identity out of the metadata-shaped path,
         // which is the path relative to its own root — an extension repeats that
         // shape, so the root-relative spelling is the one to hand over.
-        ChunkKind::Procedure | ChunkKind::Function => {
-            provider.and_then(|p| p.graph_context(&key.path, &chunk.name, kind))
+        (ChunkKind::Procedure | ChunkKind::Function, Some(provider)) => {
+            match provider.try_graph_context(&key.path, &chunk.name, kind) {
+                Ok(context) => (context, false),
+                Err(error) => {
+                    tracing::debug!(
+                        root = %key.root_id,
+                        path = %key.path,
+                        method = %chunk.name,
+                        "graph context render failed; the file owes a re-render: {error}"
+                    );
+                    (None, true)
+                }
+            }
         }
-        ChunkKind::ModuleHeader => None,
+        _ => (None, false),
     };
-    IndexedDocument {
+    let document = IndexedDocument {
         collection: "code".to_owned(),
         root_id: key.root_id.clone(),
         path: key.path.clone(),
@@ -98,7 +113,8 @@ pub(crate) fn indexed_document_for_chunk(
         text: chunk.text.clone(),
         graph_context,
         source_span: None,
-    }
+    };
+    (document, context_failed)
 }
 
 /// Prepare token-bounded parts from original AST source spans before legacy chunk splitting.
@@ -109,23 +125,52 @@ pub fn prepare_file_documents(
     provider: Option<&dyn GraphContextProvider>,
     policy: &TokenPolicy,
     document_prefix: &str,
-    mut check_singleton: impl FnMut(&str) -> Result<(), SearchError>,
+    check_singleton: impl FnMut(&str) -> Result<(), SearchError>,
 ) -> Result<Vec<IndexedDocument>, SearchError> {
-    prepare_file_documents_with_context(
+    prepare_file_documents_owing(key, source, provider, policy, document_prefix, check_singleton)
+        .map(|(documents, _)| documents)
+}
+
+/// Like [`prepare_file_documents`], and also says whether the provider failed to render some
+/// chunk's context: the caller then owes that file a re-render, as with
+/// [`indexed_document_for_chunk`].
+pub(crate) fn prepare_file_documents_owing(
+    key: &FileKey,
+    source: &str,
+    provider: Option<&dyn GraphContextProvider>,
+    policy: &TokenPolicy,
+    document_prefix: &str,
+    mut check_singleton: impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<(Vec<IndexedDocument>, bool), SearchError> {
+    let mut context_failed = false;
+    let documents = prepare_file_documents_with_context(
         key,
         source,
         |chunk| {
-            Ok(match chunk.kind {
-                ChunkKind::Procedure | ChunkKind::Function => provider.and_then(|provider| {
-                    provider.graph_context(&key.path, &chunk.name, chunk.kind.label())
-                }),
-                ChunkKind::ModuleHeader => None,
+            Ok(match (chunk.kind, provider) {
+                (ChunkKind::Procedure | ChunkKind::Function, Some(provider)) => {
+                    match provider.try_graph_context(&key.path, &chunk.name, chunk.kind.label()) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            tracing::debug!(
+                                root = %key.root_id,
+                                path = %key.path,
+                                method = %chunk.name,
+                                "graph context render failed; the file owes a re-render: {error}"
+                            );
+                            context_failed = true;
+                            None
+                        }
+                    }
+                }
+                _ => None,
             })
         },
         policy,
         document_prefix,
         &mut check_singleton,
-    )
+    )?;
+    Ok((documents, context_failed))
 }
 
 pub(crate) fn prepare_file_documents_with_context(
@@ -260,15 +305,17 @@ fn check_source_part(
     check_prepared_input(policy, &format!("{document_prefix}{input}"), check_singleton)
 }
 
+/// The documents of a file, split by the embedder's token policy when it has one, and whether
+/// the provider failed to render some chunk's context (the file then owes a re-render).
 pub(crate) fn prepare_indexed_documents(
     key: &FileKey,
     source: &str,
     provider: Option<&dyn GraphContextProvider>,
     embedder: Option<&crate::Embedder>,
-) -> Result<Vec<IndexedDocument>, SearchError> {
+) -> Result<(Vec<IndexedDocument>, bool), SearchError> {
     if let Some(embedder) = embedder {
         if let Some(policy) = embedder.token_policy() {
-            return prepare_file_documents(
+            return prepare_file_documents_owing(
                 key,
                 source,
                 provider,
@@ -278,10 +325,16 @@ pub(crate) fn prepare_indexed_documents(
             );
         }
     }
-    Ok(Chunker::chunk(source)
+    let mut context_failed = false;
+    let documents = Chunker::chunk(source)
         .iter()
-        .map(|chunk| indexed_document_for_chunk(key, chunk, provider))
-        .collect())
+        .map(|chunk| {
+            let (document, failed) = indexed_document_for_chunk(key, chunk, provider);
+            context_failed |= failed;
+            document
+        })
+        .collect();
+    Ok((documents, context_failed))
 }
 
 pub(crate) fn chunks_contexts_and_spans(
@@ -445,14 +498,15 @@ mod tests {
 
         // A method chunk gets the provider's context, folded into the embed text.
         let method = chunk(ChunkKind::Procedure, "Делать", "Процедура Делать() КонецПроцедуры");
-        let doc = indexed_document_for_chunk(&path, &method, Some(&provider));
+        let (doc, failed) = indexed_document_for_chunk(&path, &method, Some(&provider));
+        assert!(!failed);
         assert!(doc.graph_context.as_deref().unwrap().contains("Dispatch: server"));
         let embed = semantic_text_for_indexed_document(&doc);
         assert!(embed.contains("Module: ОбщийМодуль.Сервер.Модуль"), "{embed}");
         assert!(embed.contains("Calls: ДелатьВызов"), "{embed}");
 
         // A module header never gets graph context, even with a provider.
-        let header = indexed_document_for_chunk(
+        let (header, _) = indexed_document_for_chunk(
             &path,
             &chunk(ChunkKind::ModuleHeader, "", "Перем А;"),
             Some(&provider),
@@ -460,8 +514,39 @@ mod tests {
         assert_eq!(header.graph_context, None);
 
         // No provider → no context.
-        let plain = indexed_document_for_chunk(&path, &method, None);
+        let (plain, failed) = indexed_document_for_chunk(&path, &method, None);
         assert_eq!(plain.graph_context, None);
+        assert!(!failed, "no provider is no context, not a failed one");
+    }
+
+    /// A provider that cannot read its graph leaves the chunk without context AND says so: the
+    /// caller must owe the render rather than store the absence as the answer.
+    #[test]
+    fn a_failed_render_is_reported_not_stored_as_no_context() {
+        struct Unreadable;
+        impl GraphContextProvider for Unreadable {
+            fn graph_context(&self, _: &str, _: &str, _: &str) -> Option<String> {
+                None
+            }
+            fn try_graph_context(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<String>, crate::GraphContextError> {
+                Err(crate::GraphContextError("graph unavailable".to_owned()))
+            }
+        }
+        let path = FileKey::configuration("CommonModules/Сервер/Ext/Module.bsl");
+        let method = chunk(ChunkKind::Procedure, "Делать", "Процедура Делать() КонецПроцедуры");
+        let (doc, failed) = indexed_document_for_chunk(&path, &method, Some(&Unreadable));
+        assert_eq!(doc.graph_context, None);
+        assert!(failed);
+        let header = chunk(ChunkKind::ModuleHeader, "", "Перем А;");
+        assert!(
+            !indexed_document_for_chunk(&path, &header, Some(&Unreadable)).1,
+            "a header is never rendered, so it owes nothing"
+        );
     }
 
     #[test]

@@ -1815,13 +1815,24 @@ impl WorkspaceOverlayCache {
                 continue;
             }
 
-            let (lexical_documents, embedding_inputs) = build_overlay_documents_prepared(
+            let (lexical_documents, embedding_inputs) = match build_overlay_documents_prepared(
                 &file.key,
                 &content,
                 graph_context,
                 None,
                 embedder,
-            )?;
+            ) {
+                Ok(documents) => documents,
+                // An embedding refusal stops the pass; anything else is a context that could
+                // not be rendered.
+                Err(error) if error.embedding_failure().is_some() => return Err(error),
+                Err(_) => {
+                    // The file was read but its context was not: an entry without it would read
+                    // as complete, so the pass counts it with the failures it cannot vouch for.
+                    read_failures.insert(file.key.clone());
+                    continue;
+                }
+            };
             for input in &embedding_inputs {
                 let key = overlay_embedding_key(input);
                 if !warm_embeddings.contains_key(&key) {
@@ -2799,12 +2810,15 @@ fn resident_parse_root<'a>(
         .map(|snapshot| &snapshot.root)
 }
 
+/// An error when the provider failed to render some chunk's graph context: an overlay entry
+/// built without it would be kept as the answer, so the entry is not built and its file keeps
+/// the mark that asked for it.
 fn build_overlay_documents(
     key: &FileKey,
     content: &str,
     graph_context: Option<&dyn GraphContextProvider>,
     parse_root: Option<&syntax::SyntaxNode>,
-) -> (Vec<IndexedDocument>, Vec<String>) {
+) -> Result<(Vec<IndexedDocument>, Vec<String>), SearchError> {
     // When the resident host already parsed this exact text, chunk its shared syntax tree
     // instead of parsing `content` again (`chunk_parsed` is byte-parity-tested against
     // `chunk`). `content` still drives every text/offset/hash decision, so the chunk output
@@ -2817,12 +2831,16 @@ fn build_overlay_documents(
     let mut embedding_inputs = Vec::with_capacity(chunks.len());
 
     for chunk in &chunks {
-        let document = crate::document::indexed_document_for_chunk(key, chunk, graph_context);
+        let (document, context_failed) =
+            crate::document::indexed_document_for_chunk(key, chunk, graph_context);
+        if context_failed {
+            return Err(SearchError::Index(format!("graph context unavailable for {}", key.path)));
+        }
         embedding_inputs.push(crate::document::semantic_text_for_indexed_document(&document));
         lexical_documents.push(document);
     }
 
-    (lexical_documents, embedding_inputs)
+    Ok((lexical_documents, embedding_inputs))
 }
 
 fn build_overlay_documents_prepared(
@@ -2833,13 +2851,16 @@ fn build_overlay_documents_prepared(
     embedder: Option<&Embedder>,
 ) -> Result<(Vec<IndexedDocument>, Vec<String>), SearchError> {
     if embedder.is_some_and(|embedder| embedder.token_policy().is_some()) {
-        let documents =
+        let (documents, context_failed) =
             crate::document::prepare_indexed_documents(key, content, graph_context, embedder)?;
+        if context_failed {
+            return Err(SearchError::Index(format!("graph context unavailable for {}", key.path)));
+        }
         let inputs =
             documents.iter().map(crate::document::semantic_text_for_indexed_document).collect();
         Ok((documents, inputs))
     } else {
-        Ok(build_overlay_documents(key, content, graph_context, parse_root))
+        build_overlay_documents(key, content, graph_context, parse_root)
     }
 }
 
@@ -2977,7 +2998,8 @@ mod tests {
             &content,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(docs.len(), 4);
         let limit = inputs
             .iter()
@@ -3112,9 +3134,9 @@ mod tests {
         for content in &cases {
             let root = parser::parse(content).syntax_node();
             let (disk_docs, disk_inputs) =
-                build_overlay_documents(&key("M.bsl"), content, None, None);
+                build_overlay_documents(&key("M.bsl"), content, None, None).unwrap();
             let (snap_docs, snap_inputs) =
-                build_overlay_documents(&key("M.bsl"), content, None, Some(&root));
+                build_overlay_documents(&key("M.bsl"), content, None, Some(&root)).unwrap();
 
             assert!(!disk_docs.is_empty(), "fixture must produce at least one chunk");
             assert_eq!(disk_docs.len(), snap_docs.len(), "chunk count must match");
@@ -3131,7 +3153,7 @@ mod tests {
         // The large fixture genuinely crosses the split threshold, so parity is checked with
         // more than one chunk in play.
         assert!(
-            build_overlay_documents(&key("M.bsl"), &cases[2], None, None).0.len() > 1,
+            build_overlay_documents(&key("M.bsl"), &cases[2], None, None).unwrap().0.len() > 1,
             "the large fixture must exercise the 32 KiB split"
         );
     }

@@ -8,6 +8,11 @@ use super::build::GRAPH_BUILD_BATCH;
 use super::state::lock_recover;
 use super::{GraphState, GraphStatus};
 
+/// Leave the graph's file unusable, as a failed replacement does, until a rebuild replaces it.
+pub(crate) fn mark_graph_unusable(graph: &GraphState, reason: &str) {
+    graph.store.mark_unusable(reason.to_owned());
+}
+
 pub(super) fn write(root: &Path, rel: &str, text: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -69,6 +74,27 @@ pub(crate) fn workspace_hub(root: &Path) -> crate::change_hub::WorkspaceChangeHu
 pub(crate) const WAIT_POLL: Duration = Duration::from_millis(10);
 /// The default ceiling for a bounded wait on graph state.
 pub(crate) const WAIT_CEILING: Duration = Duration::from_secs(30);
+
+/// Every pooled handle of `graph`, taken once none is lent. A consumer of a fresh publication —
+/// the search hook confirming which generation it serves — borrows one for a moment right after
+/// the graph reads as ready, so a stand that must hold them all waits for that to pass.
+pub(crate) fn hold_every_handle(graph: &GraphState) -> Vec<super::GraphSnapshot> {
+    let deadline = std::time::Instant::now() + WAIT_CEILING;
+    loop {
+        let held: Vec<_> =
+            std::iter::from_fn(|| graph.snapshot()).take(super::SNAPSHOT_POOL_CAP).collect();
+        if held.len() == super::SNAPSHOT_POOL_CAP {
+            return held;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pool never had every handle idle: {}",
+            graph_state_summary(graph)
+        );
+        drop(held);
+        std::thread::sleep(WAIT_POLL);
+    }
+}
 
 /// Everything a timed-out wait needs to say to be diagnosable: which condition it
 /// waited on is the caller's half, the observed state is this one.
@@ -228,6 +254,7 @@ pub(super) fn seed_cache_with_layout(
             fingerprint,
             files: 0,
             built_at: "cached-build-sentinel".to_string(),
+            publication_id: "test-1".to_owned(),
         },
     )
     .expect("seed cache builds");

@@ -452,8 +452,8 @@ fn no_generic_or_unclassified_production_lease_callers() {
 #[test]
 fn fence_callers_are_exactly_classified() {
     let expected = [
-        ("graph/build.rs", 2),
-        ("graph/snapshot.rs", 2),
+        ("graph/build.rs", 3),
+        ("graph/snapshot.rs", 1),
         ("state/bootstrap.rs", 3),
         ("state/embed.rs", 4),
         ("state/mod.rs", 2),
@@ -474,6 +474,51 @@ fn fence_callers_are_exactly_classified() {
     }
 }
 
+/// A graph database is not copied by production code at all: reads use the file itself, a full
+/// build writes its own replacement, and a point patch writes into the file in one transaction.
+/// A copy anywhere would be a full copy of the file the counters and the disk audit do not see.
+#[test]
+fn production_code_copies_no_graph_database() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut copies = Vec::new();
+    for path in production_sources() {
+        if is_test_only_module(&path) {
+            continue;
+        }
+        let source =
+            production_source(&std::fs::read_to_string(&path).expect("Rust source is readable"));
+        for (index, _) in source.match_indices("fs::copy(") {
+            copies.push((path.strip_prefix(&root).unwrap().to_path_buf(), index));
+        }
+        assert!(
+            !source.contains("NamedTempFile") || !path.starts_with(root.join("graph")),
+            "{} makes a temporary copy of graph data",
+            path.display()
+        );
+    }
+    assert!(copies.is_empty(), "graph copies in production code: {copies:?}");
+}
+
+/// The published graph file is opened only by the graph module that lends its handles: a
+/// consumer opening it itself keeps a handle no publication can account for.
+#[test]
+fn only_the_graph_module_opens_graph_databases() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let owners = [root.join("graph"), root.join("graph_query.rs")];
+    for path in production_sources() {
+        if owners.iter().any(|owner| path.starts_with(owner)) {
+            continue;
+        }
+        let source =
+            production_source(&std::fs::read_to_string(&path).expect("Rust source is readable"));
+        assert!(
+            !source.contains("GraphDb::open"),
+            "{} opens a graph database past the graph store",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn request_paths_do_not_call_lease_or_mutation_helpers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -489,6 +534,7 @@ fn request_paths_do_not_call_lease_or_mutation_helpers() {
         "capture_point_refresh(",
         "publish_point_refresh(",
         "snapshot_blocking(",
+        "read_blocking(",
     ];
     for path in
         production_sources().into_iter().filter(|path| path == &lib || path.starts_with(&tools))
@@ -639,6 +685,18 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ),
     // The build watchdog holds a stop of its own and goes with the build.
     ("graph_db.rs", "spawn_build_watchdog", ".wait_timeout(", Waiting::OwnProtocol),
+    // A read waiting for a pooled graph handle to come back: bounded by the caller's wait.
+    ("graph/snapshot.rs", "checkout", ".wait_timeout(", Waiting::Bounded),
+    // The budget of a patch's SQL: a watchdog thread that interrupts the statement in flight.
+    ("graph_db.rs", "begin_body_patch", ".recv_timeout(", Waiting::Bounded),
+    // A replacement waits for the reads in flight, bounded by the installation wait.
+    ("graph/snapshot.rs", "pause_for_replacement", ".wait_timeout(", Waiting::Bounded),
+    // A superseded graph waits for its reads in flight before it closes the file; it ends when
+    // they return, and no read is cut short.
+    ("graph/snapshot.rs", "wait_until_returned", ".wait(", Waiting::OwnProtocol),
+    // A new owner re-trying the graph file's access lock, one short sleep per attempt, leaving
+    // on the stop it checks between them.
+    ("graph/state.rs", "acquire_graph_access", "thread::sleep", Waiting::Bounded),
     // The boot's publication takes the engine for one attempt at a time; the pause between
     // lease attempts is not held under it, which is why this wait is the owner's and bounded
     // by the attempt rather than by a foreign lease holder.
@@ -649,7 +707,7 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("state/embed.rs", "kick_context_reembed", "acquire_for_owner(", Waiting::Owner),
     (
         "state/embed.rs",
-        "refresh_search_contexts_after_graph_with_cache",
+        "refresh_search_contexts_after_graph_with_store",
         "acquire_for_owner(",
         Waiting::Owner,
     ),

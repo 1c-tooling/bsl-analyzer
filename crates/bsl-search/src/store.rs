@@ -1661,12 +1661,13 @@ impl Store {
     /// or reads changed), so a later reindex/embed pass re-renders it. A hint only: it
     /// carries no foreign key, and re-marking an already-dirty path is a cheap upsert that
     /// bumps the row's monotonic `seq`.
+    /// Mark one file context-dirty and return the mark's `seq`.
     pub fn mark_context_dirty(
         &self,
         collection: &str,
         root_id: &str,
         path: &str,
-    ) -> Result<(), SearchError> {
+    ) -> Result<i64, SearchError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1684,7 +1685,7 @@ impl Store {
         )?;
         tx.commit()?;
         self.observe_mark_seq(seq);
-        Ok(())
+        Ok(seq)
     }
 
     /// Mark every indexed file in `collection` context-dirty (a configuration-root `.xml`

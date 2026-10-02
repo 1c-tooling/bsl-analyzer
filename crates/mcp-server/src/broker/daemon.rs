@@ -41,6 +41,10 @@ use crate::{serve_stream, McpServer};
 /// dropped rather than parked, bounding memory against a runaway local client.
 const MAX_PARKED_DURING_BUILD: usize = 128;
 
+/// How long a superseded backend lets its answers in flight reach their clients, once its
+/// graph reads are done, before it closes the sessions.
+const SUPERSEDED_DRAIN: Duration = Duration::from_secs(2);
+
 /// Run the backend for `key`. `build` is invoked only after this process wins the
 /// bind, so the expensive state construction (which spawns background builds
 /// touching the project DBs) never runs in a race loser.
@@ -143,6 +147,7 @@ async fn serve(
     let poll =
         (orphan_grace.min(idle_ttl) / 4).clamp(Duration::from_millis(100), Duration::from_secs(15));
     let mut idle_since = Some(Instant::now());
+    let mut superseded = false;
     let mut ticker = interval(poll);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick
@@ -166,23 +171,23 @@ async fn serve(
             }
             _ = ticker.tick() => {
                 sessions.retain(|h| !h.is_finished());
-                let superseded = server.superseded();
+                // A newer generation owns this workspace's derived caches, so this backend is
+                // terminally unable to maintain them — a transient ownership refusal is not
+                // enough. It leaves whether or not sessions are connected: a connected client
+                // waiting on it holds the graph file away from the owner that can work.
+                if server.superseded() {
+                    tracing::info!(
+                        sessions = active.load(Ordering::SeqCst),
+                        "backend superseded by a newer daemon generation; closing its endpoint \
+                         and leaving once its graph reads finish"
+                    );
+                    superseded = true;
+                    break;
+                }
                 // Reset the idle clock while any session is connected; otherwise count down
                 // against the grace that fits the backend's history — the long `idle_ttl`
                 // once it has served real traffic, the short `orphan_grace` before then.
-                if active.load(Ordering::SeqCst) != 0 {
-                    idle_since = None;
-                } else if superseded {
-                    // A newer generation owns this workspace's derived caches, so this backend
-                    // is terminally unable to maintain them — a transient ownership refusal is
-                    // not enough. The warm hold buys a reconnecting client nothing, and holding
-                    // a multi-gigabyte resident until the TTL expires starves the daemon that
-                    // CAN work. No session is connected at this point, so nobody's link is cut.
-                    tracing::info!(
-                        "backend superseded by a newer daemon generation and idle; shutting down"
-                    );
-                    break;
-                } else if server.background_work_active() {
+                if active.load(Ordering::SeqCst) != 0 || server.background_work_active() {
                     idle_since = None;
                 } else {
                     let grace = if warmed.load(Ordering::SeqCst) { idle_ttl } else { orphan_grace };
@@ -204,6 +209,15 @@ async fn serve(
     // proxy gets an EOF and exits. Aborting a session task drops its socket; dropping the
     // listener frees the rendezvous name.
     drop(listener);
+    if superseded {
+        // The name is free for the current owner already. The graph reads in flight finish
+        // first — none is cut, however long — and whatever else is being answered gets a
+        // moment to reach its client before the sessions close.
+        while !server.graph_released() {
+            tokio::time::sleep(poll.min(Duration::from_millis(200))).await;
+        }
+        tokio::time::sleep(SUPERSEDED_DRAIN).await;
+    }
     for handle in &sessions {
         handle.abort();
     }
