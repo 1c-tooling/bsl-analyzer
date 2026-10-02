@@ -68,6 +68,13 @@ pub struct Lsp {
 
 impl Lsp {
     pub fn start(root: &Path) -> Self {
+        Self::start_with_capabilities(root, json!({}))
+    }
+
+    /// [`Self::start`] with the client capabilities the test wants negotiated — the
+    /// same document a real editor sends in `initialize`. An empty object is the
+    /// capability-less client `start` has always used.
+    pub fn start_with_capabilities(root: &Path, capabilities: Value) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
             .arg("lsp")
             .current_dir(root)
@@ -111,7 +118,7 @@ impl Lsp {
         let root_uri = lsp_types::Url::from_directory_path(root).unwrap();
         lsp.send(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"rootUri": root_uri, "capabilities": {}}
+            "params": {"rootUri": root_uri, "capabilities": capabilities}
         }));
         lsp.wait_for(|message| message["id"] == 1);
         lsp.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));

@@ -35,6 +35,188 @@ static EMBEDDING_PUBLISH_RETRY_BUDGET_WARNINGS: std::sync::atomic::AtomicUsize =
 
 type ReferenceInitError = (String, String, Option<EmbeddingFailure>);
 
+struct OpenedSearchEngine {
+    engine: SearchEngine,
+    semantic_failure: Option<EmbeddingFailure>,
+}
+
+fn is_token_layout_refusal(error: &SearchError) -> bool {
+    matches!(error, SearchError::Index(message) if message == "token layout mismatch")
+}
+
+fn is_invalid_embedding_config(error: &SearchError) -> bool {
+    error.embedding_failure().is_some_and(|failure| {
+        failure.code == bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+    })
+}
+
+fn token_profile_failure(prefixes: &super::types::EmbeddingPrefixes) -> Option<EmbeddingFailure> {
+    prefixes
+        .token_profile
+        .as_ref()
+        .filter(|profile| profile.token_policy.is_none())
+        .map(|_| EmbeddingFailure::new(bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig))
+}
+
+fn is_invalid_token_profile_only(
+    error: &SearchError,
+    prefixes: &super::types::EmbeddingPrefixes,
+) -> bool {
+    is_invalid_embedding_config(error)
+        && token_profile_failure(prefixes).is_some()
+        && bsl_search::EmbedderConfig::request_bytes_from_env().is_ok()
+}
+
+fn initial_semantic_runtime_status(
+    prefixes: &super::types::EmbeddingPrefixes,
+) -> SemanticRuntimeStatus {
+    token_profile_failure(prefixes)
+        .map_or(SemanticRuntimeStatus::Disabled, SemanticRuntimeStatus::EmbeddingFailed)
+}
+
+fn semantic_runtime_status_after_publish(
+    engine: &SearchEngine,
+    mode: &WorkspaceSearchMode,
+    indexing: bool,
+    prefixes: &super::types::EmbeddingPrefixes,
+    open_failure: Option<EmbeddingFailure>,
+) -> SemanticRuntimeStatus {
+    open_failure
+        .or_else(|| token_profile_failure(prefixes))
+        .map(SemanticRuntimeStatus::EmbeddingFailed)
+        .unwrap_or_else(|| {
+            if indexing {
+                SemanticRuntimeStatus::Indexing
+            } else {
+                SharedState::semantic_runtime_status_for_mode(engine, mode)
+            }
+        })
+}
+
+fn resolve_token_profile(
+    project: Option<&project_model::ProjectConfig>,
+    workspace: Option<&Path>,
+) -> Result<Option<super::types::EmbeddingTokenProfile>, SearchError> {
+    resolve_embedding_token_profile_values(
+        project,
+        workspace,
+        [
+            env::var_os(crate::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV),
+            env::var_os(crate::broker::EMBEDDING_TOKENIZER_FILE_ENV),
+            env::var_os(crate::broker::EMBEDDING_TOKENIZER_SHA256_ENV),
+        ],
+        [
+            env::var_os("EMBEDDING_MAX_INPUT_TOKENS"),
+            env::var_os("EMBEDDING_TOKENIZER_FILE"),
+            env::var_os("EMBEDDING_TOKENIZER_SHA256"),
+        ],
+    )
+}
+
+fn invalid_token_profile() -> super::types::EmbeddingTokenProfile {
+    super::types::EmbeddingTokenProfile {
+        max_input_tokens: 0,
+        tokenizer_file: PathBuf::new(),
+        tokenizer_sha256: String::new(),
+        token_policy: None,
+    }
+}
+
+fn token_profile_for_bootstrap(
+    project: Option<&project_model::ProjectConfig>,
+    workspace: Option<&Path>,
+) -> Option<super::types::EmbeddingTokenProfile> {
+    resolve_token_profile(project, workspace).unwrap_or_else(|_| Some(invalid_token_profile()))
+}
+
+/// Resolve the optional token profile once, honoring broker-frozen values before project and
+/// environment configuration. The tokenizer is loaded here so later workers clone the frozen
+/// policy instead of reopening the artifact.
+pub fn resolve_embedding_token_profile_values(
+    project: Option<&project_model::ProjectConfig>,
+    workspace: Option<&Path>,
+    frozen: [Option<std::ffi::OsString>; 3],
+    environment: [Option<std::ffi::OsString>; 3],
+) -> Result<Option<super::types::EmbeddingTokenProfile>, SearchError> {
+    let invalid = || {
+        SearchError::from(EmbeddingFailure::new(
+            bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+        ))
+    };
+    let [frozen_limit, frozen_file, frozen_hash] = frozen;
+    let [environment_limit, environment_file, environment_hash] = environment;
+    let frozen_any = frozen_limit.is_some() || frozen_file.is_some() || frozen_hash.is_some();
+    let project_embedding = project.map(|project| &project.search.baseline.embedding);
+    let configured_any = project_embedding.is_some_and(|embedding| {
+        embedding.max_input_tokens.is_some()
+            || embedding.tokenizer_file.is_some()
+            || embedding.tokenizer_sha256.is_some()
+    }) || environment_limit.is_some()
+        || environment_file.is_some()
+        || environment_hash.is_some();
+    if !frozen_any && !configured_any {
+        return Ok(None);
+    }
+    let limit = if frozen_any {
+        frozen_limit
+            .as_deref()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<usize>().ok())
+    } else if let Some(value) =
+        project_embedding.and_then(|embedding| embedding.max_input_tokens.as_ref())
+    {
+        value.as_integer().and_then(|value| usize::try_from(value).ok())
+    } else {
+        environment_limit
+            .as_deref()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    let root = workspace.unwrap_or(Path::new("."));
+    let path = if frozen_any {
+        frozen_file.map(PathBuf::from)
+    } else if let (Some(project), Some(declared)) =
+        (project, project_embedding.and_then(|embedding| embedding.tokenizer_file.as_deref()))
+    {
+        Some(project.search_tokenizer_file(root).unwrap_or_else(|| root.join(declared)))
+    } else {
+        environment_file.map(PathBuf::from).map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
+    };
+    let expected_hash = if frozen_any {
+        frozen_hash.as_deref().and_then(|value| value.to_str()).map(str::to_owned)
+    } else if let Some(hash) =
+        project_embedding.and_then(|embedding| embedding.tokenizer_sha256.clone())
+    {
+        Some(hash)
+    } else {
+        environment_hash.as_deref().and_then(|value| value.to_str()).map(str::to_owned)
+    };
+    let (Some(max_input_tokens), Some(path), Some(tokenizer_sha256)) =
+        (limit.filter(|value| *value > 0), path, expected_hash.filter(|hash| !hash.is_empty()))
+    else {
+        return Err(invalid());
+    };
+    let tokenizer_file = std::fs::canonicalize(path).map_err(|_| invalid())?;
+    if !tokenizer_file.is_file() {
+        return Err(invalid());
+    }
+    let token_policy =
+        bsl_search::TokenPolicy::load(&tokenizer_file, &tokenizer_sha256, max_input_tokens)
+            .map_err(|_| invalid())?;
+    Ok(Some(super::types::EmbeddingTokenProfile {
+        max_input_tokens,
+        tokenizer_file,
+        tokenizer_sha256,
+        token_policy: Some(token_policy),
+    }))
+}
+
 fn search_failure(error: SearchError) -> ReferenceInitError {
     let reason = error.reason_code().unwrap_or("search_error").to_owned();
     (error.to_string(), reason, error.embedding_failure())
@@ -78,9 +260,38 @@ impl ReferenceSearchState {
             },
             None => (None, ReferenceSearchLifecycle::Uninitialized),
         };
+        let token_profile = token_profile_for_bootstrap(project_config.as_ref(), project_root);
+        let embedding_prefixes = project_config.as_ref().map_or_else(
+            || super::types::EmbeddingPrefixes {
+                query: env::var("EMBEDDING_QUERY_PREFIX").unwrap_or_default(),
+                document: env::var("EMBEDDING_DOCUMENT_PREFIX").unwrap_or_default(),
+                token_profile: token_profile.clone(),
+            },
+            |config| {
+                let embedding = &config.search.baseline.embedding;
+                super::types::EmbeddingPrefixes {
+                    query: embedding
+                        .resolve_query_prefix(env::var("EMBEDDING_QUERY_PREFIX").ok().as_deref()),
+                    document: embedding.resolve_document_prefix(
+                        env::var("EMBEDDING_DOCUMENT_PREFIX").ok().as_deref(),
+                    ),
+                    token_profile: token_profile.clone(),
+                }
+            },
+        );
         let baseline = match &lifecycle {
             ReferenceSearchLifecycle::Failed { .. } => DeferredBaselineRuntime::absent(),
-            _ => match BaselineRuntime::reference_bootstrap(project_config.as_ref()) {
+            _ => match BaselineRuntime::reference_bootstrap(project_config.as_ref())
+                .with_token_layout_claim(
+                    SharedState::embedding_config_with_prefixes(Some(&embedding_prefixes))
+                        .ok()
+                        .flatten()
+                        .and_then(|config| {
+                            bsl_search::Embedder::new(config.embedder)
+                                .token_layout_claim()
+                                .map(str::to_owned)
+                        }),
+                ) {
                 BaselineBootstrap::Immediate(runtime) => DeferredBaselineRuntime::ready(runtime),
                 BaselineBootstrap::Connect(plan) => DeferredBaselineRuntime::spawn(*plan),
             },
@@ -88,8 +299,11 @@ impl ReferenceSearchState {
         Self {
             engine: super::shared_engine(None),
             progress: IndexProgress::new(),
-            semantic_runtime: Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
+            semantic_runtime: Arc::new(Mutex::new(initial_semantic_runtime_status(
+                &embedding_prefixes,
+            ))),
             baseline,
+            embedding_prefixes,
             lifecycle: Arc::new(Mutex::new(lifecycle)),
             stopped: Arc::new(AtomicBool::new(false)),
             stop: super::OwnerStop::default(),
@@ -109,7 +323,7 @@ impl ReferenceSearchState {
         *lifecycle = ReferenceSearchLifecycle::Loading;
         SharedState::set_semantic_runtime_status(
             &self.semantic_runtime,
-            SemanticRuntimeStatus::Disabled,
+            initial_semantic_runtime_status(&self.embedding_prefixes),
         );
         drop(lifecycle);
 
@@ -145,7 +359,11 @@ impl ReferenceSearchState {
                         None,
                     ))
                 } else {
-                    SharedState::init_reference_search_engine(&state.progress, baseline.external)
+                    SharedState::init_reference_search_engine(
+                        &state.progress,
+                        baseline.external,
+                        &state.embedding_prefixes,
+                    )
                 };
                 state.finish_initialization(initialization);
             },
@@ -195,15 +413,17 @@ impl ReferenceSearchState {
             || self.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match initialization {
             Ok((engine, embedding_failure)) => {
-                let status = embedding_failure.map_or_else(
-                    || {
-                        SharedState::semantic_runtime_status_for_mode(
-                            &engine,
-                            &WorkspaceSearchMode::SqliteLocal,
-                        )
-                    },
-                    SemanticRuntimeStatus::EmbeddingFailed,
-                );
+                let status = token_profile_failure(&self.embedding_prefixes)
+                    .or(embedding_failure)
+                    .map_or_else(
+                        || {
+                            SharedState::semantic_runtime_status_for_mode(
+                                &engine,
+                                &WorkspaceSearchMode::SqliteLocal,
+                            )
+                        },
+                        SemanticRuntimeStatus::EmbeddingFailed,
+                    );
                 // `Ready` is the claim that the engine is in the slot, so it is made only where
                 // the engine reaches it. A refused admission — the daemon stopping, or a
                 // poisoned slot — published nothing, and saying ready over an empty slot sends
@@ -361,7 +581,33 @@ impl SharedState {
         source_dir: PathBuf,
         cache: crate::cache::WorkspaceCacheLayout,
     ) -> Result<Self, WorkspaceInitError> {
+        Self::workspace_with_cache_and_prefixes(source_dir, cache, None)
+    }
+
+    /// Construct workspace state with the embedding input profile frozen by its launcher.
+    pub fn workspace_with_cache_and_prefixes(
+        source_dir: PathBuf,
+        cache: crate::cache::WorkspaceCacheLayout,
+        frozen_prefixes: Option<super::types::EmbeddingPrefixes>,
+    ) -> Result<Self, WorkspaceInitError> {
         let project = crate::project::at(&source_dir)?;
+        let embedding_prefixes = match frozen_prefixes {
+            Some(prefixes) => prefixes,
+            None => {
+                let embedding = &project.config.search.baseline.embedding;
+                super::types::EmbeddingPrefixes {
+                    query: embedding
+                        .resolve_query_prefix(env::var("EMBEDDING_QUERY_PREFIX").ok().as_deref()),
+                    document: embedding.resolve_document_prefix(
+                        env::var("EMBEDDING_DOCUMENT_PREFIX").ok().as_deref(),
+                    ),
+                    token_profile: token_profile_for_bootstrap(
+                        Some(&project.config),
+                        Some(&project.root),
+                    ),
+                }
+            }
+        };
         let source_root = project.configuration_path().map(Path::to_path_buf);
         // One value, used by everything that reads the tree: the watch, the walk that
         // feeds the graph and the search index, and the roots the engine registers. Two
@@ -413,7 +659,8 @@ impl SharedState {
         let search_engine: SharedSearchEngine = super::shared_engine(None);
         let workspace_search_initializing = Arc::new(AtomicBool::new(true));
         let index_progress = IndexProgress::new();
-        let semantic_runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled));
+        let semantic_runtime =
+            Arc::new(Mutex::new(initial_semantic_runtime_status(&embedding_prefixes)));
         let overlay_warmup = Arc::new(Mutex::new(OverlayWarmupState::Pending));
         // Only the cheap, local part of baseline resolution runs here (config, env,
         // credential helper); the PG connect itself is deferred to a background thread
@@ -422,7 +669,14 @@ impl SharedState {
         // postgres workspace baseline), not by connect success: a PG outage keeps the
         // workspace in Postgres mode with a visible issue instead of silently falling
         // back to (re)building a local index of the whole configuration.
-        let bootstrap = BaselineRuntime::workspace_bootstrap(Some(&project.root), &project.config);
+        let token_layout_claim = Self::embedding_config_with_prefixes(Some(&embedding_prefixes))
+            .ok()
+            .flatten()
+            .and_then(|config| {
+                bsl_search::Embedder::new(config.embedder).token_layout_claim().map(str::to_owned)
+            });
+        let bootstrap = BaselineRuntime::workspace_bootstrap(Some(&project.root), &project.config)
+            .with_token_layout_claim(token_layout_claim);
         let workspace_search_mode = Self::workspace_mode_for(&bootstrap);
         let embedding_publish_retry_budget = Self::embedding_publish_retry_budget();
         let baseline = match bootstrap {
@@ -486,7 +740,7 @@ impl SharedState {
         // the SAME owner; no second warmup worker is introduced.
         let overlay_retry =
             if matches!(workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay) {
-                match Self::embedding_config() {
+                match Self::embedding_config_with_prefixes(Some(&embedding_prefixes)) {
                     Ok(Some(_)) => Some(super::overlay_retry::OverlayRetry::spawn(
                         Arc::clone(&search_engine),
                         owners.clone(),
@@ -537,6 +791,7 @@ impl SharedState {
             Arc::clone(&embed_flight),
             overlay_retry.clone(),
             Arc::clone(&root_drift_epoch),
+            embedding_prefixes.clone(),
             workspace_lease.clone(),
             embedding_publish_retry_budget,
         );
@@ -607,6 +862,7 @@ impl SharedState {
             owners.clone(),
             overlay_backlog.clone(),
             Arc::clone(&search_consumer),
+            embedding_prefixes.clone(),
         );
 
         let reference_search = ReferenceSearchState::new(Some(&source_dir));
@@ -663,6 +919,7 @@ impl SharedState {
         owners: super::OwnerStop,
         overlay_backlog: super::overlay_backlog::OverlayBacklog,
         search_consumer: Arc<Mutex<super::ConsumerPhase>>,
+        embedding_prefixes: super::types::EmbeddingPrefixes,
     ) {
         let initializing_for_thread = Arc::clone(&initializing);
         // Every way out of the init that does not start the consumer abandons it — a thread
@@ -721,6 +978,7 @@ impl SharedState {
                     &graph,
                     &lease,
                     &owners,
+                    &embedding_prefixes,
                 );
 
                 let mut init = match init {
@@ -761,10 +1019,13 @@ impl SharedState {
                 // empty vector index; without this ordering a concurrent semantic query
                 // could reach `engine.search` on that empty index and return a silent
                 // zero instead of degrading to lexical.
-                let status_after_publish = match &pending_embed {
-                    Some(_) => SemanticRuntimeStatus::Indexing,
-                    None => Self::semantic_runtime_status_for_mode(&init.engine, &init.mode),
-                };
+                let status_after_publish = semantic_runtime_status_after_publish(
+                    &init.engine,
+                    &init.mode,
+                    pending_embed.is_some(),
+                    &embedding_prefixes,
+                    init.semantic_failure,
+                );
 
                 // `context_dirty` persists across restarts, so a prior run may have left marks
                 // nothing of this run placed. Capture whether any survive AND the mark
@@ -1038,7 +1299,24 @@ impl SharedState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn embedding_config() -> Result<Option<bsl_search::SearchConfig>, SearchError> {
+        Self::embedding_config_with_prefixes(None)
+    }
+
+    pub(super) fn embedding_config_with_prefixes(
+        prefixes: Option<&super::types::EmbeddingPrefixes>,
+    ) -> Result<Option<bsl_search::SearchConfig>, SearchError> {
+        let token_policy = prefixes
+            .and_then(|prefixes| prefixes.token_profile.as_ref())
+            .map(|profile| {
+                profile.token_policy.clone().ok_or_else(|| {
+                    SearchError::from(EmbeddingFailure::new(
+                        bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+                    ))
+                })
+            })
+            .transpose()?;
         // Окружение разработчика в тесты не протекает. `EMBEDDING_URL`, выставленный в
         // оболочке, уводил прогон к настоящему сервису эмбеддингов: запросы упирались в
         // сетевые таймауты и повторы, и завершение состояния ждало их десятками минут —
@@ -1055,8 +1333,12 @@ impl SharedState {
         // vectors from different models into one index. Unset means FTS-only.
         let Ok(model) = std::env::var("EMBEDDING_MODEL") else { return Ok(None) };
         let max_request_bytes = bsl_search::EmbedderConfig::request_bytes_from_env()?;
-        let dim: usize =
-            std::env::var("EMBEDDING_DIM").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        // No declared width means the request carries no `dimensions` field at all and
+        // the model keeps its native one: OpenAI-compatible endpoints that refuse the
+        // parameter (litellm's `UnsupportedParamsError` among them) answer only then.
+        // An explicit width still wins and doubles as the expectation for the response,
+        // so the index is never built for a width nobody declared.
+        let dim = bsl_search::EmbedderConfig::dim_from_env()?;
         // Background index/embedding workers otherwise saturate every core and starve interactive
         // `search_code` for tens of seconds during the one-time build. Default to leaving two cores
         // free for queries; an explicit EMBEDDING_CONCURRENCY still wins (operators who want max
@@ -1074,10 +1356,19 @@ impl SharedState {
             embedder: bsl_search::EmbedderConfig {
                 base_url,
                 model,
-                dim: Some(dim),
+                dim,
                 api_key: std::env::var("EMBEDDING_API_KEY").ok(),
                 provider: std::env::var("EMBEDDING_PROVIDER").ok(),
+                query_prefix: prefixes.map_or_else(
+                    || std::env::var("EMBEDDING_QUERY_PREFIX").unwrap_or_default(),
+                    |prefixes| prefixes.query.clone(),
+                ),
+                document_prefix: prefixes.map_or_else(
+                    || std::env::var("EMBEDDING_DOCUMENT_PREFIX").unwrap_or_default(),
+                    |prefixes| prefixes.document.clone(),
+                ),
                 max_request_bytes,
+                token_policy,
             },
             execution: bsl_search::EmbeddingExecutionPolicy {
                 batch_size: std::env::var("EMBEDDING_BATCH_SIZE")
@@ -1157,11 +1448,28 @@ impl SharedState {
         }
     }
 
+    #[cfg(test)]
     fn open_search_engine(db_path: &Path) -> Result<Option<SearchEngine>, SearchError> {
-        if let Some(config) = Self::embedding_config()? {
-            return Ok(Self::open_semantic_search_engine(db_path, config));
+        Self::open_search_engine_with_prefixes(db_path, None)
+    }
+
+    fn open_search_engine_with_prefixes(
+        db_path: &Path,
+        prefixes: Option<&super::types::EmbeddingPrefixes>,
+    ) -> Result<Option<SearchEngine>, SearchError> {
+        match Self::embedding_config_with_prefixes(prefixes) {
+            Ok(Some(config)) => Ok(Self::open_semantic_search_engine(db_path, config)
+                .or_else(|| Self::open_fts_only_search_engine(db_path))),
+            Ok(None) => Ok(Self::open_fts_only_search_engine(db_path)),
+            Err(error)
+                if prefixes
+                    .is_some_and(|prefixes| is_invalid_token_profile_only(&error, prefixes)) =>
+            {
+                tracing::warn!("embedding configuration is invalid; opening lexical search only");
+                Ok(Self::open_fts_only_search_engine(db_path))
+            }
+            Err(error) => Err(error),
         }
-        Ok(Self::open_fts_only_search_engine(db_path))
     }
 
     pub(super) fn startup_apply<T>(
@@ -1335,17 +1643,51 @@ impl SharedState {
         db_path: &Path,
         lease: &crate::workspace_lease::WorkspaceLease,
         stop: &super::OwnerStop,
-    ) -> Result<Option<SearchEngine>, bsl_search::SearchError> {
-        let opened = match Self::embedding_config()? {
-            Some(config) => SearchEngine::new_fenced(db_path, config, |apply| {
+        embedding_prefixes: &super::types::EmbeddingPrefixes,
+    ) -> Result<Option<OpenedSearchEngine>, bsl_search::SearchError> {
+        let token_profile_requested = embedding_prefixes.token_profile.is_some();
+        let mut semantic_failure = None;
+        let embedding = match Self::embedding_config_with_prefixes(Some(embedding_prefixes)) {
+            Ok(config) => config,
+            Err(error) if is_invalid_token_profile_only(&error, embedding_prefixes) => {
+                semantic_failure = error.embedding_failure();
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let opened = match embedding {
+            Some(config) => match SearchEngine::new_fenced(db_path, config, |apply| {
                 Self::startup_apply_checkpointed(lease, stop, apply)
-            }),
+            }) {
+                Ok(opened) => Ok(opened),
+                Err(error)
+                    if is_token_layout_refusal(&error)
+                        || is_invalid_token_profile_only(&error, embedding_prefixes) =>
+                {
+                    semantic_failure = Some(error.embedding_failure().unwrap_or_else(|| {
+                        EmbeddingFailure::new(
+                            bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+                        )
+                    }));
+                    SearchEngine::fts_only_fenced(db_path, |apply| {
+                        Self::startup_apply_checkpointed(lease, stop, apply)
+                    })
+                }
+                Err(error) => return Err(error),
+            },
             None => SearchEngine::fts_only_fenced(db_path, |apply| {
                 Self::startup_apply_checkpointed(lease, stop, apply)
             }),
         }?;
         Ok(match opened {
-            bsl_search::FenceOutcome::Applied(engine) => Some(engine),
+            bsl_search::FenceOutcome::Applied(engine) => {
+                if token_profile_requested && semantic_failure.is_none() && !engine.has_semantic() {
+                    semantic_failure = Some(EmbeddingFailure::new(
+                        bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+                    ));
+                }
+                Some(OpenedSearchEngine { engine, semantic_failure })
+            }
             bsl_search::FenceOutcome::TransientRefusal => {
                 unreachable!("startup_apply retries transient refusals")
             }
@@ -1357,17 +1699,53 @@ impl SharedState {
         db_path: &Path,
         lease: &crate::workspace_lease::WorkspaceLease,
         stop: &super::OwnerStop,
-    ) -> Result<Option<SearchEngine>, bsl_search::SearchError> {
-        let opened = match Self::embedding_config()? {
-            Some(config) => SearchEngine::semantic_overlay_only_fenced(db_path, config, |apply| {
-                Self::startup_apply_checkpointed(lease, stop, apply)
-            }),
+        embedding_prefixes: &super::types::EmbeddingPrefixes,
+    ) -> Result<Option<OpenedSearchEngine>, bsl_search::SearchError> {
+        let token_profile_requested = embedding_prefixes.token_profile.is_some();
+        let mut semantic_failure = None;
+        let embedding = match Self::embedding_config_with_prefixes(Some(embedding_prefixes)) {
+            Ok(config) => config,
+            Err(error) if is_invalid_token_profile_only(&error, embedding_prefixes) => {
+                semantic_failure = error.embedding_failure();
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let opened = match embedding {
+            Some(config) => {
+                match SearchEngine::semantic_overlay_only_fenced(db_path, config, |apply| {
+                    Self::startup_apply_checkpointed(lease, stop, apply)
+                }) {
+                    Ok(opened) => Ok(opened),
+                    Err(error)
+                        if is_token_layout_refusal(&error)
+                            || is_invalid_token_profile_only(&error, embedding_prefixes) =>
+                    {
+                        semantic_failure = Some(error.embedding_failure().unwrap_or_else(|| {
+                            EmbeddingFailure::new(
+                                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+                            )
+                        }));
+                        SearchEngine::fts_only_fenced(db_path, |apply| {
+                            Self::startup_apply_checkpointed(lease, stop, apply)
+                        })
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             None => SearchEngine::fts_only_fenced(db_path, |apply| {
                 Self::startup_apply_checkpointed(lease, stop, apply)
             }),
         }?;
         Ok(match opened {
-            bsl_search::FenceOutcome::Applied(engine) => Some(engine),
+            bsl_search::FenceOutcome::Applied(engine) => {
+                if token_profile_requested && semantic_failure.is_none() && !engine.has_semantic() {
+                    semantic_failure = Some(EmbeddingFailure::new(
+                        bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+                    ));
+                }
+                Some(OpenedSearchEngine { engine, semantic_failure })
+            }
             bsl_search::FenceOutcome::TransientRefusal => {
                 unreachable!("startup_apply retries transient refusals")
             }
@@ -1466,6 +1844,8 @@ impl SharedState {
     /// paying costs the arming time once; the rescan cost a walk plus a stat and a full
     /// read of every file in the configuration, on every boot. `None` (tests, and the
     /// entry points that have no hub) waits for nothing and reports no watch.
+    // Keep the frozen input profile explicit beside the existing workspace ownership controls.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn init_workspace_search_engine(
         workspace_root: &std::path::Path,
         watch: Option<(&WorkspaceChangeHub, super::sync::WatchWaitPolicy)>,
@@ -1474,6 +1854,7 @@ impl SharedState {
         graph: &GraphState,
         lease: &crate::workspace_lease::WorkspaceLease,
         stop: &super::OwnerStop,
+        embedding_prefixes: &super::types::EmbeddingPrefixes,
     ) -> Result<Option<WorkspaceSearchInit>, bsl_search::SearchError> {
         // The graph carries the resolved cache layout, so this pass reads the tree
         // through the same hole the watch does instead of re-deriving where the cache is.
@@ -1531,14 +1912,23 @@ impl SharedState {
                 ));
             };
             let roots = Self::roots_of(&project, &excluded);
-            let Some(mut engine) = bsl_search::lifecycle::with_startup_roots(
+            let Some(opened) = bsl_search::lifecycle::with_startup_roots(
                 "postgres_remote_overlay",
                 roots.entries().map(|(_, path)| path.to_path_buf()).collect(),
-                || Self::open_workspace_overlay_search_engine_fenced(&db_path, lease, stop),
+                || {
+                    Self::open_workspace_overlay_search_engine_fenced(
+                        &db_path,
+                        lease,
+                        stop,
+                        embedding_prefixes,
+                    )
+                },
             )?
             else {
                 return Ok(None);
             };
+            let mut engine = opened.engine;
+            let semantic_failure = opened.semantic_failure;
             let Some(()) = Self::configure_and_declare_baseline(
                 &mut engine,
                 roots,
@@ -1671,20 +2061,23 @@ impl SharedState {
             return Ok(Some(WorkspaceSearchInit {
                 engine,
                 mode: WorkspaceSearchMode::PostgresRemoteOverlay,
+                semantic_failure,
                 pending_embed: None,
                 overlay_init: OverlayInit::RemoteWarmup,
             }));
         }
 
         let roots = Self::roots_of(&project, &excluded);
-        let Some(mut engine) = bsl_search::lifecycle::with_startup_roots(
+        let Some(opened) = bsl_search::lifecycle::with_startup_roots(
             "sqlite_local",
             roots.entries().map(|(_, path)| path.to_path_buf()).collect(),
-            || Self::open_search_engine_fenced(&db_path, lease, stop),
+            || Self::open_search_engine_fenced(&db_path, lease, stop, embedding_prefixes),
         )?
         else {
             return Ok(None);
         };
+        let mut engine = opened.engine;
+        let semantic_failure = opened.semantic_failure;
 
         // A restart with partially embedded code must resume, not re-embed. The deferred
         // embedding pass already selects exactly the NULL-embedding chunks
@@ -1723,7 +2116,7 @@ impl SharedState {
             // the engine back immediately so lexical search and the graph go live in
             // minutes, and defer the ~hours-long embedding pass to a background thread
             // on its own connection (see `spawn_workspace_search_init`).
-            let pending_embed = Self::embedding_config()?
+            let pending_embed = Self::embedding_config_with_prefixes(Some(embedding_prefixes))?
                 .map(|config| PendingEmbed { db_path: db_path.clone(), config });
             // The fused parse pass ingested files present on disk but never removed rows for a `.bsl`
             // deleted while the daemon was down. Reconcile the store to disk so the overlay baseline
@@ -1738,6 +2131,7 @@ impl SharedState {
             return Ok(Some(WorkspaceSearchInit {
                 engine,
                 mode: WorkspaceSearchMode::SqliteLocal,
+                semantic_failure,
                 pending_embed,
                 overlay_init,
             }));
@@ -1825,7 +2219,7 @@ impl SharedState {
             let code_chunks = chunks_result.unwrap_or(0);
             let code_embeddings = embeddings_result.unwrap_or(0);
             let pending_embed = (code_chunks > code_embeddings)
-                .then(Self::embedding_config)
+                .then(|| Self::embedding_config_with_prefixes(Some(embedding_prefixes)))
                 .transpose()?
                 .flatten()
                 .map(|config| PendingEmbed { db_path: db_path.clone(), config });
@@ -1843,6 +2237,7 @@ impl SharedState {
             return Ok(Some(WorkspaceSearchInit {
                 engine,
                 mode: WorkspaceSearchMode::SqliteLocal,
+                semantic_failure,
                 pending_embed,
                 overlay_init,
             }));
@@ -1912,6 +2307,7 @@ impl SharedState {
         Ok(Some(WorkspaceSearchInit {
             engine,
             mode: WorkspaceSearchMode::SqliteLocal,
+            semantic_failure,
             pending_embed: None,
             overlay_init,
         }))
@@ -1933,6 +2329,7 @@ impl SharedState {
             graph,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &super::OwnerStop::default(),
+            &super::types::EmbeddingPrefixes::default(),
         )
         .ok()
         .flatten()
@@ -1941,37 +2338,46 @@ impl SharedState {
     fn init_reference_search_engine(
         progress: &Arc<IndexProgress>,
         external_baseline: Option<Arc<ExternalBaselineService>>,
+        embedding_prefixes: &super::types::EmbeddingPrefixes,
     ) -> Result<(SearchEngine, Option<EmbeddingFailure>), ReferenceInitError> {
         let db_path = Self::reference_search_db_path().ok_or_else(|| {
             ("reference cache path is unavailable".to_owned(), "storage_error".to_owned(), None)
         })?;
-        Self::init_reference_search_engine_at(&db_path, progress, external_baseline)
+        Self::init_reference_search_engine_at(
+            &db_path,
+            progress,
+            external_baseline,
+            Some(embedding_prefixes),
+        )
     }
 
     fn init_reference_search_engine_at(
         db_path: &Path,
         progress: &Arc<IndexProgress>,
         external_baseline: Option<Arc<ExternalBaselineService>>,
+        prefixes: Option<&super::types::EmbeddingPrefixes>,
     ) -> Result<(SearchEngine, Option<EmbeddingFailure>), ReferenceInitError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| (error.to_string(), "storage_error".to_owned(), None))?;
         }
 
-        let mut engine =
-            Self::open_search_engine(db_path).map_err(search_failure)?.ok_or_else(|| {
+        let mut engine = Self::open_search_engine_with_prefixes(db_path, prefixes)
+            .map_err(search_failure)?
+            .ok_or_else(|| {
                 (
                     "failed to open reference search engine".to_owned(),
                     "storage_error".to_owned(),
                     None,
                 )
             })?;
+        let requested_token_failure = prefixes.and_then(token_profile_failure);
         let embedding_failure = if external_baseline
             .as_ref()
             .is_some_and(|baseline| matches!(baseline.corpus(), CorpusId::Reference))
         {
             if let Some(external_baseline) = external_baseline.as_ref() {
-                let model_id = engine.embedding_model().map(ToOwned::to_owned);
+                let model_id = engine.embedding_storage_identity().map(ToOwned::to_owned);
                 let dimension = engine.embedding_dimension();
                 match external_baseline
                     .load_reference_snapshot_documents(
@@ -2014,9 +2420,11 @@ impl SharedState {
             tracing::info!(
                 "external reference baseline is configured; lexical search uses the shared snapshot and semantic cache is synchronized locally"
             );
-            None
+            requested_token_failure
         } else {
-            Self::index_platform_docs(&mut engine, progress).map_err(search_failure)?
+            Self::index_platform_docs(&mut engine, progress)
+                .map_err(search_failure)?
+                .or(requested_token_failure)
         };
         Ok((engine, embedding_failure))
     }
@@ -2273,7 +2681,7 @@ mod tests {
         let db_path = dir.path().join("reference.db");
         let state = super::ReferenceSearchState::new(None);
         let initialization =
-            SharedState::init_reference_search_engine_at(&db_path, &state.progress, None);
+            SharedState::init_reference_search_engine_at(&db_path, &state.progress, None, None);
         assert!(!db_path.exists(), "invalid configuration must fail before storage opens");
         state.finish_initialization(initialization);
         assert!(
@@ -2285,6 +2693,60 @@ mod tests {
             bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
         );
         assert!(state.engine.lock().unwrap().is_none());
+        state.shutdown();
+    }
+
+    /// The declared width is optional: unset means the request carries no `dimensions`
+    /// at all (the model answers in its native width). An explicit one still wins, and
+    /// a set-but-unusable value must not silently become "unset": now that the field
+    /// is optional, a typo would otherwise choose a different width without a word.
+    #[test]
+    fn embedding_config_declares_a_width_only_when_asked() {
+        let _lock = env_lock();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _limit = EnvVarGuard::unset("EMBEDDING_MAX_REQUEST_BYTES");
+
+        let _dim = EnvVarGuard::unset("EMBEDDING_DIM");
+        assert_eq!(SharedState::embedding_config().unwrap().unwrap().embedder.dim, None);
+
+        let _dim = EnvVarGuard::set("EMBEDDING_DIM", "7");
+        assert_eq!(SharedState::embedding_config().unwrap().unwrap().embedder.dim, Some(7));
+
+        for unusable in ["", "seven", "0", " 7"] {
+            let _dim = EnvVarGuard::set("EMBEDDING_DIM", unusable);
+            let error = SharedState::embedding_config().err().expect("unusable width");
+            assert_eq!(error.to_string(), "embedding_invalid_config");
+        }
+    }
+
+    #[test]
+    fn invalid_token_profile_reference_fallback_keeps_structured_semantic_failure() {
+        let _lock = env_lock();
+        let _max_bytes = EnvVarGuard::unset("EMBEDDING_MAX_REQUEST_BYTES");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("reference.db");
+        let prefixes = super::super::types::EmbeddingPrefixes {
+            token_profile: Some(super::invalid_token_profile()),
+            ..Default::default()
+        };
+        let state = super::ReferenceSearchState::new(None);
+        let initialization = SharedState::init_reference_search_engine_at(
+            &db_path,
+            &state.progress,
+            None,
+            Some(&prefixes),
+        );
+        assert!(db_path.exists(), "invalid requested token policy keeps reference FTS available");
+        state.finish_initialization(initialization);
+        assert_eq!(state.lifecycle(), super::ReferenceSearchLifecycle::Ready);
+        assert_eq!(
+            state.semantic_runtime.lock().unwrap().embedding_failure().unwrap().code,
+            bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+            "reference fallback must retain the token-profile failure instead of reporting Disabled"
+        );
+        assert!(state.engine.lock().unwrap().as_ref().is_some_and(|engine| !engine.has_semantic()));
         state.shutdown();
     }
 
@@ -2325,13 +2787,15 @@ mod tests {
             assert!(SharedState::open_search_engine_fenced(
                 &db_path,
                 &lease,
-                &super::super::OwnerStop::default()
+                &super::super::OwnerStop::default(),
+                &super::super::types::EmbeddingPrefixes::default(),
             )
             .is_err());
             assert!(SharedState::open_workspace_overlay_search_engine_fenced(
                 &db_path,
                 &lease,
-                &super::super::OwnerStop::default()
+                &super::super::OwnerStop::default(),
+                &super::super::types::EmbeddingPrefixes::default(),
             )
             .is_err());
             assert!(SharedState::open_search_engine(&db_path).is_err());
@@ -2340,6 +2804,283 @@ mod tests {
             let _model = EnvVarGuard::unset("EMBEDDING_MODEL");
             assert!(SharedState::embedding_config().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn token_profile_bootstrap_loads_project_artifact_once_for_workspace_and_reference() {
+        let _lock = env_lock();
+        let _limit = EnvVarGuard::unset("EMBEDDING_MAX_INPUT_TOKENS");
+        let _file = EnvVarGuard::unset("EMBEDDING_TOKENIZER_FILE");
+        let _hash = EnvVarGuard::unset("EMBEDDING_TOKENIZER_SHA256");
+        let _frozen_limit = EnvVarGuard::unset(crate::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV);
+        let _frozen_file = EnvVarGuard::unset(crate::broker::EMBEDDING_TOKENIZER_FILE_ENV);
+        let _frozen_hash = EnvVarGuard::unset(crate::broker::EMBEDDING_TOKENIZER_SHA256_ENV);
+        let dir = tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        fs::write(
+            &tokenizer,
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"document":1,"query":2},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        let config_path = dir.path().join("bsl-analyzer.toml");
+        fs::write(
+            &config_path,
+            "[search.baseline.embedding]\nmaxInputTokens = 8192\ntokenizerFile = \"tokenizer.json\"\ntokenizerSha256 = \"0140e7cf55bacdcb49a072e767dd1bc0114c690d6796d3729a0f2cb41cc27bc5\"\n",
+        )
+        .unwrap();
+        let config = project_model::ProjectConfig::load(dir.path()).unwrap().unwrap();
+        let profile = super::token_profile_for_bootstrap(Some(&config), Some(dir.path()))
+            .expect("project profile is resolved without launcher prefixes");
+        assert_eq!(profile.max_input_tokens, 8192);
+        assert_eq!(profile.tokenizer_file, tokenizer.canonicalize().unwrap());
+        assert!(profile.token_policy.is_some(), "the tokenizer is loaded once at bootstrap");
+        assert!(profile.token_policy.as_ref().unwrap().count("hello").is_ok());
+
+        let wrong_hash = config_path;
+        fs::write(
+            &wrong_hash,
+            "[search.baseline.embedding]\nmaxInputTokens = 8192\ntokenizerFile = \"tokenizer.json\"\ntokenizerSha256 = \"wrong\"\n",
+        )
+        .unwrap();
+        let invalid = project_model::ProjectConfig::load(dir.path()).unwrap().unwrap();
+        let profile = super::token_profile_for_bootstrap(Some(&invalid), Some(dir.path()))
+            .expect("invalid declared profile remains marked for lexical fallback");
+        assert!(profile.token_policy.is_none());
+        assert_eq!(profile.max_input_tokens, 0);
+    }
+
+    #[test]
+    fn invalid_token_profile_keeps_existing_local_fts_search_available() {
+        let _lock = env_lock();
+        let _max_bytes = EnvVarGuard::unset("EMBEDDING_MAX_REQUEST_BYTES");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("search.db");
+        let mut store = bsl_search::Store::open(&db_path).unwrap();
+        let chunks = [bsl_search::Chunk {
+            kind: bsl_search::ChunkKind::Procedure,
+            name: "ExistingProcedure".to_owned(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: 1,
+            line_end: 1,
+            text: "procedure ExistingProcedure()\n    BoundedFallbackProbe = 1;\nendprocedure"
+                .to_owned(),
+        }];
+        store
+            .reindex_file_in_collection(
+                "root",
+                "Existing.bsl",
+                b"fixture-hash",
+                "code",
+                &chunks,
+                None,
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let prefixes = super::super::types::EmbeddingPrefixes {
+            token_profile: Some(super::super::types::EmbeddingTokenProfile {
+                max_input_tokens: 0,
+                tokenizer_file: dir.path().join("missing-tokenizer.json"),
+                tokenizer_sha256: String::new(),
+                token_policy: None,
+            }),
+            ..Default::default()
+        };
+        let lease = crate::workspace_lease::WorkspaceLease::unmanaged();
+        let opened = SharedState::open_search_engine_fenced(
+            &db_path,
+            &lease,
+            &super::super::OwnerStop::default(),
+            &prefixes,
+        )
+        .unwrap()
+        .expect("invalid token profile falls back to local FTS");
+        assert_eq!(
+            opened.semantic_failure,
+            Some(bsl_search::EmbeddingFailure::new(
+                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+            ))
+        );
+        let engine = opened.engine;
+        let hits = engine.text_search("BoundedFallbackProbe", 5, Some("code")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol_name, "ExistingProcedure");
+
+        let runtime = Arc::new(Mutex::new(super::semantic_runtime_status_after_publish(
+            &engine,
+            &super::WorkspaceSearchMode::SqliteLocal,
+            false,
+            &prefixes,
+            opened.semantic_failure,
+        )));
+        let status = crate::tools::search::search_status(
+            crate::McpProfile::Workspace,
+            &super::super::shared_engine(Some(engine)),
+            &IndexProgress::new(),
+            &runtime,
+            super::WorkspaceSearchMode::SqliteLocal,
+            super::OverlayWarmupState::Pending,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let body = status.structured_content.unwrap();
+        assert_eq!(
+            body["semantic_failure"],
+            serde_json::json!(bsl_search::EmbeddingFailure::new(
+                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+            ))
+        );
+        assert!(status.content[0].as_text().unwrap().text.contains("embedding_invalid_config"));
+
+        let _invalid_max_bytes = EnvVarGuard::set("EMBEDDING_MAX_REQUEST_BYTES", "0");
+        let unopened = dir.path().join("invalid-legacy-config.db");
+        assert!(SharedState::open_search_engine_with_prefixes(&unopened, Some(&prefixes)).is_err());
+        assert!(
+            !unopened.exists(),
+            "invalid legacy byte limit must still fail before storage opens"
+        );
+    }
+
+    #[test]
+    fn valid_token_profile_layout_refusal_keeps_fts_and_reports_semantic_failure() {
+        let _lock = env_lock();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _max_bytes = EnvVarGuard::unset("EMBEDDING_MAX_REQUEST_BYTES");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("claimed-search.db");
+        let source = "Procedure ExistingProcedure()\n    LayoutFallbackProbe = 1;\nEndProcedure";
+        let chunks = [bsl_search::Chunk {
+            kind: bsl_search::ChunkKind::Procedure,
+            name: "ExistingProcedure".to_owned(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: 1,
+            line_end: 3,
+            text: source.to_owned(),
+        }];
+        let foreign_claim = "profile-v1:foreign-token-layout";
+        {
+            let mut store = bsl_search::Store::open(&db_path).unwrap();
+            store
+                .reindex_file_in_collection(
+                    bsl_search::CONFIGURATION_ROOT_ID,
+                    "Existing.bsl",
+                    blake3::hash(source.as_bytes()).as_bytes(),
+                    "code",
+                    &chunks,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('token_layout_claim_v1', ?1)",
+            [foreign_claim],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(
+            &tokenizer,
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"document":1,"query":2},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        let tokenizer_sha256 = "0140e7cf55bacdcb49a072e767dd1bc0114c690d6796d3729a0f2cb41cc27bc5";
+        let profile = super::super::types::EmbeddingPrefixes {
+            token_profile: Some(super::super::types::EmbeddingTokenProfile {
+                max_input_tokens: 128,
+                tokenizer_file: tokenizer.clone(),
+                tokenizer_sha256: tokenizer_sha256.to_owned(),
+                token_policy: Some(
+                    bsl_search::TokenPolicy::load(&tokenizer, tokenizer_sha256, 128).unwrap(),
+                ),
+            }),
+            ..Default::default()
+        };
+        let opened = SharedState::open_search_engine_fenced(
+            &db_path,
+            &crate::workspace_lease::WorkspaceLease::unmanaged(),
+            &super::super::OwnerStop::default(),
+            &profile,
+        )
+        .unwrap()
+        .expect("layout refusal leaves the lexical engine open");
+        assert_eq!(
+            opened.semantic_failure,
+            Some(bsl_search::EmbeddingFailure::new(
+                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+            ))
+        );
+        let hits = opened.engine.text_search("LayoutFallbackProbe", 5, Some("code")).unwrap();
+        assert_eq!(hits.len(), 1);
+
+        let runtime = Arc::new(Mutex::new(super::semantic_runtime_status_after_publish(
+            &opened.engine,
+            &super::WorkspaceSearchMode::SqliteLocal,
+            false,
+            &profile,
+            opened.semantic_failure,
+        )));
+        let status = crate::tools::search::search_status(
+            crate::McpProfile::Workspace,
+            &super::super::shared_engine(Some(opened.engine)),
+            &IndexProgress::new(),
+            &runtime,
+            super::WorkspaceSearchMode::SqliteLocal,
+            super::OverlayWarmupState::Pending,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            status.structured_content.unwrap()["semantic_failure"],
+            serde_json::json!(bsl_search::EmbeddingFailure::new(
+                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+            ))
+        );
+    }
+
+    #[test]
+    fn tokenizer_hash_mismatch_is_classified_without_disclosing_local_details() {
+        let _lock = env_lock();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _limit = EnvVarGuard::unset("EMBEDDING_MAX_REQUEST_BYTES");
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sensitive-local-tokenizer.json");
+        std::fs::write(&path, "not a tokenizer").unwrap();
+        let profile = super::super::types::EmbeddingPrefixes {
+            token_profile: Some(super::super::types::EmbeddingTokenProfile {
+                max_input_tokens: 8192,
+                tokenizer_file: path.clone(),
+                tokenizer_sha256: "private-wrong-hash".to_owned(),
+                token_policy: None,
+            }),
+            ..Default::default()
+        };
+
+        let error = match SharedState::embedding_config_with_prefixes(Some(&profile)) {
+            Err(error) => error,
+            Ok(_) => panic!("a tokenizer hash mismatch must reject the embedding profile"),
+        };
+
+        assert_eq!(error.to_string(), "embedding_invalid_config");
+        assert_eq!(
+            error.embedding_failure().unwrap().code,
+            bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+        );
+        assert!(!error.to_string().contains(path.to_str().unwrap()));
+        assert!(!error.to_string().contains("private-wrong-hash"));
     }
 
     #[test]
@@ -2997,6 +3738,7 @@ mod tests {
             crate::state::OwnerStop::default(),
             Default::default(),
             Arc::new(Mutex::new(crate::state::ConsumerPhase::Pending)),
+            super::super::types::EmbeddingPrefixes::default(),
         );
 
         for _ in 0..600 {
@@ -3063,6 +3805,7 @@ mod tests {
             crate::state::OwnerStop::default(),
             Default::default(),
             Arc::new(Mutex::new(crate::state::ConsumerPhase::Pending)),
+            super::super::types::EmbeddingPrefixes::default(),
         );
     }
 
@@ -3282,6 +4025,7 @@ mod tests {
                     text: "Процедура ПризрачнаяПроцедура()\nКонецПроцедуры".to_owned(),
                     content_hash: "ghost".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -3388,6 +4132,7 @@ mod tests {
                     text: "Процедура ПризрачнаяПроцедура()\nКонецПроцедуры".to_owned(),
                     content_hash: "ghost".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -4003,6 +4748,67 @@ mod tests {
             "the deleted module is gone from the store: {files:?}",
         );
     }
+
+    #[test]
+    fn warm_deferred_boot_reuses_frozen_embedding_prefixes_for_pending_pass() {
+        let _env_lock = env_lock();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        let _embedding_model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _embedding_dim = EnvVarGuard::set("EMBEDDING_DIM", "8");
+        let _query_prefix = EnvVarGuard::set("EMBEDDING_QUERY_PREFIX", "environment-query");
+        let _document_prefix =
+            EnvVarGuard::set("EMBEDDING_DOCUMENT_PREFIX", "environment-document");
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        fs::write(
+            workspace.join("Configuration.xml"),
+            "<Configuration><Name>Конфа</Name></Configuration>",
+        )
+        .unwrap();
+        write_common_module_tree(
+            &workspace,
+            "Сервер",
+            "&НаСервере\nФункция Тест() Экспорт Возврат 1; КонецФункции\n",
+        );
+        let frozen_prefixes = super::super::types::EmbeddingPrefixes {
+            query: "frozen-query".to_owned(),
+            document: "frozen-document".to_owned(),
+            token_profile: None,
+        };
+
+        let initialize = |prefixes: &super::super::types::EmbeddingPrefixes| {
+            SharedState::init_workspace_search_engine(
+                &workspace,
+                None,
+                WorkspaceSearchMode::SqliteLocal,
+                None,
+                &GraphState::disabled(),
+                &crate::workspace_lease::WorkspaceLease::unmanaged(),
+                &super::super::OwnerStop::default(),
+                prefixes,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let assert_pending_profile = |init: &super::WorkspaceSearchInit| {
+            let pending = init.pending_embed.as_ref().expect("NULL chunks schedule embedding");
+            let pending_embedder = bsl_search::Embedder::new(pending.config.embedder.clone());
+            let pending_identity = pending_embedder.storage_identity();
+            assert_eq!(Some(pending_identity), init.engine.embedding_storage_identity());
+            assert_eq!(pending.config.embedder.query_prefix, frozen_prefixes.query);
+            assert_eq!(pending.config.embedder.document_prefix, frozen_prefixes.document);
+        };
+
+        let cold = initialize(&frozen_prefixes);
+        assert_pending_profile(&cold);
+        drop(cold);
+
+        let warm = initialize(&frozen_prefixes);
+        assert_pending_profile(&warm);
+    }
+
     /// A file that still EXISTS but was gutted to comments-only while the daemon was down yields zero
     /// chunks; the boot indexer must REMOVE its now-stale prior chunks rather than skip it (the
     /// deletion reconcile can't help — the file is not gone). Index a module with a symbol, gut it,

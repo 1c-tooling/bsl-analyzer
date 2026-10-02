@@ -1431,7 +1431,7 @@ impl WorkspaceOverlayCache {
 
         if self.embedding_cache.is_empty() {
             if let Some(embedder) = embedder {
-                let model_id = embedder.model();
+                let model_id = embedder.model_id();
                 let dim = embedder.dim();
                 match store.load_overlay_embedding_cache(model_id, dim) {
                     Ok(cached) if !cached.is_empty() => {
@@ -1655,7 +1655,7 @@ impl WorkspaceOverlayCache {
         if let Some(embedder) = embedder {
             if !self.embedding_cache.is_empty() {
                 if let Err(error) = store.save_overlay_embedding_cache(
-                    embedder.model(),
+                    embedder.model_id(),
                     embedder.dim(),
                     &self.embedding_cache,
                 ) {
@@ -1674,6 +1674,7 @@ impl WorkspaceOverlayCache {
     /// in the overlay, builds their lexical docs and embedding inputs, and collects the distinct
     /// `content_hash -> input` pairs that lack a warm vector. Mutates nothing shared: the result
     /// is a [`RefreshPlan`] applied later by [`Self::publish_plan`].
+    #[cfg(test)]
     pub fn plan_full_refresh_from_manifest(
         manifest_fingerprints: &HashMap<FileKey, String>,
         roots: &WorkspaceRoots,
@@ -1682,17 +1683,39 @@ impl WorkspaceOverlayCache {
         graph_context: Option<&dyn GraphContextProvider>,
         distrusted: &HashSet<FileKey>,
     ) -> Result<RefreshPlan, SearchError> {
+        Self::plan_full_refresh_from_manifest_with_embedder(
+            manifest_fingerprints,
+            roots,
+            store,
+            warm_embeddings,
+            graph_context,
+            distrusted,
+            None,
+        )
+    }
+
+    pub(crate) fn plan_full_refresh_from_manifest_with_embedder(
+        manifest_fingerprints: &HashMap<FileKey, String>,
+        roots: &WorkspaceRoots,
+        store: &Store,
+        warm_embeddings: &HashMap<String, Vec<f32>>,
+        graph_context: Option<&dyn GraphContextProvider>,
+        distrusted: &HashSet<FileKey>,
+        embedder: Option<&Embedder>,
+    ) -> Result<RefreshPlan, SearchError> {
         let scanned = scan_workspace_files(roots);
-        Self::plan_full_refresh_from_manifest_scanned(
+        Self::plan_full_refresh_from_manifest_scanned_with_embedder(
             manifest_fingerprints,
             scanned,
             store,
             warm_embeddings,
             graph_context,
             distrusted,
+            embedder,
         )
     }
 
+    #[cfg(test)]
     fn plan_full_refresh_from_manifest_scanned(
         manifest_fingerprints: &HashMap<FileKey, String>,
         scanned: ScannedFiles,
@@ -1700,6 +1723,26 @@ impl WorkspaceOverlayCache {
         warm_embeddings: &HashMap<String, Vec<f32>>,
         graph_context: Option<&dyn GraphContextProvider>,
         distrusted: &HashSet<FileKey>,
+    ) -> Result<RefreshPlan, SearchError> {
+        Self::plan_full_refresh_from_manifest_scanned_with_embedder(
+            manifest_fingerprints,
+            scanned,
+            store,
+            warm_embeddings,
+            graph_context,
+            distrusted,
+            None,
+        )
+    }
+
+    fn plan_full_refresh_from_manifest_scanned_with_embedder(
+        manifest_fingerprints: &HashMap<FileKey, String>,
+        scanned: ScannedFiles,
+        store: &Store,
+        warm_embeddings: &HashMap<String, Vec<f32>>,
+        graph_context: Option<&dyn GraphContextProvider>,
+        distrusted: &HashSet<FileKey>,
+        embedder: Option<&Embedder>,
     ) -> Result<RefreshPlan, SearchError> {
         let baseline_identity =
             store.load_baseline_manifest().ok().flatten().map(|r| (r.snapshot_id, r.fingerprint));
@@ -1772,13 +1815,23 @@ impl WorkspaceOverlayCache {
                 continue;
             }
 
-            let Ok((lexical_documents, embedding_inputs)) =
-                build_overlay_documents(&file.key, &content, graph_context, None)
-            else {
-                // The file was read but its context was not: an entry without it would read
-                // as complete, so the pass counts it with the failures it cannot vouch for.
-                read_failures.insert(file.key.clone());
-                continue;
+            let (lexical_documents, embedding_inputs) = match build_overlay_documents_prepared(
+                &file.key,
+                &content,
+                graph_context,
+                None,
+                embedder,
+            ) {
+                Ok(documents) => documents,
+                // An embedding refusal stops the pass; anything else is a context that could
+                // not be rendered.
+                Err(error) if error.embedding_failure().is_some() => return Err(error),
+                Err(_) => {
+                    // The file was read but its context was not: an entry without it would read
+                    // as complete, so the pass counts it with the failures it cannot vouch for.
+                    read_failures.insert(file.key.clone());
+                    continue;
+                }
             };
             for input in &embedding_inputs {
                 let key = overlay_embedding_key(input);
@@ -1860,13 +1913,14 @@ impl WorkspaceOverlayCache {
     ) -> Result<PublishOutcome, SearchError> {
         let staging = self.stage_plan(plan, new_embeddings, baseline)?;
         let embedding = embedder.map(|embedder| {
-            (embedder.model(), embedder.dim(), staging.next_cache.embedding_cache_snapshot())
+            (embedder.model_id(), embedder.dim(), staging.next_cache.embedding_cache_snapshot())
         });
         let mut checkpoint = || std::ops::ControlFlow::Continue(());
         if store
-            .apply_overlay_publication(
+            .apply_overlay_publication_with_token_layout(
                 staging.fingerprints.as_ref().map(|(id, rows)| (id.as_str(), rows)),
                 embedding.as_ref().map(|(model, dim, rows)| (*model, *dim, rows)),
+                embedder.and_then(Embedder::token_layout_claim),
                 &mut checkpoint,
             )?
             .is_break()
@@ -2549,7 +2603,7 @@ fn build_overlay_entry(
     parse_root: Option<&syntax::SyntaxNode>,
 ) -> Result<OverlayFileEntry, SearchError> {
     let (lexical_documents, embedding_inputs) =
-        build_overlay_documents(key, content, graph_context, parse_root)?;
+        build_overlay_documents_prepared(key, content, graph_context, parse_root, embedder)?;
     let vector_documents = build_overlay_vectors(
         embedder,
         batch_size,
@@ -2789,6 +2843,27 @@ fn build_overlay_documents(
     Ok((lexical_documents, embedding_inputs))
 }
 
+fn build_overlay_documents_prepared(
+    key: &FileKey,
+    content: &str,
+    graph_context: Option<&dyn GraphContextProvider>,
+    parse_root: Option<&syntax::SyntaxNode>,
+    embedder: Option<&Embedder>,
+) -> Result<(Vec<IndexedDocument>, Vec<String>), SearchError> {
+    if embedder.is_some_and(|embedder| embedder.token_policy().is_some()) {
+        let (documents, context_failed) =
+            crate::document::prepare_indexed_documents(key, content, graph_context, embedder)?;
+        if context_failed {
+            return Err(SearchError::Index(format!("graph context unavailable for {}", key.path)));
+        }
+        let inputs =
+            documents.iter().map(crate::document::semantic_text_for_indexed_document).collect();
+        Ok((documents, inputs))
+    } else {
+        build_overlay_documents(key, content, graph_context, parse_root)
+    }
+}
+
 /// Build overlay vectors for a file's chunks.
 ///
 /// With no `embedder`, only cached vectors are attached and chunks without one remain lexical.
@@ -2878,6 +2953,7 @@ pub fn semantic_hits(
             line_start: document.document.line_start,
             line_end: document.document.line_end,
             score: cosine_similarity(query_embedding, &document.embedding),
+            source_span: document.document.source_span.clone(),
         })
         .collect();
 

@@ -1101,6 +1101,7 @@ impl GraphState {
         let discard = &retired;
         let outcome = self.lease.publish_short(&mut prepared, move |prepared| {
             #[cfg(test)]
+            #[allow(deprecated, reason = "test fault injection retains Rust 1.91 compatibility")]
             if REFUSE_SNAPSHOT_INSTALL.with(|refuse| refuse.replace(false))
                 || self
                     .refused_installs

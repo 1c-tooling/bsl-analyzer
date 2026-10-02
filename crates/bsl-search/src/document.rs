@@ -1,7 +1,9 @@
-use crate::domain::IndexedDocument;
+use crate::domain::{IndexedDocument, SourceSpan};
+use crate::error::{EmbeddingFailureCode, SearchError};
 use crate::ports::GraphContextProvider;
+use crate::token_policy::TokenPolicy;
 use crate::workspace_roots::FileKey;
-use code_chunk::{Chunk, ChunkKind};
+use code_chunk::{Chunk, ChunkKind, Chunker};
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -110,8 +112,7 @@ pub(crate) fn indexed_document_for_chunk(
         content_hash: blake3::hash(chunk.text.as_bytes()).to_hex().to_string(),
         text: chunk.text.clone(),
         graph_context,
-    };
-    (document, context_failed)
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +131,7 @@ mod tests {
             text: "Возврат 1;".to_owned(),
             content_hash: "h".to_owned(),
             graph_context: None,
+            source_span: None,
         }
     }
 
@@ -256,5 +258,103 @@ mod tests {
             semantic_text_for_indexed_document(&blank),
             semantic_text_for_indexed_document(&doc())
         );
+    }
+
+    #[test]
+    fn prepared_file_parts_cover_original_source_and_keep_parent_context() {
+        let Ok(path) = std::env::var("USER2_TOKENIZER_JSON") else { return };
+        let policy = TokenPolicy::load(
+            std::path::Path::new(&path),
+            "80d0433a2cfc55a4561b0e98b6f822decc48c9d457db498837223f9385ef3aff",
+            120,
+        )
+        .unwrap();
+        let source = format!("Процедура Тест()\r\n{}\r\nКонецПроцедуры", "x".repeat(2200));
+        let provider = FakeProvider;
+        let key = FileKey::configuration("CommonModules/Тест/Ext/Module.bsl");
+        let mut accepted_inputs = Vec::new();
+        let documents =
+            prepare_file_documents(&key, &source, Some(&provider), &policy, "", |input| {
+                if input.len() > 1000 {
+                    Err(crate::error::EmbeddingFailure::new(
+                        EmbeddingFailureCode::EmbeddingInputTooLarge,
+                    )
+                    .into())
+                } else {
+                    accepted_inputs.push(input.to_owned());
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert!(documents.len() > 1);
+        assert!(documents.iter().all(|document| document
+            .graph_context
+            .as_deref()
+            .unwrap()
+            .contains("Calls: ТестВызов")));
+        let spans = documents
+            .iter()
+            .map(|document| document.source_span.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(spans.first().unwrap().part_index, 1);
+        assert!(spans.iter().all(|span| span.part_count as usize == documents.len()));
+        assert!(spans.windows(2).all(|pair| pair[0].byte_end == pair[1].byte_start));
+        assert_eq!(spans.first().unwrap().byte_start, spans.first().unwrap().parent_byte_start);
+        assert_eq!(spans.last().unwrap().byte_end, spans.last().unwrap().parent_byte_end);
+        let reconstructed =
+            documents.iter().map(|document| document.text.as_str()).collect::<String>();
+        assert_eq!(reconstructed, source);
+        for document in &documents {
+            let span = document.source_span.as_ref().unwrap();
+            assert_eq!(span.parent_symbol, "Тест");
+            assert_eq!(&source[span.byte_start as usize..span.byte_end as usize], document.text);
+            assert!(accepted_inputs.contains(&semantic_text_for_indexed_document(document)));
+        }
+
+        let header_source = format!("Перем {}", "x".repeat(2200));
+        let header_docs =
+            prepare_file_documents(&key, &header_source, None, &policy, "", |input| {
+                if input.len() > 1000 {
+                    Err(crate::error::EmbeddingFailure::new(
+                        EmbeddingFailureCode::EmbeddingInputTooLarge,
+                    )
+                    .into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        let symbols = header_docs
+            .iter()
+            .map(|document| document.symbol_name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(symbols.len(), header_docs.len());
+        assert!(header_docs.iter().all(|document| document
+            .source_span
+            .as_ref()
+            .unwrap()
+            .parent_symbol
+            .is_empty()));
+
+        let large_source = format!("x=1; //{}", "x".repeat(535_405));
+        assert_eq!(large_source.len(), 535_412);
+        let largest_checked = std::cell::Cell::new(0usize);
+        let large_docs = prepare_file_documents(&key, &large_source, None, &policy, "", |input| {
+            largest_checked.set(largest_checked.get().max(input.len()));
+            Ok(())
+        })
+        .unwrap();
+        assert!(largest_checked.get() <= crate::token_policy::MAX_SOURCE_WINDOW_BYTES + 256);
+        assert_eq!(
+            large_docs.iter().map(|document| document.text.as_str()).collect::<String>(),
+            large_source
+        );
+        let large_spans = large_docs
+            .iter()
+            .map(|document| document.source_span.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(large_spans.first().unwrap().byte_start, 0);
+        assert_eq!(large_spans.last().unwrap().byte_end, large_source.len() as u32);
+        assert!(large_spans.windows(2).all(|parts| parts[0].byte_end == parts[1].byte_start));
     }
 }

@@ -3286,6 +3286,7 @@ mod tests {
                     text: "Процедура УдаляемаяПроцедура()\nКонецПроцедуры".to_owned(),
                     content_hash: "h".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -3415,6 +3416,7 @@ mod tests {
                     text: "Процедура П()\nКонецПроцедуры".to_owned(),
                     content_hash: "h".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -3505,6 +3507,7 @@ mod tests {
                     text: "Процедура П()\nКонецПроцедуры".to_owned(),
                     content_hash: "h".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -3689,6 +3692,7 @@ mod tests {
                     text: "Процедура ЧитаетХ()\nКонецПроцедуры".to_owned(),
                     content_hash: "h".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -3868,6 +3872,7 @@ mod tests {
             text: format!("Процедура {sym}()\nКонецПроцедуры"),
             content_hash: "h".to_owned(),
             graph_context: None,
+            source_span: None,
         };
         engine
             .sync_indexed_documents_in_collection(
@@ -3929,6 +3934,7 @@ mod tests {
                 text: "Процедура П()\nКонецПроцедуры".to_owned(),
                 content_hash: "h".to_owned(),
                 graph_context: None,
+                source_span: None,
             }
         }
 

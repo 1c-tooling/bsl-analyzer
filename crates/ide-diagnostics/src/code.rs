@@ -106,6 +106,7 @@ pub enum DiagnosticCode {
     FormDataToValue,
     GetFormMethod,
     GlobalContextMethodCollision8312,
+    GlobalContextMethodConflict,
     InternetAccess,
     IsInRoleMethod,
     PairingBrokenTransaction,

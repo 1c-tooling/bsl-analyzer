@@ -1,3 +1,4 @@
+mod docs;
 mod sdbl;
 #[cfg(test)]
 mod token_stream_tests;
@@ -67,6 +68,8 @@ impl HlMod {
     pub const ASYNC: HlMod = HlMod(1 << 2);
     pub const DECLARATION: HlMod = HlMod(1 << 3);
     pub const DEFINITION: HlMod = HlMod(1 << 4);
+    /// Occurrences inside structured method documentation.
+    pub const DOCUMENTATION: HlMod = HlMod(1 << 5);
 
     pub const fn new() -> Self {
         HlMod(0)
@@ -97,6 +100,9 @@ impl HlMod {
         }
         if self.contains(HlMod::DEFINITION) {
             result.push("definition");
+        }
+        if self.contains(HlMod::DOCUMENTATION) {
+            result.push("documentation");
         }
         result
     }
@@ -153,7 +159,7 @@ pub fn highlight<DB: RootDatabase>(db: &DB, file_id: FileId) -> HighlightResult 
     let mut ctx = HighlightContext::new(db, file_id, Some(line_index));
     let mut highlights = Vec::new();
 
-    traverse_node(&mut ctx, &root, &mut highlights);
+    traverse_node(&mut ctx, &root, &bsl_source, &mut highlights);
 
     let highlights = normalize_highlights(highlights);
 
@@ -166,8 +172,12 @@ pub fn highlight<DB: RootDatabase>(db: &DB, file_id: FileId) -> HighlightResult 
 fn traverse_node<DB: RootDatabase>(
     ctx: &mut HighlightContext<DB>,
     node: &SyntaxNode,
+    source: &str,
     highlights: &mut Vec<HlRange>,
 ) {
+    if matches!(node.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF) {
+        docs::highlight_leading_comments(node, source, highlights);
+    }
     for token in node.children_with_tokens() {
         match token {
             syntax::NodeOrToken::Token(token) => {
@@ -196,7 +206,7 @@ fn traverse_node<DB: RootDatabase>(
                     }
                 }
 
-                traverse_node(ctx, &node, highlights);
+                traverse_node(ctx, &node, source, highlights);
             }
         }
     }
@@ -425,7 +435,8 @@ mod tests {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer"))
     }
 
-    fn create_db_with_file(source: &str) -> (RootDatabaseImpl, FileId) {
+    /// Shared isolated database for semantic highlighting regression tests.
+    pub(super) fn create_db_with_file(source: &str) -> (RootDatabaseImpl, FileId) {
         let mut db = RootDatabaseImpl::default();
         let file_id = FileId(0);
 

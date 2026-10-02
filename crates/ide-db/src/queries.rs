@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use base_db::FileIdInput;
+use bsl_metadata::traits::MdObject;
 use hir::ModuleId;
 
 use crate::{
@@ -240,6 +241,22 @@ pub fn module_metadata_query<'db>(
     let configuration = db.get_configuration(file_id);
 
     metadata = crate::metadata::build_module_metadata(&file_path, configuration.as_deref());
+
+    // `get_configuration` selects the raw config root that owns this path. For a
+    // common module body in an extension that leaves the adopted metadata at its
+    // overlay defaults (for example omitted ReturnValuesReuse). Resolve the owner
+    // by its name through this file's visibility chain so module-level consumers
+    // receive the same effective metadata as per-name lookups and object resolvers.
+    if metadata.module_type == bsl_metadata::ModuleType::CommonModule {
+        let raw_module =
+            metadata.common_module.clone().or_else(|| db.common_module_for_file_id(file_id));
+        if let Some(raw_module) = raw_module {
+            if let Some(effective) = db.resolve_common_module(file_id, raw_module.name()) {
+                metadata.execution_context = Some(hir::compute_execution_context(&effective));
+                metadata.common_module = Some(effective);
+            }
+        }
+    }
 
     if let (Some(config), Some((root, canonical, kind))) =
         (configuration.as_deref(), db.external_root_of_path(&file_path))

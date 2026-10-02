@@ -4,7 +4,7 @@ use ide::{
     DocumentHighlightKind as IdeDocumentHighlightKind, FoldingRangeKind as IdeFoldingRangeKind,
     InlayHintKind as IdeInlayHintKind, Location as IdeLocation, RenameError,
 };
-use line_index::{LineIndex, TextSize};
+use line_index::LineIndex;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
@@ -794,37 +794,95 @@ pub fn handle_folding_range(
     let uri = params.text_document.uri;
     let file_id = ctx.file_id_for_url(&uri)?;
 
-    let doc = ctx
-        .mem_docs
-        .get(&uri)
-        .ok_or_else(|| anyhow::anyhow!("Document not in MemDocs: {}", uri))?;
-    let line_index = doc.line_index();
+    // The document must be open, but only as a precondition now: the folded
+    // lines come from `ide` already resolved over the analysis text, so the
+    // handler no longer projects offsets through a second line index built
+    // over a second text (github#55).
+    if ctx.mem_docs.get(&uri).is_none() {
+        return Err(anyhow::anyhow!("Document not in MemDocs: {}", uri));
+    }
 
     let ranges = ctx.analysis.folding_ranges(file_id);
     if ranges.is_empty() {
         return Ok(None);
     }
 
-    let lsp_ranges: Vec<LspFoldingRange> = ranges
+    let mut lsp_ranges: Vec<LspFoldingRange> = ranges
         .into_iter()
-        .filter_map(|folding_range| {
-            let (start_line, end_line) = folding_range_lines(line_index, folding_range.range)?;
-            Some(LspFoldingRange {
-                start_line,
-                start_character: None,
-                end_line,
-                end_character: None,
-                kind: folding_range.kind.map(convert_folding_range_kind),
-                collapsed_text: None,
-            })
+        .map(|folding_range| LspFoldingRange {
+            start_line: folding_range.start_line,
+            start_character: None,
+            end_line: folding_range.end_line,
+            end_character: None,
+            kind: folding_range.kind.map(convert_folding_range_kind),
+            collapsed_text: None,
         })
         .collect();
+
+    // A client that named a `rangeLimit` gets no more than that many ranges
+    // (github#56); which folds leave first is documented below.
+    if let Some(limit) = ctx.folding_range_limit {
+        truncate_folding_ranges(&mut lsp_ranges, limit as usize);
+    }
 
     if lsp_ranges.is_empty() {
         Ok(None)
     } else {
         Ok(Some(lsp_ranges))
     }
+}
+
+/// Trims the response to the client's `rangeLimit`. The folds that leave first
+/// are the deepest ones: collapsing an outer fold hides the inner ones anyway,
+/// so the outer skeleton — regions, procedures — survives the cut. Among equals
+/// the shorter fold leaves first (it hides fewer lines), then the later one.
+fn truncate_folding_ranges(ranges: &mut Vec<LspFoldingRange>, limit: usize) {
+    if ranges.len() <= limit {
+        return;
+    }
+
+    let depths = folding_depths(ranges);
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&index| {
+        let range = &ranges[index];
+        (depths[index], std::cmp::Reverse(range.end_line - range.start_line), range.start_line)
+    });
+
+    let mut keep: Vec<usize> = order[..limit].to_vec();
+    keep.sort_unstable();
+    let kept: Vec<LspFoldingRange> = keep.into_iter().map(|index| ranges[index].clone()).collect();
+
+    tracing::info!(
+        limit,
+        kept = kept.len(),
+        dropped = ranges.len() - kept.len(),
+        "folding ranges truncated to the client's rangeLimit"
+    );
+    *ranges = kept;
+}
+
+/// How deeply each fold is nested. A stack of open ends: a fold stays an
+/// ancestor while its end is not before the current fold's end. For properly
+/// nested ranges this is exactly the number of ancestors; when ranges cross, an
+/// evicted ancestor is not counted, so the depth reads as the number of *open*
+/// enveloping folds — a lower bound, which is all the cut order needs.
+fn folding_depths(ranges: &[LspFoldingRange]) -> Vec<u32> {
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&index| {
+        (ranges[index].start_line, std::cmp::Reverse(ranges[index].end_line))
+    });
+
+    let mut depths = vec![0u32; ranges.len()];
+    let mut open_ends: Vec<u32> = Vec::new();
+    for index in order {
+        let end_line = ranges[index].end_line;
+        while open_ends.last().is_some_and(|&open_end| open_end < end_line) {
+            open_ends.pop();
+        }
+        depths[index] = open_ends.len() as u32;
+        open_ends.push(end_line);
+    }
+    depths
 }
 
 pub fn handle_hover(ctx: &LatencyRequestContext, params: HoverParams) -> Result<Option<Hover>> {
@@ -1471,6 +1529,7 @@ pub fn handle_document_diagnostic(
         &ide_diagnostics,
         ctx.position_encoding,
         crate::lsp::to_proto::CodeDescriptions::from_client_support(ctx.supports_code_description),
+        ctx.supports_diagnostic_tags,
     );
 
     Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
@@ -1738,6 +1797,7 @@ fn workspace_report_item(
             crate::lsp::to_proto::CodeDescriptions::from_client_support(
                 ctx.supports_code_description,
             ),
+            ctx.supports_diagnostic_tags,
         );
         (result_id, Some(lsp))
     }));
@@ -1958,17 +2018,6 @@ fn convert_folding_range_kind(kind: IdeFoldingRangeKind) -> LspFoldingRangeKind 
         IdeFoldingRangeKind::Region => LspFoldingRangeKind::Region,
         IdeFoldingRangeKind::Comment => LspFoldingRangeKind::Comment,
     }
-}
-
-fn folding_range_lines(line_index: &LineIndex, range: ide::TextRange) -> Option<(u32, u32)> {
-    if range.is_empty() {
-        return None;
-    }
-
-    let start_line = line_index.try_line_col(range.start())?.line;
-    let end_offset = range.end() - TextSize::from(1);
-    let end_line = line_index.try_line_col(end_offset)?.line;
-    (end_line > start_line).then_some((start_line, end_line))
 }
 
 fn convert_completion_item(item: ide::CompletionItem, adjust_indentation: bool) -> CompletionItem {
@@ -2399,6 +2448,7 @@ mod tests {
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
             supports_code_description: state.supports_code_description,
+            supports_diagnostic_tags: state.supports_diagnostic_tags,
             diagnostics_baseline: std::sync::Arc::clone(&state.diagnostics_baseline),
             diagnostics_config: state.diagnostics_config.clone(),
             position_encoding: state.position_encoding,
@@ -2406,6 +2456,7 @@ mod tests {
                 .supports_insert_text_mode_adjust_indentation,
             supports_workspace_edit_document_changes: state
                 .supports_workspace_edit_document_changes,
+            folding_range_limit: state.folding_range_limit,
             task_sender: state.task_pool.pool.sender.clone(),
             call_hierarchy_index: state.call_hierarchy_index.ensure(),
             call_hierarchy_wait_policy: state.call_hierarchy_wait_policy,
@@ -2428,6 +2479,7 @@ mod tests {
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
             supports_code_description: state.supports_code_description,
+            supports_diagnostic_tags: state.supports_diagnostic_tags,
             diagnostics_baseline: std::sync::Arc::clone(&state.diagnostics_baseline),
             diagnostics_config: state.diagnostics_config.clone(),
             position_encoding: state.position_encoding,
@@ -2435,6 +2487,7 @@ mod tests {
                 .supports_insert_text_mode_adjust_indentation,
             supports_workspace_edit_document_changes: state
                 .supports_workspace_edit_document_changes,
+            folding_range_limit: state.folding_range_limit,
             task_sender: state.task_pool.pool.sender.clone(),
             call_hierarchy_index: state.call_hierarchy_index.ensure(),
             call_hierarchy_wait_policy: state.call_hierarchy_wait_policy,
@@ -2543,8 +2596,9 @@ mod tests {
         name: &str,
     ) -> hir::MethodId {
         let file_id = state.vfs_file_for_url(fixture.uri).expect("source file is registered");
-        let offset =
-            TextSize::from(fixture.source.find(name).expect("method name is present") as u32);
+        let offset = line_index::TextSize::from(
+            fixture.source.find(name).expect("method name is present") as u32,
+        );
         let db = state.analysis_host.raw_database();
         let definition = Semantics::new(db)
             .symbol_at(file_id, offset)
@@ -3435,8 +3489,19 @@ mod tests {
         file_name: &str,
         source: &str,
     ) -> Vec<(u32, u32, Option<LspFoldingRangeKind>)> {
+        folding_answer(file_name, source, None).unwrap_or_default()
+    }
+
+    /// Сырой ответ хендлера: `None` — это пустой ответ (`null`), и его нельзя
+    /// путать с присутствующим пустым списком.
+    fn folding_answer(
+        file_name: &str,
+        source: &str,
+        limit: Option<u32>,
+    ) -> Option<Vec<(u32, u32, Option<LspFoldingRangeKind>)>> {
         let mut state = create_test_state();
         state.init_empty_source_root();
+        state.folding_range_limit = limit;
 
         let uri = lsp_types::Url::parse(&format!("file:///{file_name}")).unwrap();
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
@@ -3458,12 +3523,12 @@ mod tests {
             partial_result_params: Default::default(),
         };
 
-        handle_folding_range(&ctx, params)
-            .unwrap()
-            .unwrap()
-            .iter()
-            .map(|range| (range.start_line, range.end_line, range.kind.clone()))
-            .collect()
+        handle_folding_range(&ctx, params).unwrap().map(|ranges| {
+            ranges
+                .iter()
+                .map(|range| (range.start_line, range.end_line, range.kind.clone()))
+                .collect()
+        })
     }
 
     const FOLDING_COMMENT_SOURCE: &str = r#"#Область ПрограммныйИнтерфейс
@@ -3528,6 +3593,74 @@ mod tests {
                 (3, 4, Some(LspFoldingRangeKind::Comment)),
             ]
         );
+    }
+
+    /// `rangeLimit` — не подсказка «сколько получится»: ответ урезается, и на
+    /// контрольном входе без лимита видно, что режется именно он.
+    #[test]
+    fn folding_range_is_truncated_to_the_client_range_limit() {
+        let source = "Процедура П1()\n\
+                      Сообщить(1);\n\
+                      КонецПроцедуры\n\
+                      Процедура П2()\n\
+                      Сообщить(2);\n\
+                      КонецПроцедуры\n\
+                      Процедура П3()\n\
+                      Сообщить(3);\n\
+                      КонецПроцедуры";
+
+        assert_eq!(
+            folding_lines_for("folding_limit_all.bsl", source),
+            vec![(0, 2, None), (3, 5, None), (6, 8, None)]
+        );
+        assert_eq!(
+            folding_answer("folding_limit_two.bsl", source, Some(2)),
+            Some(vec![(0, 2, None), (3, 5, None)])
+        );
+        // Лимит выше ответа не режет ничего, а нулевой лимит — это именно
+        // пустой ответ (`null`), а не присутствующий пустой список.
+        assert_eq!(
+            folding_answer("folding_limit_ten.bsl", source, Some(10)),
+            Some(vec![(0, 2, None), (3, 5, None), (6, 8, None)])
+        );
+        assert_eq!(folding_answer("folding_limit_zero.bsl", source, Some(0)), None);
+    }
+
+    /// Политика урезания: первыми уходят самые глубоко вложенные складки —
+    /// внешний каркас переживает лимит.
+    #[test]
+    fn range_limit_drops_the_deepest_fold_first() {
+        let mut ranges = vec![fold(0, 19), fold(1, 10), fold(2, 9), fold(11, 12)];
+
+        truncate_folding_ranges(&mut ranges, 3);
+
+        assert_eq!(fold_pairs(&ranges), vec![(0, 19), (1, 10), (11, 12)]);
+    }
+
+    /// При равной глубине уходит самая короткая складка: она скрывает меньше
+    /// строк.
+    #[test]
+    fn range_limit_drops_the_shortest_fold_at_equal_depth() {
+        let mut ranges = vec![fold(0, 5), fold(10, 12), fold(20, 30)];
+
+        truncate_folding_ranges(&mut ranges, 2);
+
+        assert_eq!(fold_pairs(&ranges), vec![(0, 5), (20, 30)]);
+    }
+
+    fn fold(start_line: u32, end_line: u32) -> LspFoldingRange {
+        LspFoldingRange {
+            start_line,
+            start_character: None,
+            end_line,
+            end_character: None,
+            kind: None,
+            collapsed_text: None,
+        }
+    }
+
+    fn fold_pairs(ranges: &[LspFoldingRange]) -> Vec<(u32, u32)> {
+        ranges.iter().map(|range| (range.start_line, range.end_line)).collect()
     }
 
     fn setup_code_action_doc(source: &str) -> (GlobalState, lsp_types::Url) {

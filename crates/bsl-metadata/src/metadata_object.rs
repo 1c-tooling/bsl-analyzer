@@ -471,6 +471,10 @@ pub struct MetadataObject {
     pub register_records: Vec<(MdoType, Name)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<Uuid>,
+    #[serde(default)]
+    pub object_belonging: crate::ObjectBelonging,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended_configuration_object: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -707,6 +711,9 @@ pub enum AttributeType {
     /// the platform catalogue by stripping the XML namespace prefix
     /// (`v8ui:`, `mxl:`, `d5p1:`, …) and looking the local name up there.
     PlatformNamed(String),
+    /// A type name preserved from XML when this build cannot resolve it. Keeping the
+    /// source token lets metadata consumers report an honest partial type description.
+    UnknownNamed(String),
     Unknown,
 }
 
@@ -723,6 +730,7 @@ impl AttributeType {
                 stdx::heap::vec_bytes::<AttributeType>(types.len())
                     + types.iter().map(AttributeType::estimated_heap_size).sum::<usize>()
             }
+            Self::UnknownNamed(name) => name.capacity(),
             Self::String { .. }
             | Self::Number { .. }
             | Self::Boolean
@@ -813,6 +821,8 @@ impl MetadataObject {
             constant_type: None,
             register_records: Vec::new(),
             uuid: None,
+            object_belonging: crate::ObjectBelonging::Own,
+            extended_configuration_object: None,
         }
     }
 
@@ -835,6 +845,8 @@ impl MetadataObject {
             constant_type: None,
             register_records: Vec::new(),
             uuid: None,
+            object_belonging: crate::ObjectBelonging::Own,
+            extended_configuration_object: None,
         }
     }
 
@@ -858,6 +870,8 @@ impl MetadataObject {
             constant_type: None,
             register_records: Vec::new(),
             uuid: None,
+            object_belonging: crate::ObjectBelonging::Own,
+            extended_configuration_object: None,
         }
     }
 
@@ -888,9 +902,15 @@ impl MetadataObject {
         }
 
         for tabular_section in &overlay.tabular_sections {
-            self.tabular_sections
-                .retain(|existing| !existing.name().eq_ignore_ascii_case(tabular_section.name()));
-            self.tabular_sections.push(tabular_section.clone());
+            if let Some(base_section) = self
+                .tabular_sections
+                .iter_mut()
+                .find(|existing| existing.name().eq_ignore_ascii_case(tabular_section.name()))
+            {
+                base_section.apply_extension_overlay(tabular_section);
+            } else {
+                self.tabular_sections.push(tabular_section.clone());
+            }
         }
 
         for child in &overlay.children {
@@ -923,6 +943,29 @@ impl MetadataObject {
 
     pub fn uuid(&self) -> Option<&Uuid> {
         self.uuid.as_ref()
+    }
+
+    pub fn object_belonging(&self) -> crate::ObjectBelonging {
+        self.object_belonging
+    }
+
+    pub fn extends_uuid(&self) -> Option<&Uuid> {
+        self.extended_configuration_object.as_ref()
+    }
+
+    pub fn set_object_belonging(&mut self, value: crate::ObjectBelonging) {
+        self.object_belonging = value;
+    }
+
+    pub fn set_extends_uuid(&mut self, value: Uuid) {
+        self.extended_configuration_object = Some(value);
+    }
+
+    pub fn adopts(&self, base: &MetadataObject) -> bool {
+        self.object_belonging == crate::ObjectBelonging::Adopted
+            && self.mdo_type == base.mdo_type
+            && self.name.eq_ignore_ascii_case(&base.name)
+            && base.uuid.as_ref().is_some_and(|uuid| Some(uuid) == self.extends_uuid())
     }
 
     pub fn set_uuid(&mut self, uuid: Uuid) {
@@ -1070,6 +1113,7 @@ impl std::fmt::Display for AttributeType {
             }
             Self::Platform(pvt) => write!(f, "{}", pvt.russian_name()),
             Self::PlatformNamed(name) => write!(f, "{}", name),
+            Self::UnknownNamed(name) => write!(f, "{}", name),
             Self::Unknown => write!(f, "Неизвестно"),
         }
     }

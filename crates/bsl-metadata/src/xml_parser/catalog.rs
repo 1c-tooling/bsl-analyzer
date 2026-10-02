@@ -197,6 +197,10 @@ fn parse_metadata_object_xml(xml: &str, mdo_type: MdoType) -> Result<MetadataObj
             ),
         }
     }
+    mdo.set_object_belonging(properties.object_belonging);
+    if let Some(uuid) = properties.extended_configuration_object {
+        mdo.set_extends_uuid(uuid);
+    }
     if mdo_type == MdoType::Document {
         mdo.set_register_records(parse_register_records(props_node));
     }
@@ -423,6 +427,26 @@ mod tests {
             mdo.uuid().map(|u| u.to_string()),
             Some("d11b89e1-90a2-47e7-b43f-7f231ec64b2f".to_string())
         );
+    }
+
+    #[test]
+    fn adopted_document_parses_target_uuid_without_inventing_own_token() {
+        let mdo = parse_document_xml(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+                <Document uuid="d11b89e1-90a2-47e7-b43f-7f231ec64b2f">
+                    <Properties>
+                        <Name>Заказ</Name>
+                        <ObjectBelonging>Adopted</ObjectBelonging>
+                        <ExtendedConfigurationObject>9de71b46-e9bf-4b0b-8f3c-4abcd6a385de</ExtendedConfigurationObject>
+                    </Properties>
+                </Document>
+            </MetaDataObject>"#,
+        )
+        .unwrap();
+
+        assert_eq!(mdo.object_belonging(), crate::ObjectBelonging::Adopted);
+        assert_eq!(mdo.extends_uuid().unwrap().to_string(), "9de71b46-e9bf-4b0b-8f3c-4abcd6a385de");
+        assert_eq!(mdo.uuid().unwrap().to_string(), "d11b89e1-90a2-47e7-b43f-7f231ec64b2f");
     }
 
     fn code_attr_type(mdo: &crate::metadata_object::MetadataObject) -> &AttributeType {

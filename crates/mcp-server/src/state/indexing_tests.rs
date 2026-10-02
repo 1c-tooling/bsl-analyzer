@@ -339,6 +339,7 @@ fn reference_actor(
                 } else {
                     Ok(if hit {
                         vec![LexicalHit {
+                            source_span: None,
                             collection: "platform".into(),
                             root_id: "".into(),
                             path: "platform://fixture".into(),
@@ -365,6 +366,7 @@ fn reference_actor(
                 } else {
                     Ok(if hit {
                         vec![SemanticHit {
+                            source_span: None,
                             collection: "platform".into(),
                             root_id: "".into(),
                             path: "platform://fixture".into(),
@@ -394,6 +396,7 @@ fn reference_actor(
                         text: "Needle documentation".into(),
                         content_hash: "fixture".into(),
                         graph_context: None,
+                        source_span: None,
                     }]
                 } else {
                     vec![]

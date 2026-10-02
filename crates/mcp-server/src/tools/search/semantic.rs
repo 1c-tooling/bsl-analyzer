@@ -90,6 +90,20 @@ pub(super) fn semantic_code_hits(
             return Ok(CodeHits::Unavailable(SemanticUnavailable::NotConfigured));
         }
 
+        // SQLite can still serve lexical rows when a persisted profile claim belongs to a
+        // different embedding input. Its native vector index is then intentionally empty;
+        // refuse before embedding the query so an empty semantic result cannot look complete.
+        // The store compatibility check keeps unclaimed legacy wire-model caches accepted.
+        if matches!(&workspace_search_mode, WorkspaceSearchMode::SqliteLocal)
+            && !engine.embedding_profile_matches().unwrap_or(false)
+        {
+            return Ok(CodeHits::Unavailable(SemanticUnavailable::IdentityMismatch(
+                "semantic skipped: stored vectors do not match the current embedding profile; \
+                 restore the matching profile or rebuild the local semantic index"
+                    .to_owned(),
+            )));
+        }
+
         // Best-effort identity gate, kept under the guard and *before* the embed: the reader's
         // query vectors are only comparable against the baseline's stored vectors if both were
         // produced by the same embedding model/dimension. A mismatch means the embed could never
@@ -101,7 +115,7 @@ pub(super) fn semantic_code_hits(
         if let Some(source) = external_baseline.as_ref() {
             match source.embedding_identity(cancel) {
                 Ok(Some((baseline_model, baseline_dim))) => {
-                    let reader_model = engine.embedding_model().unwrap_or("unset");
+                    let reader_model = engine.embedding_storage_identity().unwrap_or("unset");
                     let reader_dim = engine.embedding_dimension();
                     if reader_model != baseline_model || reader_dim != Some(baseline_dim) {
                         let reader_dim = reader_dim
@@ -147,7 +161,7 @@ pub(super) fn semantic_code_hits(
         (
             engine.embedder_clone(),
             engine.workspace_roots().cloned(),
-            engine.embedding_model().map(str::to_owned),
+            engine.embedding_storage_identity().map(str::to_owned),
             engine.embedding_dimension(),
         )
     };
@@ -424,7 +438,8 @@ mod tests {
     use super::super::types::{CodeHits, DirectResult, SemanticUnavailable};
     use super::{merge_direct_semantic_with_refill, semantic_code_hits};
     use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
-    use bsl_search::{EmbedderConfig, SearchConfig, SearchEngine};
+    use bsl_search::{Chunk, ChunkKind, EmbedderConfig, SearchConfig, SearchEngine, Store};
+    use rusqlite::Connection;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
@@ -550,5 +565,142 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, CodeHits::Unavailable(SemanticUnavailable::EmbeddingFailed(_))));
+    }
+
+    #[test]
+    fn foreign_local_profile_degrades_before_query_embedding_and_preserves_legacy_blobs() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let db_path = workspace.join("workspace-search.db");
+        std::fs::write(
+            workspace.join("CommonModule.bsl"),
+            "Процедура ПроверитьИНН()\nКонецПроцедуры",
+        )
+        .unwrap();
+        let chunk = Chunk {
+            kind: ChunkKind::Procedure,
+            name: "ПроверитьИНН".to_owned(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: 1,
+            line_end: 2,
+            text: "Процедура ПроверитьИНН()\nКонецПроцедуры".to_owned(),
+        };
+        let mut store = Store::open(&db_path).unwrap();
+        store
+            .reindex_file(
+                "",
+                "CommonModule.bsl",
+                b"same-file",
+                &[chunk],
+                Some(&[vec![1.0, 0.0, 0.0]]),
+            )
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('embedding_profile_identity', 'profile-v1:foreign')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('embedding_profile_dimension', '3')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let stored_blobs = || {
+            let connection = Connection::open(&db_path).unwrap();
+            let mut statement = connection
+                .prepare("SELECT embedding FROM chunks WHERE embedding IS NOT NULL ORDER BY id")
+                .unwrap();
+            let blobs = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            blobs
+        };
+        let before = stored_blobs();
+        assert_eq!(before.len(), 1);
+
+        let config = SearchConfig {
+            embedder: EmbedderConfig {
+                base_url: "http://127.0.0.1:1".to_owned(),
+                model: "current-model".to_owned(),
+                dim: Some(3),
+                query_prefix: "current-query".to_owned(),
+                document_prefix: "current-document".to_owned(),
+                ..EmbedderConfig::default()
+            },
+            ..SearchConfig::default()
+        };
+        let mut engine = SearchEngine::new(&db_path, config).unwrap();
+        engine.set_workspace_root(workspace);
+        assert!(!engine.embedding_profile_matches().unwrap());
+
+        let result = super::super::hybrid::hybrid_code(
+            &crate::state::shared_engine(Some(engine)),
+            &Arc::new(Mutex::new(SemanticRuntimeStatus::Ready)),
+            WorkspaceSearchMode::SqliteLocal,
+            None,
+            None,
+            &bsl_search::IndexProgress::new(),
+            "ПроверитьИНН",
+            10,
+            usize::MAX,
+        )
+        .unwrap();
+        let body = result.structured_content.as_ref().expect("structured response");
+        assert!(body["degraded"]
+            .as_str()
+            .unwrap()
+            .contains("stored vectors do not match the current embedding profile"));
+        assert_eq!(body["freshness"]["completeness"]["status"], "partial");
+        assert!(body["freshness"]["completeness"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason["code"] == "modality_degraded"));
+        let hits = body["hits"].as_array().unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit["modality"] == "L"));
+        assert_eq!(stored_blobs(), before, "foreign-profile refusal must preserve BLOBs");
+
+        // Old stores without a profile claim still follow the wire-alias compatibility rule.
+        let legacy_path = workspace.join("legacy-search.db");
+        let mut legacy_store = Store::open(&legacy_path).unwrap();
+        legacy_store
+            .reindex_file(
+                "",
+                "CommonModule.bsl",
+                b"same-file",
+                &[Chunk {
+                    kind: ChunkKind::Procedure,
+                    name: "ПроверитьИНН".to_owned(),
+                    is_export: false,
+                    annotations: Vec::new(),
+                    line_start: 1,
+                    line_end: 2,
+                    text: "Процедура ПроверитьИНН()\nКонецПроцедуры".to_owned(),
+                }],
+                Some(&[vec![1.0, 0.0, 0.0]]),
+            )
+            .unwrap();
+        drop(legacy_store);
+        let legacy_config = SearchConfig {
+            embedder: EmbedderConfig {
+                base_url: "http://127.0.0.1:1".to_owned(),
+                model: "legacy-wire-alias".to_owned(),
+                dim: Some(3),
+                ..EmbedderConfig::default()
+            },
+            ..SearchConfig::default()
+        };
+        let legacy_engine = SearchEngine::new(&legacy_path, legacy_config).unwrap();
+        assert!(legacy_engine.embedding_profile_matches().unwrap());
     }
 }

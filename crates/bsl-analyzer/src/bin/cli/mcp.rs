@@ -741,6 +741,7 @@ fn daemon_command(
     workspace_cache: &mcp_server::WorkspaceCacheLayout,
     args: &McpServeArgs,
     topology_fp: u64,
+    embedding_prefixes: &mcp_server::EmbeddingPrefixes,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(executable);
     cmd.arg("mcp")
@@ -777,7 +778,123 @@ fn daemon_command(
         cmd.env("BSL_ONEC_PASSWORD", &args.onec_password);
     }
     cmd.env(mcp_server::broker::TOPOLOGY_FP_ENV, topology_fp.to_string());
+    cmd.env(mcp_server::broker::EMBEDDING_QUERY_PREFIX_ENV, &embedding_prefixes.query);
+    cmd.env(mcp_server::broker::EMBEDDING_DOCUMENT_PREFIX_ENV, &embedding_prefixes.document);
+    cmd.env_remove(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV);
+    cmd.env_remove(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV);
+    cmd.env_remove(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV);
+    if let Some(profile) = &embedding_prefixes.token_profile {
+        cmd.env(
+            mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV,
+            profile.max_input_tokens.to_string(),
+        );
+        cmd.env(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV, &profile.tokenizer_file);
+        cmd.env(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV, &profile.tokenizer_sha256);
+    }
     cmd
+}
+
+fn resolve_embedding_prefixes(
+    source_dir: Option<&Path>,
+) -> Result<mcp_server::EmbeddingPrefixes, Box<dyn Error + Send + Sync>> {
+    let frozen_query = env::var(mcp_server::broker::EMBEDDING_QUERY_PREFIX_ENV).ok();
+    let frozen_document = env::var(mcp_server::broker::EMBEDDING_DOCUMENT_PREFIX_ENV).ok();
+    let frozen = frozen_query.zip(frozen_document);
+    if let Some((query, document)) = frozen.as_ref() {
+        return frozen_embedding_prefixes(
+            query,
+            document,
+            [
+                env::var_os(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV),
+                env::var_os(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV),
+                env::var_os(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV),
+            ],
+        );
+    }
+    let config = source_dir.map(project_model::Project::new).transpose()?;
+    let embedding = config.as_ref().map(|project| &project.config.search.baseline.embedding);
+    let query_env = env::var("EMBEDDING_QUERY_PREFIX").ok();
+    let document_env = env::var("EMBEDDING_DOCUMENT_PREFIX").ok();
+    let mut profile = resolve_embedding_prefix_values(
+        embedding,
+        query_env.as_deref(),
+        document_env.as_deref(),
+        frozen.as_ref().map(|(query, document)| (query.as_str(), document.as_str())),
+    );
+    profile.token_profile = resolve_token_profile(config.as_ref(), source_dir)?;
+    Ok(profile)
+}
+
+fn frozen_embedding_prefixes(
+    query: &str,
+    document: &str,
+    frozen_profile: [Option<std::ffi::OsString>; 3],
+) -> Result<mcp_server::EmbeddingPrefixes, Box<dyn Error + Send + Sync>> {
+    let mut prefixes = resolve_embedding_prefix_values(None, None, None, Some((query, document)));
+    // The launcher froze the whole input profile, so neither the project file nor the
+    // ambient environment may add a token profile the launcher did not key on.
+    prefixes.token_profile =
+        resolve_token_profile_values(None, None, frozen_profile, [None, None, None])?;
+    Ok(prefixes)
+}
+
+fn resolve_embedding_prefix_values(
+    config: Option<&project_model::SearchEmbeddingConfig>,
+    query_environment: Option<&str>,
+    document_environment: Option<&str>,
+    frozen: Option<(&str, &str)>,
+) -> mcp_server::EmbeddingPrefixes {
+    if let Some((query, document)) = frozen {
+        return mcp_server::EmbeddingPrefixes {
+            query: query.to_owned(),
+            document: document.to_owned(),
+            token_profile: None,
+        };
+    }
+    let query = match config {
+        Some(config) => config.resolve_query_prefix(query_environment),
+        None => query_environment.unwrap_or_default().to_owned(),
+    };
+    let document = match config {
+        Some(config) => config.resolve_document_prefix(document_environment),
+        None => document_environment.unwrap_or_default().to_owned(),
+    };
+    mcp_server::EmbeddingPrefixes { query, document, token_profile: None }
+}
+
+fn resolve_token_profile(
+    project: Option<&project_model::Project>,
+    workspace: Option<&Path>,
+) -> Result<Option<mcp_server::EmbeddingTokenProfile>, Box<dyn Error + Send + Sync>> {
+    resolve_token_profile_values(
+        project,
+        workspace,
+        [
+            env::var_os(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV),
+            env::var_os(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV),
+            env::var_os(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV),
+        ],
+        [
+            env::var_os("EMBEDDING_MAX_INPUT_TOKENS"),
+            env::var_os("EMBEDDING_TOKENIZER_FILE"),
+            env::var_os("EMBEDDING_TOKENIZER_SHA256"),
+        ],
+    )
+}
+
+fn resolve_token_profile_values(
+    project: Option<&project_model::Project>,
+    workspace: Option<&Path>,
+    frozen: [Option<std::ffi::OsString>; 3],
+    environment: [Option<std::ffi::OsString>; 3],
+) -> Result<Option<mcp_server::EmbeddingTokenProfile>, Box<dyn Error + Send + Sync>> {
+    mcp_server::resolve_embedding_token_profile_values(
+        project.map(|project| &project.config),
+        workspace,
+        frozen,
+        environment,
+    )
+    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
 }
 
 fn run_mcp_broker(
@@ -793,19 +910,26 @@ fn run_mcp_broker(
     })?;
 
     let topology_fp = mcp_server::broker::workspace_topology_fingerprint(&source_dir);
+    let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
     let key = mcp_server::broker::BackendKey::new(
         &source_dir,
         workspace_cache.root(),
         profile,
-        mcp_server::broker::embedding_config_fingerprint(),
+        mcp_server::broker::embedding_config_fingerprint_with_prefixes(&embedding_prefixes),
         topology_fp,
         mcp_server::contract::effective_opt_in(profile, &args.enable_tools),
     );
 
     // Credentials travel via env rather than argv, while source/cache and the frozen
     // topology are propagated exactly so proxy and daemon derive one backend key.
-    let cmd =
-        daemon_command(&env::current_exe()?, &source_dir, &workspace_cache, args, topology_fp);
+    let cmd = daemon_command(
+        &env::current_exe()?,
+        &source_dir,
+        &workspace_cache,
+        args,
+        topology_fp,
+        &embedding_prefixes,
+    );
 
     tracing::info!(?source_dir, "Starting MCP broker proxy");
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -856,11 +980,12 @@ fn run_mcp_broker_required(
     let expected_pid = args.backend_pid.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "--mode broker-required requires --backend-pid")
     })?;
+    let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
     let key = mcp_server::broker::BackendKey::new(
         &source_dir,
         workspace_cache.root(),
         profile,
-        mcp_server::broker::embedding_config_fingerprint(),
+        mcp_server::broker::embedding_config_fingerprint_with_prefixes(&embedding_prefixes),
         mcp_server::broker::workspace_topology_fingerprint(&source_dir),
         mcp_server::contract::effective_opt_in(profile, &args.enable_tools),
     );
@@ -890,11 +1015,12 @@ fn run_mcp_daemon(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| mcp_server::broker::workspace_topology_fingerprint(&source_dir));
+    let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
     let key = mcp_server::broker::BackendKey::new(
         &source_dir,
         workspace_cache.root(),
         profile,
-        mcp_server::broker::embedding_config_fingerprint(),
+        mcp_server::broker::embedding_config_fingerprint_with_prefixes(&embedding_prefixes),
         topology_fp,
         mcp_server::contract::effective_opt_in(profile, &inputs.enable_tools),
     );
@@ -1302,9 +1428,13 @@ fn build_server(
             let source_dir = source_dir.canonicalize().unwrap_or(source_dir);
             let workspace_cache = workspace_cache
                 .unwrap_or_else(|| mcp_server::WorkspaceCacheLayout::for_workspace(&source_dir));
-            let mut state =
-                mcp_server::SharedState::workspace_with_cache(source_dir, workspace_cache)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
+            let mut state = mcp_server::SharedState::workspace_with_cache_and_prefixes(
+                source_dir,
+                workspace_cache,
+                Some(embedding_prefixes),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             if let Some(ref url) = onec_url {
                 tracing::info!(%url, "Configuring 1C HTTP client");
                 state.set_onec_client(onec_client::Client::new(url, &onec_user, &onec_password));
@@ -1469,10 +1599,11 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_command, decode_password, resolve_onec_password, resolve_serve_mode_with_override,
-        resolve_workspace_cache, validate_backend_pid, validate_onec_settings, validate_serve_args,
-        warn_on_wildcard_allowlist, HttpServeOptions, McpCommand, McpProfileCli, McpServeArgs,
-        McpServeMode, ServeModeContext,
+        daemon_command, decode_password, frozen_embedding_prefixes,
+        resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
+        resolve_token_profile_values, resolve_workspace_cache, validate_backend_pid,
+        validate_onec_settings, validate_serve_args, warn_on_wildcard_allowlist, HttpServeOptions,
+        McpCommand, McpProfileCli, McpServeArgs, McpServeMode, ServeModeContext,
     };
     use clap::Parser;
     use std::io;
@@ -1483,6 +1614,219 @@ mod tests {
     struct ServeCli {
         #[command(flatten)]
         args: McpServeArgs,
+    }
+
+    #[test]
+    fn embedding_prefix_resolution_honors_project_empty_and_frozen_pair() {
+        let config = project_model::SearchEmbeddingConfig {
+            query_prefix: Some(String::new()),
+            document_prefix: None,
+            ..Default::default()
+        };
+        let resolved = resolve_embedding_prefix_values(
+            Some(&config),
+            Some("environment query"),
+            Some("environment document"),
+            None,
+        );
+        assert_eq!(resolved.query, "");
+        assert_eq!(resolved.document, "environment document");
+
+        let frozen = resolve_embedding_prefix_values(
+            Some(&config),
+            Some("environment query"),
+            Some("environment document"),
+            Some(("frozen query", "frozen document")),
+        );
+        assert_eq!(frozen.query, "frozen query");
+        assert_eq!(frozen.document, "frozen document");
+    }
+
+    #[test]
+    fn token_profile_resolution_honors_origins_and_rejects_partial_or_zero_profiles() {
+        use std::ffi::OsString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("tokenizer.json");
+        std::fs::write(
+            &artifact,
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"document":1,"query":2,"extra":3,"hello":4},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        let project_config = dir.path().join("bsl-analyzer.toml");
+        std::fs::write(
+            &project_config,
+            "[search.baseline.embedding]\nmaxInputTokens = 8192\ntokenizerFile = \"tokenizer.json\"\ntokenizerSha256 = \"a58e529fb53e63963f904605eee152d54676591a555ca3072b51bdb680e993c9\"\n",
+        )
+        .unwrap();
+        let project = project_model::Project::new(dir.path()).unwrap();
+        let env = [
+            Some(OsString::from("4096")),
+            Some(OsString::from("elsewhere/tokenizer.json")),
+            Some(OsString::from(
+                "a58e529fb53e63963f904605eee152d54676591a555ca3072b51bdb680e993c9",
+            )),
+        ];
+        let resolved =
+            resolve_token_profile_values(Some(&project), Some(dir.path()), [None, None, None], env)
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved.max_input_tokens, 8192);
+        assert_eq!(resolved.tokenizer_file, artifact.canonicalize().unwrap());
+        assert_eq!(
+            resolved.tokenizer_sha256,
+            "a58e529fb53e63963f904605eee152d54676591a555ca3072b51bdb680e993c9"
+        );
+
+        let environment_profile = resolve_token_profile_values(
+            None,
+            Some(dir.path()),
+            [None, None, None],
+            [
+                Some(OsString::from("4096")),
+                Some(OsString::from("tokenizer.json")),
+                Some(OsString::from(
+                    "a58e529fb53e63963f904605eee152d54676591a555ca3072b51bdb680e993c9",
+                )),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(environment_profile.max_input_tokens, 4096);
+        assert_eq!(environment_profile.tokenizer_file, artifact.canonicalize().unwrap());
+        assert_eq!(
+            environment_profile.tokenizer_sha256,
+            "a58e529fb53e63963f904605eee152d54676591a555ca3072b51bdb680e993c9"
+        );
+
+        let partial = resolve_token_profile_values(
+            None,
+            Some(dir.path()),
+            [None, None, None],
+            [Some(OsString::from("8192")), None, None],
+        )
+        .unwrap_err();
+        assert_eq!(partial.to_string(), "embedding_invalid_config");
+
+        let zero = resolve_token_profile_values(
+            None,
+            Some(dir.path()),
+            [None, None, None],
+            [Some(OsString::from("0")), None, None],
+        )
+        .unwrap_err();
+        assert_eq!(zero.to_string(), "embedding_invalid_config");
+
+        let missing = resolve_token_profile_values(
+            None,
+            Some(dir.path()),
+            [None, None, None],
+            [
+                Some(OsString::from("8192")),
+                Some(OsString::from("missing-tokenizer.json")),
+                Some(OsString::from("hash")),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(missing.to_string(), "embedding_invalid_config");
+        assert!(!missing.to_string().contains("missing-tokenizer.json"));
+
+        assert!(resolve_token_profile_values(
+            None,
+            Some(dir.path()),
+            [None, None, None],
+            [None, None, None]
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// The broker keys the backend on the profile it resolved and hands the daemon only the
+    /// frozen environment. A daemon that rebuilt a different profile from that environment
+    /// would bind under another key and serve with another token policy.
+    #[test]
+    fn daemon_rebuilds_the_broker_token_profile_from_its_frozen_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"document":1,"query":2,"extra":3,"hello":4},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bsl-analyzer.toml"),
+            "[search.baseline.embedding]\nmaxInputTokens = 8192\ntokenizerFile = \"tokenizer.json\"\ntokenizerSha256 = \"a58e529fb53e63963f904605eee152d54676591a555ca3072b51bdb680e993c9\"\n",
+        )
+        .unwrap();
+        let project = project_model::Project::new(dir.path()).unwrap();
+        let broker = mcp_server::EmbeddingPrefixes {
+            query: "query: ".to_owned(),
+            document: "document: ".to_owned(),
+            token_profile: resolve_token_profile_values(
+                Some(&project),
+                Some(dir.path()),
+                [None, None, None],
+                [None, None, None],
+            )
+            .unwrap(),
+        };
+        assert!(broker.token_profile.is_some(), "the fixture must configure a token profile");
+        let source = dir.path().canonicalize().unwrap();
+        let cache = mcp_server::WorkspaceCacheLayout::for_workspace(&source);
+        let command = daemon_command(
+            PathBuf::from("bsl-analyzer").as_path(),
+            &source,
+            &cache,
+            &serve_args(McpServeMode::Broker, None),
+            42,
+            &broker,
+        );
+        let frozen = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        };
+
+        let daemon = frozen_embedding_prefixes(
+            &frozen(mcp_server::broker::EMBEDDING_QUERY_PREFIX_ENV).unwrap().to_string_lossy(),
+            &frozen(mcp_server::broker::EMBEDDING_DOCUMENT_PREFIX_ENV).unwrap().to_string_lossy(),
+            [
+                frozen(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV),
+                frozen(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV),
+                frozen(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV),
+            ],
+        )
+        .unwrap();
+
+        let profile =
+            daemon.token_profile.as_ref().expect("the daemon must keep the token profile");
+        assert!(profile.token_policy.is_some(), "the daemon must load the frozen tokenizer");
+        let expected = broker.token_profile.as_ref().unwrap();
+        assert_eq!(profile.max_input_tokens, expected.max_input_tokens);
+        assert_eq!(profile.tokenizer_file, expected.tokenizer_file);
+        assert_eq!(profile.tokenizer_sha256, expected.tokenizer_sha256);
+        assert_eq!(
+            mcp_server::broker::embedding_config_fingerprint_with_prefixes(&daemon),
+            mcp_server::broker::embedding_config_fingerprint_with_prefixes(&broker),
+        );
+
+        let without_profile =
+            mcp_server::EmbeddingPrefixes { token_profile: None, ..broker.clone() };
+        let command = daemon_command(
+            PathBuf::from("bsl-analyzer").as_path(),
+            &source,
+            &cache,
+            &serve_args(McpServeMode::Broker, None),
+            42,
+            &without_profile,
+        );
+        assert!(command.get_envs().any(|(name, value)| name
+            == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV)
+            && value.is_none()));
+        assert!(frozen_embedding_prefixes("query: ", "document: ", [None, None, None])
+            .unwrap()
+            .token_profile
+            .is_none());
     }
 
     #[test]
@@ -2207,6 +2551,16 @@ mod tests {
         .unwrap();
         let mut args = serve_args(McpServeMode::Broker, None);
         args.cache_dir = Some(PathBuf::from("кеш с пробелом"));
+        let embedding_prefixes = mcp_server::EmbeddingPrefixes {
+            query: "query: ".to_owned(),
+            document: "document: ".to_owned(),
+            token_profile: Some(mcp_server::EmbeddingTokenProfile {
+                max_input_tokens: 8192,
+                tokenizer_file: cache.root().join("tokenizer.json"),
+                tokenizer_sha256: "abc123".to_owned(),
+                token_policy: None,
+            }),
+        };
 
         let command = daemon_command(
             PathBuf::from("bsl-analyzer").as_path(),
@@ -2214,12 +2568,33 @@ mod tests {
             &cache,
             &args,
             42,
+            &embedding_prefixes,
         );
         let argv = command.get_args().map(PathBuf::from).collect::<Vec<_>>();
         let flag = argv.iter().position(|arg| arg == "--cache-dir").unwrap();
 
         assert!(argv[flag + 1].is_absolute());
         assert_eq!(argv[flag + 1], cache.root());
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_QUERY_PREFIX_ENV)
+                && value == Some(std::ffi::OsStr::new("query: "))
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_DOCUMENT_PREFIX_ENV)
+                && value == Some(std::ffi::OsStr::new("document: "))
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV)
+                && value == Some(std::ffi::OsStr::new("8192"))
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV)
+                && value == Some(cache.root().join("tokenizer.json").as_os_str())
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV)
+                && value == Some(std::ffi::OsStr::new("abc123"))
+        }));
     }
 
     /// Without the flag the child must derive the default itself. Handing it the resolved
@@ -2238,6 +2613,7 @@ mod tests {
             &cache,
             &args,
             42,
+            &mcp_server::EmbeddingPrefixes::default(),
         );
         let argv = command.get_args().map(PathBuf::from).collect::<Vec<_>>();
 
@@ -2263,6 +2639,7 @@ mod tests {
             &cache,
             &args,
             42,
+            &mcp_server::EmbeddingPrefixes::default(),
         );
         let argv: Vec<String> =
             command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();

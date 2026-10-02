@@ -225,6 +225,10 @@ impl Configuration {
 
     #[allow(dead_code)]
     fn build_caches(&mut self) {
+        // Preserve the effective same-name MDO choices made by overlay merging.
+        // Raw configurations have first-wins entries here; an overlay may have
+        // intentionally redirected a key to an independent extension object.
+        let previous_metadata_object_index = std::mem::take(&mut self.metadata_objects_by_key);
         self.uri_to_module.clear();
         self.uri_lower_to_common_module.clear();
         self.name_to_common_module.clear();
@@ -236,7 +240,6 @@ impl Configuration {
         self.name_to_http_service.clear();
         self.name_to_web_service.clear();
         self.name_to_integration_service.clear();
-        self.metadata_objects_by_key.clear();
         self.recorders_by_register.clear();
 
         for (idx, object) in self.metadata_objects.iter().enumerate() {
@@ -244,6 +247,15 @@ impl Configuration {
             self.metadata_objects_by_key
                 .entry((object.mdo_type, NormName::intern(&object.name)))
                 .or_insert(idx);
+        }
+        for (key, idx) in previous_metadata_object_index {
+            if self
+                .metadata_objects
+                .get(idx)
+                .is_some_and(|object| (object.mdo_type, NormName::intern(&object.name)) == key)
+            {
+                self.metadata_objects_by_key.insert(key, idx);
+            }
         }
 
         for (idx, module) in self.common_modules.iter().enumerate() {
@@ -377,14 +389,29 @@ impl Configuration {
     }
 
     pub fn merge_extension_overlay(&mut self, extension: &Configuration) {
-        for ext_obj in &extension.metadata_objects {
-            if let Some(base_obj) = self.metadata_objects.iter_mut().find(|obj| {
-                obj.mdo_type == ext_obj.mdo_type && obj.name.eq_ignore_ascii_case(&ext_obj.name)
-            }) {
-                base_obj.apply_extension_overlay(ext_obj);
-            } else {
-                self.add_metadata_object(ext_obj.clone());
+        for ext_module in &extension.common_modules {
+            if ext_module.object_belonging() == crate::ObjectBelonging::Adopted {
+                if let Some(base_module) = self.common_modules.iter_mut().find(|module| {
+                    Some(module.uuid()) == ext_module.extends_uuid()
+                        && module.name().eq_ignore_ascii_case(ext_module.name())
+                }) {
+                    base_module.apply_extension_overlay(ext_module);
+                    continue;
+                }
             }
+            self.add_common_module(ext_module.clone());
+        }
+
+        for ext_obj in &extension.metadata_objects {
+            if let Some(base_obj) = self.metadata_objects.iter_mut().find(|obj| ext_obj.adopts(obj))
+            {
+                base_obj.apply_extension_overlay(ext_obj);
+                continue;
+            }
+            let idx = self.metadata_objects.len();
+            self.add_metadata_object(ext_obj.clone());
+            self.metadata_objects_by_key
+                .insert((ext_obj.mdo_type, NormName::intern(&ext_obj.name)), idx);
         }
 
         for ext_reg in &extension.registers {
@@ -844,8 +871,12 @@ mod tests {
 
     #[test]
     fn merge_extension_overlay_preserves_base_and_adds_extension_attributes() {
+        use crate::enums::ObjectBelonging;
+
         let mut base = Configuration::new("Base");
         let mut base_catalog = MetadataObject::new(MdoType::Catalog, "Номенклатура");
+        let base_uuid = uuid::Uuid::new_v4();
+        base_catalog.set_uuid(base_uuid);
         base_catalog.add_attribute(crate::metadata_object::Attribute {
             name: "Родитель".to_string(),
             name_en: Some("Parent".to_string()),
@@ -858,6 +889,8 @@ mod tests {
 
         let mut extension = Configuration::new("Extension");
         let mut extension_catalog = MetadataObject::new(MdoType::Catalog, "Номенклатура");
+        extension_catalog.set_object_belonging(ObjectBelonging::Adopted);
+        extension_catalog.set_extends_uuid(base_uuid);
         extension_catalog.add_attribute(crate::metadata_object::Attribute {
             name: "БУС_Артикул".to_string(),
             name_en: None,
@@ -871,6 +904,198 @@ mod tests {
 
         assert!(catalog.find_attribute("Родитель").is_some());
         assert!(catalog.find_attribute("БУС_Артикул").is_some());
+    }
+
+    #[test]
+    fn adopted_common_module_inherits_omitted_reuse_but_own_same_name_does_not() {
+        use crate::enums::{ObjectBelonging, ReturnValueReuse};
+
+        let mut base = Configuration::new("Base");
+        let base_module = CommonModule::builder()
+            .name("Shared")
+            .return_values_reuse(ReturnValueReuse::DontUse)
+            .build();
+        let base_uuid = *base_module.uuid();
+        base.add_common_module(base_module);
+
+        let mut adopted = Configuration::new("Adopted");
+        adopted.add_common_module(
+            CommonModule::builder()
+                .name("Shared")
+                .object_belonging(ObjectBelonging::Adopted)
+                .extends_uuid(base_uuid)
+                .build(),
+        );
+        let inherited = base.merged_with_extension(&adopted);
+        assert_eq!(
+            inherited.find_common_module("Shared").unwrap().return_values_reuse(),
+            ReturnValueReuse::DontUse,
+        );
+
+        let mut explicit = Configuration::new("Explicit");
+        explicit.add_common_module(
+            CommonModule::builder()
+                .name("Shared")
+                .object_belonging(ObjectBelonging::Adopted)
+                .extends_uuid(base_uuid)
+                .return_values_reuse(ReturnValueReuse::DuringSession)
+                .build(),
+        );
+        let overridden = base.merged_with_extension(&explicit);
+        assert_eq!(
+            overridden.find_common_module("Shared").unwrap().return_values_reuse(),
+            ReturnValueReuse::DuringSession,
+        );
+
+        let mut independent = Configuration::new("Independent");
+        independent.add_common_module(CommonModule::builder().name("Shared").build());
+        let not_merged = base.merged_with_extension(&independent);
+        assert_eq!(
+            not_merged.find_common_module("Shared").unwrap().return_values_reuse(),
+            ReturnValueReuse::Unknown,
+        );
+    }
+
+    #[test]
+    fn adopted_metadata_object_merges_by_uuid_and_same_name_own_object_stays_independent() {
+        use crate::enums::ObjectBelonging;
+        use crate::metadata_object::Attribute;
+
+        let base_uuid = uuid::Uuid::new_v4();
+        let mut base = Configuration::new("Base");
+        let mut document = MetadataObject::new(MdoType::Document, "Заказ");
+        document.set_uuid(base_uuid);
+        let mut base_lines =
+            crate::tabular_section::TabularSection::new(uuid::Uuid::new_v4(), "Товары");
+        base_lines.set_attributes(vec![crate::tabular_section::TabularSectionAttribute::new(
+            uuid::Uuid::new_v4(),
+            "Номенклатура",
+            AttributeType::Unknown,
+        )]);
+        document.add_tabular_section(base_lines);
+        document.add_attribute(Attribute {
+            name: "Основание".into(),
+            name_en: None,
+            attr_type: AttributeType::Boolean,
+        });
+        base.add_metadata_object(document);
+
+        let mut extension = Configuration::new("Extension");
+        let mut adopted = MetadataObject::new(MdoType::Document, "Заказ");
+        adopted.set_object_belonging(ObjectBelonging::Adopted);
+        adopted.set_extends_uuid(base_uuid);
+        let mut overlay_lines =
+            crate::tabular_section::TabularSection::new(uuid::Uuid::new_v4(), "Товары");
+        overlay_lines.set_attributes(vec![crate::tabular_section::TabularSectionAttribute::new(
+            uuid::Uuid::new_v4(),
+            "Характеристика",
+            AttributeType::Unknown,
+        )]);
+        adopted.add_tabular_section(overlay_lines);
+        adopted.add_attribute(Attribute {
+            name: "НомерВнешнегоЗаказа".into(),
+            name_en: None,
+            attr_type: AttributeType::String { length: Some(20) },
+        });
+        extension.add_metadata_object(adopted);
+
+        let merged = base.merged_with_extension(&extension);
+        let object = merged.find_metadata_object(MdoType::Document, "Заказ").unwrap();
+        assert!(object.find_attribute("Основание").is_some());
+        assert!(object.find_attribute("НомерВнешнегоЗаказа").is_some());
+        let columns = object.tabular_sections[0]
+            .attributes()
+            .iter()
+            .map(|attribute| attribute.name())
+            .collect::<Vec<_>>();
+        assert!(columns.contains(&"Номенклатура"));
+        assert!(columns.contains(&"Характеристика"));
+
+        let mut independent = Configuration::new("Independent");
+        let mut own = MetadataObject::new(MdoType::Document, "Заказ");
+        own.add_attribute(Attribute {
+            name: "СвоеПоле".into(),
+            name_en: None,
+            attr_type: AttributeType::String { length: Some(20) },
+        });
+        independent.add_metadata_object(own);
+        let separate = base.merged_with_extension(&independent);
+        assert_eq!(separate.metadata_objects().len(), 2);
+        assert!(separate.metadata_objects()[0].find_attribute("СвоеПоле").is_none());
+        assert!(separate.metadata_objects()[1].find_attribute("Основание").is_none());
+        assert!(separate
+            .find_metadata_object(MdoType::Document, "Заказ")
+            .unwrap()
+            .find_attribute("СвоеПоле")
+            .is_some());
+        let second_extension = Configuration::new("SecondExtension");
+        let after_second_merge = separate.merged_with_extension(&second_extension);
+        assert!(
+            after_second_merge
+                .find_metadata_object(MdoType::Document, "Заказ")
+                .unwrap()
+                .find_attribute("СвоеПоле")
+                .is_some(),
+            "a later unrelated extension must preserve the earlier effective object"
+        );
+    }
+
+    /// Enums and constants are parsed outside the shared MDO property reader, so
+    /// they must carry their extension ownership too: an adopted copy that lost it
+    /// would replace the base object instead of extending it.
+    #[test]
+    fn adopted_enum_and_constant_parsed_from_xml_extend_the_base_object() {
+        use crate::xml_parser::{parse_constant_xml, parse_enum_xml};
+
+        fn mdo(kind: &str, uuid: &str, name: &str, ownership: &str, body: &str) -> String {
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema"><{kind} uuid="{uuid}"><Properties><Name>{name}</Name>{ownership}</Properties>{body}</{kind}></MetaDataObject>"#
+            )
+        }
+        let base_uuid = "11111111-1111-1111-1111-111111111111";
+        let adopted = format!(
+            "<ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>{base_uuid}</ExtendedConfigurationObject>"
+        );
+        let value = |name: &str| {
+            format!(
+                r#"<ChildObjects><EnumValue uuid="{name}"><Properties><Name>{name}</Name></Properties></EnumValue></ChildObjects>"#
+            )
+        };
+
+        let mut base = Configuration::new("Base");
+        base.add_metadata_object(
+            parse_enum_xml(&mdo("Enum", base_uuid, "Статусы", "", &value("А"))).unwrap(),
+        );
+        base.add_metadata_object(
+            parse_constant_xml(&mdo(
+                "Constant",
+                base_uuid,
+                "Флаг",
+                "<Type><v8:Type>xs:boolean</v8:Type></Type>",
+                "",
+            ))
+            .unwrap(),
+        );
+
+        let ext_uuid = "22222222-2222-2222-2222-222222222222";
+        let mut extension = Configuration::new("Extension");
+        extension.add_metadata_object(
+            parse_enum_xml(&mdo("Enum", ext_uuid, "Статусы", &adopted, &value("В"))).unwrap(),
+        );
+        extension.add_metadata_object(
+            parse_constant_xml(&mdo("Constant", ext_uuid, "Флаг", &adopted, "")).unwrap(),
+        );
+
+        let merged = base.merged_with_extension(&extension);
+        assert_eq!(merged.metadata_objects().len(), 2, "adopted objects must not be duplicated");
+        let statuses = merged.find_metadata_object(MdoType::Enum, "Статусы").unwrap();
+        assert!(statuses.find_enum_value("А").is_some(), "base enum value must survive");
+        assert!(statuses.find_enum_value("В").is_some(), "extension enum value must be added");
+        assert_eq!(
+            merged.find_metadata_object(MdoType::Constant, "Флаг").unwrap().constant_type,
+            Some(AttributeType::Boolean),
+            "base constant type must survive an adopted copy without <Type>"
+        );
     }
 
     #[test]
@@ -1058,14 +1283,20 @@ mod tests {
 
     #[test]
     fn overlay_merge_rebuilds_recorder_cache() {
+        use crate::enums::ObjectBelonging;
+
         let doc_name = "Документ1";
         let mut base = Configuration::new("Base");
         let mut base_document = MetadataObject::new(MdoType::Document, doc_name);
+        let base_uuid = uuid::Uuid::new_v4();
+        base_document.set_uuid(base_uuid);
         base_document.set_register_records(vec![(MdoType::InformationRegister, "A".to_string())]);
         base.add_metadata_object(base_document);
 
         let mut extension = Configuration::new("Extension");
         let mut overlay_document = MetadataObject::new(MdoType::Document, doc_name);
+        overlay_document.set_object_belonging(ObjectBelonging::Adopted);
+        overlay_document.set_extends_uuid(base_uuid);
         overlay_document
             .set_register_records(vec![(MdoType::InformationRegister, "B".to_string())]);
         extension.add_metadata_object(overlay_document);

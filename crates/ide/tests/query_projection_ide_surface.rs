@@ -36,7 +36,8 @@ fn var_ty(db: &RootDatabaseImpl, file_id: FileId, var_lower: &str) -> Option<Typ
 fn projection_fields_visible_via_hir_type_accessors() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Выборка = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя").Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя");
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выборка;
 КонецФункции
 "#;
@@ -55,7 +56,8 @@ fn projection_fields_visible_via_hir_type_accessors() {
 fn projection_fields_surface_in_enumerate_fields() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Выборка = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя, 42 КАК Цена").Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя, 42 КАК Цена");
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выборка;
 КонецФункции
 "#;
@@ -223,7 +225,8 @@ fn completion_on_projection_selection_lists_columns_and_platform_members() {
     let items = complete(
         r#"//- /test.bsl
 Функция Тест()
-    Выборка = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя, 42 КАК Цена").Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя, 42 КАК Цена");
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выборка.$0;
 КонецФункции
 "#,
@@ -248,7 +251,8 @@ fn completion_on_inline_query_union_receiver_lists_projection_columns() {
     let items = complete(
         r#"//- /test.bsl
 Функция Тест()
-    Возврат Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя").Выполнить().Выбрать().$0;
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя");
+    Возврат ЗапросОбъект.Выполнить().Выбрать().$0;
 КонецФункции
 "#,
     );
@@ -267,7 +271,8 @@ fn completion_on_inline_query_union_receiver_lists_projection_columns() {
 fn hover_on_inline_query_union_receiver_field_renders_type() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Возврат Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя").Выполнить().Выбрать().Им$0я;
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя");
+    Возврат ЗапросОбъект.Выполнить().Выбрать().Им$0я;
 КонецФункции
 "#;
     let (analysis, file_id, offset) = hover_baseline_setup(fixture);
@@ -286,7 +291,8 @@ fn hover_on_projection_none_omits_fields_block() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
     Текст = ПолучитьТекстЗапроса();
-    Выборка = Новый Запрос(Текст).Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос(Текст);
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выб$0орка;
 КонецФункции
 "#;
@@ -305,7 +311,8 @@ fn hover_on_projection_none_omits_fields_block() {
 fn hover_on_projection_selection_lists_field_names() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Выборка = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя").Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ""abc"" КАК Имя");
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выб$0орка;
 КонецФункции
 "#;
@@ -316,7 +323,8 @@ fn hover_on_projection_selection_lists_field_names() {
 fn hover_on_projection_selection_renders_cast_precision_and_scale() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Выборка = Новый Запрос("ВЫБРАТЬ ВЫРАЗИТЬ(0 КАК Число(15, 2)) КАК Цена").Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ВЫРАЗИТЬ(0 КАК Число(15, 2)) КАК Цена");
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выб$0орка;
 КонецФункции
 "#;
@@ -327,7 +335,8 @@ fn hover_on_projection_selection_renders_cast_precision_and_scale() {
 fn hover_on_projection_selection_renders_cast_string_length() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Выборка = Новый Запрос("ВЫБРАТЬ ВЫРАЗИТЬ("""" КАК Строка(50)) КАК Имя").Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ВЫРАЗИТЬ("""" КАК Строка(50)) КАК Имя");
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выб$0орка;
 КонецФункции
 "#;
@@ -356,7 +365,8 @@ fn hover_on_iteration_row_from_batched_helper_renders_cast_precision() {
 fn hover_on_projection_selection_renders_cast_precision_only_number() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
-    Выборка = Новый Запрос("ВЫБРАТЬ ВЫРАЗИТЬ(0 КАК Число(15)) КАК Сумма").Выполнить().Выбрать();
+    ЗапросОбъект = Новый Запрос("ВЫБРАТЬ ВЫРАЗИТЬ(0 КАК Число(15)) КАК Сумма");
+    Выборка = ЗапросОбъект.Выполнить().Выбрать();
     Возврат Выб$0орка;
 КонецФункции
 "#;

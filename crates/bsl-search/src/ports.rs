@@ -53,6 +53,11 @@ pub trait ModuleSnapshotSource: Send + Sync {
 pub trait EmbeddingGenerator {
     fn model_id(&self) -> &str;
 
+    /// Claim for the storage layout this input generator requires. Legacy generators need none.
+    fn token_layout_claim(&self) -> Option<&str> {
+        None
+    }
+
     fn dimension(&self) -> usize;
 
     fn batch_ranges(
@@ -144,6 +149,16 @@ pub trait EmbeddingStore {
         _dimension: usize,
     ) -> Result<(), SearchError> {
         Ok(())
+    }
+
+    /// Pin or validate the opt-in source-part layout before any snapshot or vector writes.
+    fn ensure_token_layout_claim(
+        &self,
+        _layout_version: &str,
+        _claim: &str,
+    ) -> Result<(), SearchError> {
+        Err(crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingInvalidConfig)
+            .into())
     }
 }
 

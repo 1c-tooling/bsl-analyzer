@@ -22,7 +22,6 @@ use crate::{
     semantic_key_for_indexed_document, semantic_text_for_indexed_document,
     BaselineOverlaySearchService, BaselineRef, CorpusId,
 };
-use code_chunk::Chunker;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -57,6 +56,7 @@ pub struct SearchHit {
     pub line_start: u32,
     pub line_end: u32,
     pub score: f32,
+    pub source_span: Option<crate::SourceSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +90,7 @@ impl SearchHit {
             line_start: hit.line_start,
             line_end: hit.line_end,
             score: hit.rank,
+            source_span: hit.source_span.clone(),
         }
     }
 
@@ -104,6 +105,7 @@ impl SearchHit {
             line_end: self.line_end,
             text: self.text.clone(),
             rank: self.score,
+            source_span: self.source_span.clone(),
         }
     }
 
@@ -117,6 +119,7 @@ impl SearchHit {
             line_start: self.line_start,
             line_end: self.line_end,
             score: self.score,
+            source_span: self.source_span.clone(),
         }
     }
 
@@ -131,6 +134,7 @@ impl SearchHit {
             line_start: hit.line_start,
             line_end: hit.line_end,
             score: hit.score,
+            source_span: hit.source_span,
         }
     }
 }
@@ -155,6 +159,7 @@ pub struct WorkspaceRootsTransitionSeed {
     serves_external_baseline: bool,
     manifest: HashMap<FileKey, String>,
     graph_context_provider: Option<Arc<dyn crate::ports::GraphContextProvider>>,
+    embedder: Option<Embedder>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -181,6 +186,7 @@ struct PlannedWorkspaceFile {
     graph_contexts: Vec<Option<String>>,
     documents: Vec<crate::IndexedDocument>,
     embedding_inputs: Vec<String>,
+    source_spans: Vec<Option<crate::SourceSpan>>,
     manifest_fingerprint: String,
 }
 
@@ -318,25 +324,22 @@ impl WorkspaceRootsTransitionSeed {
                 unread_files.push(PlannedUnreadWorkspaceFile { key, identity });
                 continue;
             };
-            let chunks = Chunker::chunk(content);
-            let mut documents: Vec<crate::IndexedDocument> = Vec::with_capacity(chunks.len());
-            for chunk in &chunks {
-                let (document, context_failed) = crate::document::indexed_document_for_chunk(
-                    &key,
-                    chunk,
-                    self.graph_context_provider.as_deref(),
-                );
-                // A transition applied without some contexts would publish files that no mark
-                // owes a render; the plan fails instead and its owner retries the transition.
-                if context_failed {
-                    return Err(SearchError::Index(format!(
-                        "graph context unavailable for {}; root transition deferred",
-                        key.path
-                    )));
-                }
-                documents.push(document);
+            let (documents, context_failed) = crate::document::prepare_indexed_documents(
+                &key,
+                content,
+                self.graph_context_provider.as_deref(),
+                self.embedder.as_ref(),
+            )?;
+            // A transition applied without some contexts would publish files that no mark
+            // owes a render; the plan fails instead and its owner retries the transition.
+            if context_failed {
+                return Err(SearchError::Index(format!(
+                    "graph context unavailable for {}; root transition deferred",
+                    key.path
+                )));
             }
-            let graph_contexts = documents.iter().map(|doc| doc.graph_context.clone()).collect();
+            let (chunks, graph_contexts, source_spans) =
+                crate::document::chunks_contexts_and_spans(&documents);
             let embedding_inputs =
                 documents.iter().map(crate::document::semantic_text_for_indexed_document).collect();
             files.push(PlannedWorkspaceFile {
@@ -347,6 +350,7 @@ impl WorkspaceRootsTransitionSeed {
                 graph_contexts,
                 documents,
                 embedding_inputs,
+                source_spans,
                 manifest_fingerprint: crate::workspace_overlay::fingerprint_content(
                     content, &key.path,
                 ),
@@ -555,6 +559,13 @@ impl SearchEngine {
         };
         let dim = embedder_config.dim.unwrap_or(1024);
         let embedder = Embedder::new(embedder_config);
+        if let Err(error) = Self::ensure_store_token_layout_claim(&store, &embedder) {
+            if Self::is_token_layout_mismatch(&error) {
+                drop(store);
+                return Self::fts_only_fenced(db_path, &mut apply);
+            }
+            return Err(error);
+        }
 
         let (index, built_generation, identity_verified) =
             Self::load_or_build_index_unpublished(&store, dim, Some(&embedder))?;
@@ -660,7 +671,7 @@ impl SearchEngine {
                 ) {
                     Ok(opened) => opened,
                     Err(error) if crate::store::sqlite_bootstrap_retryable(&error) => {
-                        return ControlFlow::Continue(Ok(OpenAttempt::Retry(error)))
+                        return ControlFlow::Continue(Ok(OpenAttempt::Retry(error)));
                     }
                     Err(error) => return ControlFlow::Continue(Err(error)),
                 };
@@ -811,7 +822,7 @@ impl SearchEngine {
                 return Ok((index, None, true));
             }
         }
-        let (generation, data, stored) = store.load_index_embedding_snapshot(dim)?;
+        let (generation, data, stored) = Self::load_index_snapshot(store, dim, embedder)?;
         #[cfg(test)]
         CONSTRUCTOR_APPLY_ACTIVE.with(|active| {
             assert!(!active.get(), "HNSW build ran inside the constructor apply callback")
@@ -822,6 +833,64 @@ impl SearchEngine {
         observed.outcome = Outcome::Completed;
         observed.emit(false);
         Ok((index, Some(generation), stored == 0))
+    }
+
+    fn load_index_snapshot(
+        store: &Store,
+        dim: usize,
+        embedder: Option<&Embedder>,
+    ) -> Result<crate::store::IndexEmbeddingSnapshot, SearchError> {
+        let Some(embedder) = embedder else {
+            return store.load_index_embedding_snapshot(dim);
+        };
+        match store.load_index_embedding_snapshot_for_profile_with_token_layout(
+            embedder.model_id(),
+            dim,
+            embedder.token_layout_claim(),
+        ) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(SearchError::Index(message)) if message == "embedding profile mismatch" => {
+                tracing::warn!(
+                    "semantic vectors are unavailable for the current embedding profile"
+                );
+                Ok((
+                    store.embedding_generation()?,
+                    Vec::new(),
+                    store.stored_embedding_count()?.max(1),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn ensure_store_token_layout_claim(
+        store: &Store,
+        embedder: &Embedder,
+    ) -> Result<(), SearchError> {
+        if let Some(claim) = embedder.token_layout_claim() {
+            store.ensure_token_layout_claim(crate::token_policy::SEGMENTATION_VERSION, claim)?;
+        }
+        Ok(())
+    }
+
+    fn is_token_layout_mismatch(error: &SearchError) -> bool {
+        matches!(error, SearchError::Index(message) if message == "token layout mismatch")
+    }
+
+    fn load_embeddings_for_profile(
+        store: &Store,
+        embedder: &Embedder,
+        dim: usize,
+    ) -> Result<crate::store::EmbeddingsSnapshot, SearchError> {
+        if store.embedding_profile_matches(embedder.model_id(), dim)? {
+            store.load_all_embeddings_with_profile_and_token_layout(
+                embedder.model_id(),
+                dim,
+                embedder.token_layout_claim(),
+            )
+        } else {
+            Err(SearchError::Index("embedding profile mismatch".to_owned()))
+        }
     }
 
     /// Build the vector index from SQLite and persist it (best-effort) when persistence applies.
@@ -886,7 +955,10 @@ impl SearchEngine {
         if let Some(token) = progress {
             token.phase(IndexPhase::Persisting);
         }
-        let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
+        let (generation, data) = match embedder {
+            Some(embedder) => Self::load_embeddings_for_profile(store, embedder, dim)?,
+            None => store.load_all_embeddings_with_generation(dim)?,
+        };
         let index = VectorIndex::build(dim, &data)?;
         if let Some(mut prepared) =
             Self::prepare_built_with_progress(store, dim, embedder, &index, generation, progress)
@@ -953,7 +1025,7 @@ impl SearchEngine {
         dim: usize,
         embedder: Option<&'a Embedder>,
     ) -> Option<crate::vector_persist::PersistKey<'a>> {
-        let model_id = embedder?.model();
+        let model_id = embedder?.model_id();
         if store.db_path() == Path::new(":memory:") {
             return None;
         }
@@ -1057,6 +1129,13 @@ impl SearchEngine {
         };
         let dim = embedder_config.dim.unwrap_or(1024);
         let embedder = Embedder::new(embedder_config);
+        if let Err(error) = Self::ensure_store_token_layout_claim(&store, &embedder) {
+            if Self::is_token_layout_mismatch(&error) {
+                drop(store);
+                return Self::fts_only_fenced(db_path, &mut apply);
+            }
+            return Err(error);
+        }
         let index = VectorIndex::new(dim)?;
         let loaded_reference_fingerprint = store.reference_collection_fingerprint("platform")?;
 
@@ -1199,6 +1278,8 @@ impl SearchEngine {
                 "Cannot generate embeddings: embedder not configured. Set EMBEDDING_URL.".into(),
             )
         })?;
+        let model_id = embedder.model_id().to_owned();
+        let dimension = embedder.dimension();
 
         let mut tasks: Vec<FileTask> = Vec::new();
         let mut total_chunks = 0usize;
@@ -1219,26 +1300,19 @@ impl SearchEngine {
             let (_, reason) = self.observed_file_hash(key, hash.as_bytes())?;
             if reason == Reason::Unchanged { continue; }
 
-            let chunks = Chunker::chunk(&content);
+            let (documents, context_owed) = crate::document::prepare_indexed_documents(
+                key,
+                &content,
+                self.graph_context_provider.as_deref(),
+                Some(embedder),
+            )?;
+            let (chunks, graph_contexts, source_spans) =
+                crate::document::chunks_contexts_and_spans(&documents);
             if chunks.is_empty() {
                 continue;
             }
-
-            let provider = self.graph_context_provider.as_deref();
-            let mut context_owed = false;
-            let docs: Vec<crate::IndexedDocument> = chunks
-                .iter()
-                .map(|c| {
-                    let (document, failed) =
-                        crate::document::indexed_document_for_chunk(key, c, provider);
-                    context_owed |= failed;
-                    document
-                })
-                .collect();
             let texts: Vec<String> =
-                docs.iter().map(crate::document::semantic_text_for_indexed_document).collect();
-            let graph_contexts: Vec<Option<String>> =
-                docs.iter().map(|d| d.graph_context.clone()).collect();
+                documents.iter().map(crate::document::semantic_text_for_indexed_document).collect();
 
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             let ranges = embedder.batch_ranges(&refs, self.batch_size)?;
@@ -1252,6 +1326,7 @@ impl SearchEngine {
                 ranges,
                 graph_contexts,
                 context_owed,
+                source_spans,
             });
         }
 
@@ -1318,6 +1393,7 @@ impl SearchEngine {
                             chunks: task.chunks,
                             graph_contexts: task.graph_contexts,
                             context_owed: task.context_owed,
+                            source_spans: task.source_spans,
                             embeddings: match error {
                                 None => Ok(embeddings),
                                 Some(e) => Err(e),
@@ -1344,13 +1420,17 @@ impl SearchEngine {
         while let Ok(result) = result_rx.recv() {
             match result.embeddings {
                 Ok(embeddings) => {
-                    if let Err(error) = lifecycle::with_reason(result.reason, || self.store.reindex_file_with_context(
+                    if let Err(error) = lifecycle::with_reason(result.reason, || self.store.reindex_file_with_identity_and_source_spans(
                         &result.key.root_id,
                         &result.key.path,
                         &result.hash,
                         &result.chunks,
                         Some(&embeddings),
                         Some(&result.graph_contexts),
+                        &model_id,
+                        dimension,
+                        embedder.token_layout_claim(),
+                        &result.source_spans,
                     )) {
                         first_error.get_or_insert(error);
                         continue;
@@ -1635,21 +1715,21 @@ impl SearchEngine {
         for range in ranges {
             let batch = &items[range.clone()];
             if should_continue.is_some_and(|keep_going| !keep_going()) {
-                let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                let (_, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                 return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Released));
             }
             match Self::fenced_value_retrying(apply, || Ok(()), retry_transient)? {
                 FenceOutcome::Applied(()) => {}
                 FenceOutcome::TransientRefusal => {
-                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    let (_, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::TransientRefusal));
                 }
                 FenceOutcome::Superseded => {
-                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    let (_, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Superseded));
                 }
                 FenceOutcome::Released => {
-                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    let (_, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Released));
                 }
             }
@@ -1669,20 +1749,26 @@ impl SearchEngine {
             let pairs: Vec<_> = batch.iter().map(|(id, _)| *id).zip(embeddings).collect();
             match Self::fenced_value_retrying(
                 apply,
-                || store.set_chunk_embeddings(&pairs),
+                || {
+                    store.set_chunk_embeddings_with_token_layout(
+                        &pairs,
+                        Some((embedder.model_id(), dim)),
+                        embedder.token_layout_claim(),
+                    )
+                },
                 retry_transient,
             )? {
                 FenceOutcome::Applied(()) => embedded += pairs.len(),
                 FenceOutcome::TransientRefusal => {
-                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    let (_, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::TransientRefusal));
                 }
                 FenceOutcome::Superseded => {
-                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    let (_, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Superseded));
                 }
                 FenceOutcome::Released => {
-                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    let (_, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Released));
                 }
             }
@@ -1691,7 +1777,7 @@ impl SearchEngine {
         if let Some(progress) = progress {
             progress.phase(IndexPhase::Persisting);
         }
-        let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
+        let (generation, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
         let index = VectorIndex::build(dim, &data)?;
         if should_continue.is_some_and(|keep_going| !keep_going()) {
             return Ok((index, FenceOutcome::Released));
@@ -1793,6 +1879,10 @@ impl SearchEngine {
         let mut embedding_skipped = false;
         let lifecycle_result = lifecycle_batch.context().in_scope(|| {
             embedder.config().validate()?;
+            Self::ensure_store_token_layout_claim(store, embedder)?;
+            if !store.embedding_profile_matches(embedder.model_id(), dim)? {
+                return Err(SearchError::Index("embedding profile mismatch".to_owned()));
+            }
             let pending = store.load_pending_embedding_documents("code")?;
             lifecycle_batch.pending(pending.len() as u64);
             if pending.is_empty() {
@@ -1800,7 +1890,7 @@ impl SearchEngine {
                     p.phase(IndexPhase::Persisting);
                 }
                 embedding_skipped = true;
-                let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
+                let (generation, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
                 let index = VectorIndex::build(dim, &data)?;
                 // The sidecar is a shared artifact like any other; a caller that may no longer
                 // write leaves it to whoever may.
@@ -1936,7 +2026,11 @@ impl SearchEngine {
                     Ok(pairs) => {
                         let batch_len = pairs.len();
                         let outcome = match Self::fenced_value(apply, || {
-                            store.set_chunk_embeddings(&pairs)
+                            store.set_chunk_embeddings_with_token_layout(
+                                &pairs,
+                                Some((embedder.model_id(), dim)),
+                                embedder.token_layout_claim(),
+                            )
                         }) {
                             Ok(outcome) => outcome,
                             Err(error) => {
@@ -1990,7 +2084,7 @@ impl SearchEngine {
                 p.phase(IndexPhase::Persisting);
             }
 
-            let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
+            let (generation, data) = Self::load_embeddings_for_profile(store, embedder, dim)?;
             let index = VectorIndex::build(dim, &data)?;
             // Asked once more before the sidecar: a takeover landing after the last batch would
             // otherwise still leave this pass's index description behind for the new owner.
@@ -2037,7 +2131,7 @@ impl SearchEngine {
             match persisted {
                 FenceOutcome::Applied(()) => {}
                 FenceOutcome::TransientRefusal => {
-                    return Ok((index, FenceOutcome::TransientRefusal))
+                    return Ok((index, FenceOutcome::TransientRefusal));
                 }
                 FenceOutcome::Superseded => return Ok((index, FenceOutcome::Superseded)),
                 FenceOutcome::Released => return Ok((index, FenceOutcome::Released)),
@@ -2211,12 +2305,21 @@ impl SearchEngine {
         let (stored_hash, reason) = self.observed_file_hash(key, hash.as_bytes())?;
         let had_prior = match stored_hash {
             Some(stored_hash) if stored_hash == hash.as_bytes() => {
-                return Ok(PreparedBootFile::Unchanged)
+                return Ok(PreparedBootFile::Unchanged);
             }
             Some(_) => true,
             None => false,
         };
-        let chunks = Chunker::chunk(&content);
+        let provider =
+            if with_graph_context { self.graph_context_provider.as_deref() } else { None };
+        let (documents, context_owed) = crate::document::prepare_indexed_documents(
+            key,
+            &content,
+            provider,
+            self.embedder.as_ref(),
+        )?;
+        let (chunks, rendered_contexts, source_spans) =
+            crate::document::chunks_contexts_and_spans(&documents);
         if chunks.is_empty() {
             return Ok(if had_prior {
                 PreparedBootFile::Remove(key.clone(), reason)
@@ -2224,19 +2327,7 @@ impl SearchEngine {
                 PreparedBootFile::Unchanged
             });
         }
-        let mut context_owed = false;
-        let graph_contexts = with_graph_context.then(|| {
-            let provider = self.graph_context_provider.as_deref();
-            chunks
-                .iter()
-                .map(|chunk| {
-                    let (document, failed) =
-                        crate::document::indexed_document_for_chunk(key, chunk, provider);
-                    context_owed |= failed;
-                    document.graph_context
-                })
-                .collect()
-        });
+        let graph_contexts = with_graph_context.then_some(rendered_contexts);
         Ok(PreparedBootFile::Reindex {
             key: key.clone(),
             reason,
@@ -2244,6 +2335,7 @@ impl SearchEngine {
             chunks,
             graph_contexts,
             context_owed,
+            source_spans,
         })
     }
 
@@ -2261,7 +2353,12 @@ impl SearchEngine {
                     return ControlFlow::Break(());
                 }
                 ControlFlow::Continue(lifecycle::with_reason(*reason, || {
-                    self.store.remove_file(&key.root_id, &key.path, "code")
+                    self.store.remove_file_with_token_layout(
+                        &key.root_id,
+                        &key.path,
+                        "code",
+                        self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+                    )
                 }))
             }
             PreparedBootFile::Reindex {
@@ -2271,14 +2368,22 @@ impl SearchEngine {
                 reason,
                 graph_contexts: Some(contexts),
                 context_owed,
+                source_spans,
             } => {
                 match lifecycle::with_reason(*reason, || {
-                    self.store.reindex_file_with_context_checkpointed(
-                        key,
+                    self.store.reindex_file_in_collection_checkpointed_with_source_spans(
+                        &key.root_id,
+                        &key.path,
                         hash,
+                        "code",
                         chunks,
                         None,
                         Some(contexts),
+                        self.embedder
+                            .as_ref()
+                            .map(|embedder| (embedder.model_id(), embedder.dim())),
+                        self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+                        source_spans,
                         checkpoint,
                     )
                 }) {
@@ -2293,11 +2398,29 @@ impl SearchEngine {
                 }
             }
             PreparedBootFile::Reindex {
-                key, hash, chunks, reason, graph_contexts: None, ..
+                key,
+                hash,
+                chunks,
+                reason,
+                graph_contexts: None,
+                source_spans,
+                ..
             } => {
                 match lifecycle::with_reason(*reason, || {
-                    self.store.reindex_file_with_context_checkpointed(
-                        key, hash, chunks, None, None, checkpoint,
+                    self.store.reindex_file_in_collection_checkpointed_with_source_spans(
+                        &key.root_id,
+                        &key.path,
+                        hash,
+                        "code",
+                        chunks,
+                        None,
+                        None,
+                        self.embedder
+                            .as_ref()
+                            .map(|embedder| (embedder.model_id(), embedder.dim())),
+                        self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+                        source_spans,
+                        checkpoint,
                     )
                 }) {
                     Ok(ControlFlow::Continue(_)) => ControlFlow::Continue(Ok(())),
@@ -2339,7 +2462,7 @@ impl SearchEngine {
                         })? {
                             FenceOutcome::Applied(()) => {}
                             FenceOutcome::TransientRefusal => {
-                                return Ok(FenceOutcome::TransientRefusal)
+                                return Ok(FenceOutcome::TransientRefusal);
                             }
                             FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
                             FenceOutcome::Released => return Ok(FenceOutcome::Released),
@@ -2537,7 +2660,14 @@ impl SearchEngine {
                     None => false,
                 };
 
-                let chunks = Chunker::chunk(&content);
+                let (documents, context_owed) = crate::document::prepare_indexed_documents(
+                    key,
+                    &content,
+                    self.graph_context_provider.as_deref(),
+                    self.embedder.as_ref(),
+                )?;
+                let (chunks, graph_contexts, source_spans) =
+                    crate::document::chunks_contexts_and_spans(&documents);
                 if chunks.is_empty() {
                     // The content changed (its hash mismatched above) but now yields no chunks — the
                     // file was gutted to comments/blank while the daemon was down. Any prior chunks are
@@ -2548,16 +2678,45 @@ impl SearchEngine {
                     // so only prior-stored files are touched.
                     if had_prior {
                         lifecycle::with_reason(reason, || {
-                            self.store.remove_file(&key.root_id, &rel_path, "code")
+                            self.store.remove_file_with_token_layout(
+                                &key.root_id,
+                                &rel_path,
+                                "code",
+                                self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+                            )
                         })?;
                         indexed += 1;
                     }
                     continue;
                 }
 
-                lifecycle::with_reason(reason, || {
-                    self.store.reindex_file(&key.root_id, &rel_path, hash.as_bytes(), &chunks, None)
-                })?;
+                match lifecycle::with_reason(reason, || {
+                    let mut checkpoint = || ControlFlow::Continue(());
+                    self.store.reindex_file_in_collection_checkpointed_with_source_spans(
+                        &key.root_id,
+                        &rel_path,
+                        hash.as_bytes(),
+                        "code",
+                        &chunks,
+                        None,
+                        Some(&graph_contexts),
+                        self.embedder
+                            .as_ref()
+                            .map(|embedder| (embedder.model_id(), embedder.dim())),
+                        self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+                        &source_spans,
+                        &mut checkpoint,
+                    )
+                })? {
+                    ControlFlow::Continue(_) => {}
+                    ControlFlow::Break(()) => {
+                        unreachable!("permit-all ingest checkpoint cannot cancel")
+                    }
+                }
+                // Marked only once the rows exist, so a refresh in between cannot clear it.
+                if context_owed {
+                    self.owe_graph_contexts([key])?;
+                }
                 indexed += 1;
             }
 
@@ -2602,12 +2761,15 @@ impl SearchEngine {
 
             let embeddings = self.embed_documents(documents, progress)?;
             lifecycle::with_reason(reason, || {
-                self.store.reindex_documents(
+                self.store.reindex_documents_with_identity(
                     collection,
                     virtual_path,
                     version_hash,
                     documents,
                     embeddings.as_deref(),
+                    self.embedder
+                        .as_ref()
+                        .map(|embedder| (embedder.model_id(), embedder.dimension())),
                 )
             })?;
             if embeddings.is_some() {
@@ -2684,7 +2846,7 @@ impl SearchEngine {
         let result = (|| {
             let stamp = Self::reference_stamp(
                 fingerprint,
-                self.embedding_model(),
+                self.embedding_storage_identity(),
                 self.embedding_dimension(),
             );
             let committed = self.store.reference_collection_fingerprint(collection)?;
@@ -2736,12 +2898,13 @@ impl SearchEngine {
             } else {
                 Self::reference_stamp(fingerprint, None, None)
             };
-            let outcome = self.store.replace_reference_collection_if_stale(
+            let outcome = self.store.replace_reference_collection_with_identity(
                 collection,
                 virtual_path,
                 &stamp,
                 documents,
                 embeddings.as_deref(),
+                self.embedder.as_ref().map(|embedder| (embedder.model_id(), embedder.dimension())),
             )?;
             if self.loaded_reference_fingerprint.as_deref()
                 != Some(outcome.committed_fingerprint.as_str())
@@ -2907,6 +3070,28 @@ impl SearchEngine {
         self.embedder.as_ref().map(Embedder::model)
     }
 
+    pub fn embedding_storage_identity(&self) -> Option<&str> {
+        self.embedder.as_ref().map(Embedder::storage_identity)
+    }
+
+    /// Whether persisted local vectors may be used with this engine's embedding profile.
+    /// A matching profile claim is required for profile identities; an unclaimed legacy
+    /// wire-model id remains accepted by the store's compatibility rule.
+    pub fn embedding_profile_matches(&self) -> Result<bool, SearchError> {
+        let Some(embedder) = &self.embedder else { return Ok(false) };
+        self.store.embedding_profile_matches(embedder.storage_identity(), embedder.dim())
+    }
+
+    pub fn embedding_profile(&self) -> Option<(&str, &str, usize)> {
+        self.embedder.as_ref().and_then(|embedder| {
+            (embedder.storage_identity() != embedder.model()).then_some((
+                embedder.model(),
+                embedder.storage_identity(),
+                embedder.dim(),
+            ))
+        })
+    }
+
     pub fn embedding_dimension(&self) -> Option<usize> {
         self.embedder.as_ref().map(Embedder::dim)
     }
@@ -3050,6 +3235,7 @@ impl SearchEngine {
             serves_external_baseline: self.serves_external_baseline,
             manifest,
             graph_context_provider: self.graph_context_provider.clone(),
+            embedder: self.embedder.clone(),
         })
     }
 
@@ -3147,6 +3333,7 @@ impl SearchEngine {
                     hash: file.content_hash.clone(),
                     chunks: file.chunks.clone(),
                     graph_contexts: file.graph_contexts.clone(),
+                    source_spans: file.source_spans.clone(),
                 })
                 .collect()
         };
@@ -3187,8 +3374,10 @@ impl SearchEngine {
                 &key.path,
             )?);
         }
-        let (embedding_generation, mut embeddings) =
-            self.store.load_all_embeddings_with_generation(self.dim)?;
+        let (embedding_generation, mut embeddings) = match self.embedder.as_ref() {
+            Some(embedder) => Self::load_embeddings_for_profile(&self.store, embedder, self.dim)?,
+            None => self.store.load_all_embeddings_with_generation(self.dim)?,
+        };
         embeddings.retain(|(id, _)| !removed_chunk_ids.contains(id));
         #[cfg(test)]
         if crate::store::FORCE_WORKSPACE_TRANSITION_VECTOR_ERROR.with(std::cell::Cell::get) {
@@ -3271,6 +3460,7 @@ impl SearchEngine {
                 cleanup: &staging.cleanup,
                 tombstones: &staging.obsolete_baseline,
                 upserts: &staging.upserts,
+                token_layout_claim: self.embedder.as_ref().and_then(Embedder::token_layout_claim),
             },
             checkpoint,
         ) {
@@ -3798,7 +3988,12 @@ impl SearchEngine {
             }
         }
         self.observe_live_index("live_index_evicted", Reason::FileDeleted, Outcome::Completed);
-        self.store.remove_file(&key.root_id, &key.path, "code")?;
+        self.store.remove_file_with_token_layout(
+            &key.root_id,
+            &key.path,
+            "code",
+            self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+        )?;
         Ok(())
     }
 
@@ -4076,6 +4271,16 @@ impl SearchEngine {
             keys.sort();
 
             let mut mutations = Vec::new();
+            let token_claim = self
+                .embedder
+                .as_ref()
+                .and_then(Embedder::token_layout_claim)
+                .map(str::to_owned);
+            let token_policy = self
+                .embedder
+                .as_ref()
+                .and_then(Embedder::token_policy);
+            let mut token_replacements = Vec::new();
             let mut retained_context = false;
             if topology_changed {
                 mutations.extend(
@@ -4085,6 +4290,70 @@ impl SearchEngine {
                 );
             }
             for key in keys {
+                if token_claim.is_some() {
+                    let (Some(embedder), Some(policy), Some(roots)) = (
+                        self.embedder.as_ref(),
+                        token_policy,
+                        self.workspace_roots.as_ref(),
+                    ) else {
+                        retained_context = true;
+                        continue;
+                    };
+                    let Some(path) = roots.resolve(&key) else {
+                        retained_context = true;
+                        continue;
+                    };
+                    let content = match std::fs::read_to_string(&path) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            tracing::warn!(root = %key.root_id, path = %key.path, "context refresh source read failed; keeping dirty mark: {error}");
+                            retained_context = true;
+                            continue;
+                        }
+                    };
+                    let content_hash = blake3::hash(content.as_bytes()).as_bytes().to_vec();
+                    if self.store.file_hash(&key.root_id, &key.path)?.as_deref()
+                        != Some(content_hash.as_slice())
+                    {
+                        retained_context = true;
+                        continue;
+                    }
+                    let mut check = |input: &str| embedder.check_singleton_input(input);
+                    let documents = crate::document::prepare_file_documents_with_context(
+                        &key,
+                        &content,
+                        |chunk| match chunk.kind {
+                            code_chunk::ChunkKind::Procedure | code_chunk::ChunkKind::Function => {
+                                provider
+                                    .try_graph_context(&key.path, &chunk.name, chunk.kind.label())
+                                    .map_err(|error| SearchError::Index(error.to_string()))
+                            }
+                            code_chunk::ChunkKind::ModuleHeader => Ok(None),
+                        },
+                        policy,
+                        embedder.document_prefix(),
+                        &mut check,
+                    );
+                    let documents = match documents {
+                        Ok(documents) => documents,
+                        Err(error) => {
+                            tracing::warn!(root = %key.root_id, path = %key.path, "context refresh preparation failed; keeping dirty mark: {error}");
+                            retained_context = true;
+                            continue;
+                        }
+                    };
+                    let (chunks, contexts, spans) =
+                        crate::document::chunks_contexts_and_spans(&documents);
+                    token_replacements.push((key.clone(), content_hash, chunks, contexts, spans));
+                    lifecycle::decision(
+                        self.store.db_path(),
+                        &key,
+                        Reason::ContextChanged,
+                        None,
+                        None,
+                    );
+                    continue;
+                }
                 // A render error for ANY method of this path keeps the mark: the failure is
                 // transient (the graph DB could not be read), so the next publish must retry
                 // the whole path rather than clearing it against a half-failed render. A
@@ -4140,7 +4409,11 @@ impl SearchEngine {
             for batch in mutations.chunks(WORKSPACE_APPLY_BATCH_ROWS) {
                 let outcome = Self::fenced_checkpointed_value(apply, |checkpoint| {
                     lifecycle::with_reason(Reason::ContextChanged, || {
-                        self.store.apply_context_refresh_batch(batch, checkpoint)
+                    self.store.apply_context_refresh_batch_with_token_layout(
+                        batch,
+                        self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+                        checkpoint,
+                    )
                     })
                 })?;
                 match outcome {
@@ -4158,6 +4431,72 @@ impl SearchEngine {
                     }
                     FenceOutcome::Superseded => return Ok((stats, FenceOutcome::Superseded)),
                     FenceOutcome::Released => return Ok((stats, FenceOutcome::Released)),
+                }
+            }
+            if let Some(token_claim) = token_claim.as_deref() {
+                for (key, hash, chunks, contexts, spans) in token_replacements {
+                    let (model_id, dimension) = self
+                        .embedder
+                        .as_ref()
+                        .map(|embedder| (embedder.model_id().to_owned(), embedder.dim()))
+                        .expect("claim requires embedder");
+                    let outcome = Self::fenced_checkpointed_value(apply, |checkpoint| {
+                        let reindex = lifecycle::with_reason(Reason::ContextChanged, || {
+                            self.store.reindex_file_in_collection_checkpointed_with_source_spans(
+                                &key.root_id,
+                                &key.path,
+                                &hash,
+                                "code",
+                                &chunks,
+                                None,
+                                Some(&contexts),
+                                Some((&model_id, dimension)),
+                                Some(token_claim),
+                                &spans,
+                                checkpoint,
+                            )
+                        });
+                        match reindex {
+                            Err(error) => ControlFlow::Continue(Err(error)),
+                            Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
+                            Ok(ControlFlow::Continue(_)) => {
+                                let clear = [ContextRefreshMutation::Clear {
+                                    key: key.clone(),
+                                    seq_bound,
+                                }];
+                                match self.store.apply_context_refresh_batch_with_token_layout(
+                                    &clear,
+                                    Some(token_claim),
+                                    checkpoint,
+                                ) {
+                                    ControlFlow::Break(()) => ControlFlow::Break(()),
+                                    ControlFlow::Continue(Err(error)) => {
+                                        ControlFlow::Continue(Err(error))
+                                    }
+                                    ControlFlow::Continue(Ok(_)) => {
+                                        ControlFlow::Continue(Ok(()))
+                                    }
+                                }
+                            }
+                        }
+                    })?;
+                    match outcome {
+                        FenceOutcome::Applied(()) => {
+                            self.invalidate_semantic_coverage();
+                            stats.paths_cleared += 1;
+                            stats.chunks_updated += chunks.len();
+                            stats.cleared_embeddings += chunks.len();
+                        }
+                        FenceOutcome::TransientRefusal => {
+                            return Ok((stats, FenceOutcome::TransientRefusal));
+                        }
+                        FenceOutcome::Superseded => {
+                            return Ok((stats, FenceOutcome::Superseded));
+                        }
+                        FenceOutcome::Released => {
+                            return Ok((stats, FenceOutcome::Released));
+                        }
+                    }
                 }
             }
             let mut evidence = self.semantic_qualification.get();
@@ -4646,15 +4985,16 @@ impl SearchEngine {
         // tables on a schema mismatch. A pass has no business migrating anything.
         let store = Store::open_existing(db_path)?;
         let embedder = Embedder::new(embedder_config);
+        Self::ensure_store_token_layout_claim(&store, &embedder)?;
 
         // Seed the warm cache from the persisted overlay embedding cache so a restart reuses
         // vectors already paid for instead of re-embedding everything.
         let mut warm_embeddings = warm_embeddings;
         if warm_embeddings.is_empty() {
-            match store.load_overlay_embedding_cache(embedder.model(), embedder.dim()) {
+            match store.load_overlay_embedding_cache(embedder.model_id(), embedder.dim()) {
                 Ok(cached) if !cached.is_empty() => {
                     info!(
-                        model_id = embedder.model(),
+                        model_id = embedder.model_id(),
                         dim = embedder.dim(),
                         cached_embeddings = cached.len(),
                         "loaded persisted overlay embedding cache for standalone prime"
@@ -4668,13 +5008,14 @@ impl SearchEngine {
         let manifest_fingerprints =
             store.load_baseline_manifest_fingerprints("code")?.unwrap_or_default();
 
-        let plan = WorkspaceOverlayCache::plan_full_refresh_from_manifest(
+        let plan = WorkspaceOverlayCache::plan_full_refresh_from_manifest_with_embedder(
             &manifest_fingerprints,
             roots,
             &store,
             &warm_embeddings,
             graph_provider.as_deref(),
             distrusted,
+            Some(&embedder),
         )?;
 
         let mut new_embeddings = match Self::embed_missing_overlay_chunks(
@@ -4782,7 +5123,7 @@ impl SearchEngine {
                 apply,
                 || {
                     store.save_overlay_embedding_cache(
-                        embedder.model(),
+                        embedder.model_id(),
                         embedder.dim(),
                         &batch_persist,
                     )?;
@@ -4837,7 +5178,7 @@ impl SearchEngine {
             embedding_identity: self
                 .embedder
                 .as_ref()
-                .map(|embedder| (embedder.model().to_owned(), embedder.dim())),
+                .map(|embedder| (embedder.model_id().to_owned(), embedder.dim())),
         })
     }
 
@@ -4868,9 +5209,10 @@ impl SearchEngine {
             .embedding_identity
             .as_ref()
             .map(|(model, dim)| (model.as_str(), *dim, &embedding_cache));
-        match self.store.apply_overlay_publication(
+        match self.store.apply_overlay_publication_with_token_layout(
             staging.fingerprints.as_ref().map(|(id, rows)| (id.as_str(), rows)),
             embedding,
+            self.embedder.as_ref().and_then(Embedder::token_layout_claim),
             checkpoint,
         ) {
             Ok(ControlFlow::Break(())) => return ControlFlow::Break(()),
@@ -5000,8 +5342,12 @@ impl SearchEngine {
         let mut overlay = self.workspace_overlay_snapshot()?.overlay;
         overlay.baseline = baseline.clone();
         BaselineOverlaySearchService::new(
-            LocalStoreBaselineAdapter::workspace_code(&self.store),
-            LocalStoreBaselineAdapter::workspace_code(&self.store),
+            LocalStoreBaselineAdapter::workspace_code(&self.store).with_token_layout_claim(
+                self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+            ),
+            LocalStoreBaselineAdapter::workspace_code(&self.store).with_token_layout_claim(
+                self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+            ),
             InMemoryResolvedViewResolver,
         )
         .resolve_view(baseline, overlay)
@@ -5152,6 +5498,7 @@ impl SearchEngine {
                     line_start: info.line_start,
                     line_end: info.line_end,
                     score: result.score,
+                    source_span: info.source_span,
                 });
             }
         }
@@ -5280,6 +5627,7 @@ impl SearchEngine {
                     line_start: info.line_start,
                     line_end: info.line_end,
                     score,
+                    source_span: info.source_span,
                 });
             }
         }
@@ -5405,7 +5753,12 @@ impl SearchEngine {
             let desired: HashSet<&FileKey> = grouped.keys().collect();
             for (existing, _) in self.store.all_files_in_collection(collection)? {
                 if !desired.contains(&existing) {
-                    self.store.remove_file(&existing.root_id, &existing.path, collection)?;
+                    self.store.remove_file_with_token_layout(
+                        &existing.root_id,
+                        &existing.path,
+                        collection,
+                        self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+                    )?;
                 }
             }
 
@@ -5574,7 +5927,31 @@ impl SearchEngine {
     /// Called after a fully successful native pass and live installation, for its captured epoch.
     pub fn observe_semantic_publication(&self, epoch: u64) {
         let mut evidence = self.semantic_qualification.get();
-        if evidence.epoch == epoch && evidence.identity_verified {
+        if evidence.epoch != epoch {
+            return;
+        }
+        if !evidence.identity_verified {
+            let Some(embedder) = self.embedder.as_ref() else { return };
+            let Some(claim) = embedder.token_layout_claim() else { return };
+            let qualifies = self
+                .store
+                .embedding_profile_matches(embedder.storage_identity(), self.dim)
+                .unwrap_or(false)
+                && self.store.token_layout_claim_matches(claim).unwrap_or(false)
+                && self
+                    .store
+                    .chunk_count()
+                    .ok()
+                    .zip(self.store.embedding_count_by_collection("code").ok())
+                    .is_some_and(|(chunks, embeddings)| {
+                        chunks == embeddings && chunks == self.index.len()
+                    });
+            if !qualifies {
+                return;
+            }
+            evidence.identity_verified = true;
+        }
+        if evidence.identity_verified {
             evidence.coverage_complete = true;
             evidence.pending_work = false;
             self.semantic_qualification.set(evidence);
@@ -5612,7 +5989,12 @@ impl SearchEngine {
     }
 
     pub fn remove_file(&mut self, rel_path: &str, collection: &str) -> Result<(), SearchError> {
-        self.store.remove_file(CONFIGURATION_ROOT_ID, rel_path, collection)?;
+        self.store.remove_file_with_token_layout(
+            CONFIGURATION_ROOT_ID,
+            rel_path,
+            collection,
+            self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+        )?;
         self.invalidate_reference_stamp(collection)?;
         self.index = Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
         self.observe_live_index("live_index_replaced", Reason::ExplicitRebuild, Outcome::Completed);
@@ -5721,6 +6103,7 @@ enum PreparedBootFile {
         graph_contexts: Option<Vec<Option<String>>>,
         /// Some context failed to render; the file owes a re-render once written.
         context_owed: bool,
+        source_spans: Vec<Option<crate::SourceSpan>>,
     },
 }
 
@@ -5736,6 +6119,7 @@ struct FileTask {
     graph_contexts: Vec<Option<String>>,
     /// Some context failed to render; the file owes a re-render once written.
     context_owed: bool,
+    source_spans: Vec<Option<crate::SourceSpan>>,
 }
 
 struct FileResult {
@@ -5745,6 +6129,7 @@ struct FileResult {
     chunks: Vec<code_chunk::Chunk>,
     graph_contexts: Vec<Option<String>>,
     context_owed: bool,
+    source_spans: Vec<Option<crate::SourceSpan>>,
     embeddings: Result<Vec<Vec<f32>>, SearchError>,
 }
 
@@ -5846,11 +6231,218 @@ mod tests {
     use crate::ports::{SnapshotCatalog, SnapshotContentStore};
     use crate::workspace_roots::{FileKey, CONFIGURATION_ROOT_ID};
     use crate::{BaselineRef, CorpusId, Document, IndexedDocument, SearchError, Snapshot};
+    use crate::{
+        Chunk, ChunkKind, Embedder, EmbedderConfig, EmbeddingExecutionPolicy, SearchConfig,
+        SourceSpan, Store, TokenPolicy,
+    };
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::fs;
     use std::ops::ControlFlow;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn token_layout_corruption_falls_back_to_fts_without_mutating_rows() {
+        let Ok(tokenizer_path) = std::env::var("USER2_TOKENIZER_JSON") else { return };
+        const TOKENIZER_SHA256: &str =
+            "80d0433a2cfc55a4561b0e98b6f822decc48c9d457db498837223f9385ef3aff";
+        let token_policy =
+            TokenPolicy::load(Path::new(&tokenizer_path), TOKENIZER_SHA256, 8192).unwrap();
+        let config = || SearchConfig {
+            embedder: EmbedderConfig {
+                dim: Some(2),
+                token_policy: Some(token_policy.clone()),
+                ..EmbedderConfig::default()
+            },
+            execution: EmbeddingExecutionPolicy::default(),
+        };
+        let embedder = Embedder::new(config().embedder);
+        let claim = embedder.token_layout_claim().unwrap().to_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("claimed-corrupt.db");
+        let mut store = Store::open(&db_path).unwrap();
+        let text = "Procedure Original()\n// DistinctiveLexicalNeedle\nEndProcedure";
+        let chunk = Chunk {
+            kind: ChunkKind::Procedure,
+            name: "Original".to_owned(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: 1,
+            line_end: 3,
+            text: text.to_owned(),
+        };
+        store
+            .reindex_file_with_identity_and_source_spans(
+                "root",
+                "Module.bsl",
+                b"stable-hash",
+                &[chunk],
+                Some(&[vec![1.0, 0.0]]),
+                None,
+                embedder.model_id(),
+                2,
+                Some(&claim),
+                &[Some(SourceSpan {
+                    parent_symbol: "Original".to_owned(),
+                    byte_start: 0,
+                    byte_end: text.len() as u32,
+                    parent_byte_start: 0,
+                    parent_byte_end: text.len() as u32,
+                    part_index: 1,
+                    part_count: 1,
+                })],
+            )
+            .unwrap();
+        drop(store);
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection.execute("UPDATE chunk_source_spans SET part_index = 0", []).unwrap();
+        drop(connection);
+
+        let before = Store::open_existing(&db_path).unwrap();
+        let before_counts = (before.file_count().unwrap(), before.chunk_count().unwrap());
+        drop(before);
+        let outcome =
+            SearchEngine::new_fenced(&db_path, config(), SearchEngine::permit_checkpointed_apply)
+                .unwrap();
+        let FenceOutcome::Applied(engine) = outcome else {
+            panic!("permit-all startup should return the FTS fallback")
+        };
+        assert!(!engine.has_semantic());
+        assert_eq!(engine.index.len(), 0, "fallback must not read vectors into HNSW");
+        assert_eq!(
+            engine.text_search("DistinctiveLexicalNeedle", 10, Some("code")).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            (engine.store().file_count().unwrap(), engine.store().chunk_count().unwrap()),
+            before_counts,
+            "claim validation must keep pre-existing rows intact"
+        );
+
+        let overlay = SearchEngine::semantic_overlay_only_fenced(
+            &db_path,
+            config(),
+            SearchEngine::permit_checkpointed_apply,
+        )
+        .unwrap();
+        let FenceOutcome::Applied(engine) = overlay else {
+            panic!("permit-all startup should return the FTS fallback")
+        };
+        assert!(!engine.has_semantic());
+        assert_eq!(engine.index.len(), 0, "fallback must not read vectors into HNSW");
+        assert_eq!(
+            engine.text_search("DistinctiveLexicalNeedle", 10, Some("code")).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            (engine.store().file_count().unwrap(), engine.store().chunk_count().unwrap()),
+            before_counts
+        );
+    }
+
+    /// Opt-in proof over a caller-prepared, already-indexed corpus. The test is inert unless all
+    /// required paths are explicitly provided; it opens the Store read-only and never rebuilds it.
+    #[test]
+    fn optional_token_layout_corpus_store_source_coverage() {
+        let (Ok(workspace), Ok(configuration), Ok(store_path)) = (
+            std::env::var("BSL_TOKEN_LAYOUT_COVERAGE_WORKSPACE"),
+            std::env::var("BSL_TOKEN_LAYOUT_COVERAGE_CONFIGURATION"),
+            std::env::var("BSL_TOKEN_LAYOUT_COVERAGE_STORE"),
+        ) else {
+            return;
+        };
+        let extensions = std::env::var_os("BSL_TOKEN_LAYOUT_COVERAGE_EXTENSIONS")
+            .as_deref()
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let workspace = PathBuf::from(workspace);
+        let configuration = PathBuf::from(configuration);
+        let (roots, rejected) =
+            crate::WorkspaceRoots::build(&workspace, &configuration, &extensions);
+        assert!(rejected.is_empty(), "coverage roots must match production root ownership");
+        let declared = roots.entries().map(|(_, path)| path.to_path_buf()).collect::<Vec<_>>();
+        let scan = project_model::SourceSet::scan_excluding(&declared, roots.excluded());
+        assert!(scan.clean(), "source coverage requires a complete source walk");
+        let files = SearchEngine::files_from_scan(&roots, &scan);
+        let store = Store::open_reader(Path::new(&store_path)).unwrap();
+        let documents = store.load_indexed_documents(Some("code")).unwrap();
+        let mut documents_by_file = HashMap::<FileKey, Vec<IndexedDocument>>::new();
+        for document in documents {
+            documents_by_file
+                .entry(FileKey::new(&document.root_id, &document.path))
+                .or_default()
+                .push(document);
+        }
+
+        let mut expected = HashSet::new();
+        for (key, walked_path) in &files {
+            let source = fs::read_to_string(walked_path).unwrap();
+            for parent in crate::Chunker::source_chunks(&source) {
+                let identity = (
+                    key.clone(),
+                    parent.chunk.name,
+                    parent.source_byte_start,
+                    parent.source_byte_end,
+                );
+                assert!(expected.insert(identity), "AST parent identity must be unique");
+            }
+        }
+
+        let mut actual = HashSet::new();
+        for (key, walked_path) in &files {
+            let source = fs::read_to_string(walked_path).unwrap();
+            let mut groups = HashMap::<(String, u32, u32), Vec<IndexedDocument>>::new();
+            for document in documents_by_file.remove(key).unwrap_or_default() {
+                let span = document.source_span.as_ref().expect("token rows need provenance");
+                groups
+                    .entry((
+                        span.parent_symbol.clone(),
+                        span.parent_byte_start,
+                        span.parent_byte_end,
+                    ))
+                    .or_default()
+                    .push(document);
+            }
+
+            for ((parent_symbol, parent_start, parent_end), mut parts) in groups {
+                let identity = (key.clone(), parent_symbol.clone(), parent_start, parent_end);
+                assert!(actual.insert(identity), "a parent may be persisted only once");
+                parts.sort_by_key(|document| document.source_span.as_ref().unwrap().byte_start);
+                let part_count = parts[0].source_span.as_ref().unwrap().part_count;
+                assert_eq!(parts.len(), part_count as usize);
+                assert_eq!(parts[0].source_span.as_ref().unwrap().byte_start, parent_start);
+                assert_eq!(
+                    parts.last().unwrap().source_span.as_ref().unwrap().byte_end,
+                    parent_end
+                );
+                for (index, document) in parts.iter().enumerate() {
+                    let span = document.source_span.as_ref().unwrap();
+                    assert_eq!(span.parent_symbol, parent_symbol);
+                    assert_eq!(
+                        (span.parent_byte_start, span.parent_byte_end),
+                        (parent_start, parent_end)
+                    );
+                    assert_eq!(span.part_index, index as u32 + 1);
+                    assert_eq!(span.part_count, part_count);
+                    assert_eq!(
+                        document.text,
+                        source[span.byte_start as usize..span.byte_end as usize],
+                        "persisted source text must be the exact original byte slice"
+                    );
+                    if let Some(next) = parts.get(index + 1) {
+                        assert_eq!(span.byte_end, next.source_span.as_ref().unwrap().byte_start);
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected, "every AST parent, including module headers, is covered once");
+        assert!(
+            documents_by_file.is_empty(),
+            "store contains source files outside the configured roots"
+        );
+    }
     use std::sync::Arc;
 
     fn baseline_manifest(snapshot: &str, rows: usize) -> crate::WorkspaceBaselineManifest {
@@ -7152,6 +7744,7 @@ mod tests {
                     text: "базовая".to_owned(),
                     content_hash: "base-changed".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 },
                 IndexedDocument {
                     collection: "code".to_owned(),
@@ -7164,6 +7757,7 @@ mod tests {
                     text: "stable".to_owned(),
                     content_hash: "base-stable".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 },
             ],
         );
@@ -7720,6 +8314,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_context_refresh_refusal_keeps_source_vectors_and_dirty_mark() {
+        let Ok(tokenizer_path) = std::env::var("USER2_TOKENIZER_JSON") else { return };
+        const TOKENIZER_SHA256: &str =
+            "80d0433a2cfc55a4561b0e98b6f822decc48c9d457db498837223f9385ef3aff";
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct OversizedContext(String);
+        impl crate::ports::GraphContextProvider for OversizedContext {
+            fn graph_context(&self, _rel: &str, _symbol: &str, _kind: &str) -> Option<String> {
+                Some(self.0.clone())
+            }
+        }
+
+        let token_policy =
+            TokenPolicy::load(Path::new(&tokenizer_path), TOKENIZER_SHA256, 8192).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let running = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_running = Arc::clone(&running);
+        let server_requests = Arc::clone(&requests);
+        let server = std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    server_requests.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !server_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("fake embedding endpoint failed: {error}"),
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let source = "Процедура Owned()\n    Возврат;\nКонецПроцедуры\n";
+        std::fs::write(workspace.join("Owned.bsl"), source).unwrap();
+        let config = SearchConfig {
+            embedder: EmbedderConfig {
+                base_url: endpoint,
+                dim: Some(2),
+                token_policy: Some(token_policy.clone()),
+                ..EmbedderConfig::default()
+            },
+            execution: EmbeddingExecutionPolicy::default(),
+        };
+        let embedder = Embedder::new(config.embedder.clone());
+        let key = FileKey::configuration("Owned.bsl");
+        let mut check_singleton = |input: &str| embedder.check_singleton_input(input);
+        let documents = crate::document::prepare_file_documents(
+            &key,
+            source,
+            None,
+            &token_policy,
+            embedder.document_prefix(),
+            &mut check_singleton,
+        )
+        .unwrap();
+        assert!(documents.iter().any(|document| document.kind == "procedure"));
+        let (chunks, contexts, spans) = crate::document::chunks_contexts_and_spans(&documents);
+        let vectors = vec![vec![0.5_f32, 0.25]; chunks.len()];
+        let claim = embedder.token_layout_claim().unwrap();
+        let db_path = dir.path().join("bsl-search.db");
+        {
+            let mut store = Store::open(&db_path).unwrap();
+            store
+                .reindex_file_with_identity_and_source_spans(
+                    CONFIGURATION_ROOT_ID,
+                    "Owned.bsl",
+                    blake3::hash(source.as_bytes()).as_bytes(),
+                    &chunks,
+                    Some(&vectors),
+                    Some(&contexts),
+                    embedder.model_id(),
+                    2,
+                    Some(claim),
+                    &spans,
+                )
+                .unwrap();
+        }
+        let mut engine = SearchEngine::new(&db_path, config).unwrap();
+        engine.set_workspace_root(&workspace);
+        engine.store().mark_context_dirty("code", CONFIGURATION_ROOT_ID, "Owned.bsl").unwrap();
+        let before_documents = engine
+            .store()
+            .load_indexed_documents_with_token_layout_claim(Some("code"), Some(claim))
+            .unwrap();
+        let before_embeddings = engine
+            .store()
+            .load_all_embeddings_with_profile_and_token_layout(claim, 2, Some(claim))
+            .unwrap();
+        let before_generation = engine.store().embedding_generation().unwrap();
+
+        let stats = engine
+            .refresh_dirty_contexts(&OversizedContext("контекст ".repeat(20_000)), i64::MAX)
+            .unwrap();
+        assert_eq!(stats.paths_cleared, 0);
+        assert_eq!(stats.chunks_updated, 0);
+        assert!(
+            engine.context_dirty_paths("code").unwrap().contains(&key),
+            "context preparation refusal must retain its retry obligation"
+        );
+        assert_eq!(
+            engine
+                .store()
+                .load_indexed_documents_with_token_layout_claim(Some("code"), Some(claim))
+                .unwrap(),
+            before_documents,
+            "refused context must preserve exact source text and spans"
+        );
+        assert_eq!(
+            engine
+                .store()
+                .load_all_embeddings_with_profile_and_token_layout(claim, 2, Some(claim))
+                .unwrap(),
+            before_embeddings,
+            "refused context must preserve persisted vector rows"
+        );
+        assert_eq!(engine.store().embedding_generation().unwrap(), before_generation);
+        std::thread::sleep(Duration::from_millis(20));
+        running.store(false, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "context refusal must not request embeddings"
+        );
+    }
+
     /// A render FAILURE (transient — the graph DB could not be read) must NOT clear the
     /// path's dirty mark: the next graph publish has to retry it. A legitimate `Ok(None)`
     /// still clears. Without keeping the mark, a one-off graph-read error would silently
@@ -7941,6 +8677,7 @@ mod tests {
                 text: "Процедура П()\nКонецПроцедуры".to_owned(),
                 content_hash: "h".to_owned(),
                 graph_context: None,
+                source_span: None,
             })
             .collect();
         engine.sync_indexed_documents_in_collection("code", &documents, None).unwrap();
@@ -8805,6 +9542,7 @@ mod tests {
                     text: "Процедура П()\nКонецПроцедуры".to_owned(),
                     content_hash: "h".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -9333,6 +10071,7 @@ mod tests {
                     text: "Процедура П()\nКонецПроцедуры".to_owned(),
                     content_hash: "h".to_owned(),
                     graph_context: None,
+                    source_span: None,
                 }],
                 None,
             )
@@ -11249,6 +11988,8 @@ mod indexing_pass_lifecycle {
 #[cfg(test)]
 mod indexing_local_qualification {
     use super::*;
+    use sha2::Digest;
+    use std::io::{Read, Write};
 
     fn config(dim: usize) -> SearchConfig {
         SearchConfig {
@@ -11331,6 +12072,12 @@ mod indexing_local_qualification {
                 !engine.semantic_index_qualification().identity_verified,
                 "BLOB provenance is unknown"
             );
+            let epoch = engine.semantic_index_qualification().epoch;
+            engine.observe_semantic_publication(epoch);
+            assert!(
+                !engine.semantic_index_qualification().identity_verified,
+                "an unclaimed BLOB cannot be qualified by a publication observation"
+            );
             if vector_dim == 2 {
                 assert!(!engine.semantic_index_qualification().coverage_complete);
             }
@@ -11356,6 +12103,174 @@ mod indexing_local_qualification {
                 );
             }
         }
+    }
+
+    #[test]
+    fn successful_token_profile_publication_qualifies_a_partial_matching_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#;
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer_path, tokenizer).unwrap();
+        let tokenizer_hash = sha2::Sha256::digest(tokenizer)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let token_policy = crate::TokenPolicy::load(&tokenizer_path, &tokenizer_hash, 32).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 2048];
+            let input_count = loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                bytes.extend_from_slice(&buffer[..read]);
+                let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap();
+                if bytes.len() >= split + 4 + length {
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&bytes[split + 4..]).unwrap();
+                    break request["input"].as_array().unwrap().len();
+                }
+            };
+            let data: Vec<_> = (0..input_count)
+                .map(|index| serde_json::json!({"index": index, "embedding": [0.0, 1.0, 0.0]}))
+                .collect();
+            let response = serde_json::json!({"data": data}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+
+        let config = || SearchConfig {
+            embedder: EmbedderConfig {
+                base_url: format!("http://{address}"),
+                model: "fixture".into(),
+                dim: Some(3),
+                token_policy: Some(token_policy.clone()),
+                ..EmbedderConfig::default()
+            },
+            ..SearchConfig::default()
+        };
+        let embedder = Embedder::new(config().embedder);
+        let path = dir.path().join("partial.db");
+        let mut store = Store::open(&path).unwrap();
+        let texts = ["Процедура One()\nКонецПроцедуры", "Процедура Two()\nКонецПроцедуры"];
+        let chunks = [
+            crate::Chunk {
+                kind: crate::ChunkKind::Procedure,
+                name: "One".into(),
+                is_export: false,
+                annotations: Vec::new(),
+                line_start: 1,
+                line_end: 2,
+                text: texts[0].into(),
+            },
+            crate::Chunk {
+                kind: crate::ChunkKind::Procedure,
+                name: "Two".into(),
+                is_export: false,
+                annotations: Vec::new(),
+                line_start: 3,
+                line_end: 4,
+                text: texts[1].into(),
+            },
+        ];
+        let first_end = texts[0].len() as u32;
+        let second_end = first_end + texts[1].len() as u32;
+        let spans = [
+            Some(crate::SourceSpan {
+                parent_symbol: "One".into(),
+                byte_start: 0,
+                byte_end: first_end,
+                parent_byte_start: 0,
+                parent_byte_end: first_end,
+                part_index: 1,
+                part_count: 1,
+            }),
+            Some(crate::SourceSpan {
+                parent_symbol: "Two".into(),
+                byte_start: first_end,
+                byte_end: second_end,
+                parent_byte_start: first_end,
+                parent_byte_end: second_end,
+                part_index: 1,
+                part_count: 1,
+            }),
+        ];
+        store
+            .reindex_file_with_identity_and_source_spans(
+                "root",
+                "Module.bsl",
+                b"partial-cache",
+                &chunks,
+                Some(&[vec![1.0, 0.0, 0.0]]),
+                None,
+                embedder.storage_identity(),
+                3,
+                embedder.token_layout_claim(),
+                &spans,
+            )
+            .unwrap();
+        drop(store);
+
+        let mut engine = SearchEngine::new(&path, config()).unwrap();
+        assert!(!engine.semantic_index_qualification().identity_verified);
+        engine.observe_semantic_boot_coverage(
+            engine.chunk_count().ok(),
+            engine.embedding_count_by_collection("code").ok(),
+        );
+        assert!(engine.semantic_index_qualification().pending_work);
+        let epoch = engine.semantic_index_qualification().epoch;
+        engine.observe_semantic_publication(epoch.wrapping_add(1));
+        assert!(!engine.semantic_index_qualification().identity_verified);
+        engine.observe_semantic_publication(epoch);
+        assert!(
+            !engine.semantic_index_qualification().identity_verified,
+            "a partial matching cache is not complete evidence"
+        );
+        let embedder = Embedder::new(config().embedder);
+        let mut apply = |operation: &mut dyn FnMut() -> Result<(), SearchError>| {
+            FenceOutcome::Applied(operation())
+        };
+        let mut retry = || false;
+        let (index, outcome) = SearchEngine::run_embedding_pass_owned(
+            &engine.store,
+            &embedder,
+            3,
+            32,
+            1,
+            None,
+            None,
+            &mut apply,
+            Some(&mut retry),
+        )
+        .unwrap();
+        assert!(matches!(outcome, FenceOutcome::Applied(())));
+        server.join().unwrap();
+        assert_eq!(index.len(), 2);
+        engine.set_vector_index(index);
+        engine.observe_semantic_publication(epoch);
+        let qualification = engine.semantic_index_qualification();
+        assert!(qualification.identity_verified);
+        assert!(qualification.coverage_complete);
+        assert!(!qualification.pending_work);
     }
 
     #[test]

@@ -347,6 +347,13 @@ EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B \
 запроса, без вывода исходного значения. Настройка не добавляет секцию TOML;
 библиотечный клиент задаёт `EmbedderConfig.max_request_bytes` напрямую.
 
+`EMBEDDING_DIM` необязателен: не задан — поле `dimensions` не отправляется
+вовсе, и запрос принимает эндпоинт, не поддерживающий параметр; ширину
+объявляет сама модель. Индекс при этом строится на **1024** — модели другой
+ширины требуют явного `EMBEDDING_DIM` (и эндпоинта, принимающего `dimensions`).
+Заданное, но негодное значение (ноль, мусор) даёт `embedding_invalid_config` до
+сетевого запроса.
+
 Сборка и публикация разбивают работу одновременно по действующему лимиту числа
 документов и точному размеру сериализованного запроса: учитываются UTF-8,
 JSON-экранирование, модель, dimensions и provider routing. Равенство лимиту
@@ -391,10 +398,11 @@ JSON-экранирование, модель, dimensions и provider routing. �
 
 ## Совместимость indexing
 
-Текущий machine contract — `3.1`: успешные ответы поиска и graph lifecycle/loading
+Текущий machine contract — `3.3`: live metadata object использует schema `2` с полнотой и усечением;
+успешные ответы поиска и graph lifecycle/loading
 несут структурированный `indexing`, ответы поиска — необязательный `semantic_failure`.
-Search hits/not-ready имеют schema `7` для `search_code` и `6` для docs-действий,
-search status — `3`, graph descriptor — `35`; list_platform остаётся `1`.
+Search hits/not-ready имеют schema `8` для `search_code` и `6` для docs-действий,
+search status — `4`, graph descriptor — `35`; list_platform остаётся `1`.
 Готовность lexical, semantic, graph и reference читается отдельно; unknown не
 означает завершение. Точный формат, null/terminal правила и примеры описаны в
 [TOOLS_AND_EXTENSION.md](TOOLS_AND_EXTENSION.md#структурированный-прогресс-индексации).

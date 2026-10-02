@@ -53,19 +53,60 @@ pub fn severity(severity: Severity) -> DiagnosticSeverity {
     }
 }
 
-pub fn diagnostic_tags(tags: &[IdeTag]) -> Option<Vec<DiagnosticTag>> {
-    if tags.is_empty() {
-        return None;
+/// Какие `Diagnostic.tags` клиент готов принять.
+///
+/// `publishDiagnostics.tagSupport` — не булев признак, а множество значений: клиент
+/// перечисляет теги, которые он обрабатывает. Не объявлен — свойство не отправляется
+/// вовсе (пустой массив вместо отсутствующего поля заявлял бы поддержку, которой нет);
+/// объявлен — массив фильтруется по `valueSet`, а опустевший результат тоже не
+/// публикуется.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientTags {
+    unnecessary: bool,
+    deprecated: bool,
+}
+
+impl ClientTags {
+    /// Клиент не объявил `tagSupport`: ни один тег не отправляется.
+    pub const NONE: Self = Self { unnecessary: false, deprecated: false };
+
+    /// Оба тега: значение для путей без согласованных возможностей клиента
+    /// (обёртки `diagnostic`/`diagnostics` вне LSP-проекции).
+    pub const ALL: Self = Self { unnecessary: true, deprecated: true };
+
+    /// Разбор `publishDiagnostics.tagSupport` из согласованных при `initialize`
+    /// возможностей клиента.
+    pub fn from_capabilities(caps: &lsp_types::ClientCapabilities) -> Self {
+        Self::from_client_support(
+            caps.text_document
+                .as_ref()
+                .and_then(|td| td.publish_diagnostics.as_ref())
+                .and_then(|pd| pd.tag_support.as_ref()),
+        )
     }
 
-    Some(
-        tags.iter()
-            .map(|tag| match tag {
-                IdeTag::Unnecessary => DiagnosticTag::UNNECESSARY,
-                IdeTag::Deprecated => DiagnosticTag::DEPRECATED,
-            })
-            .collect(),
-    )
+    fn from_client_support(support: Option<&lsp_types::TagSupport<DiagnosticTag>>) -> Self {
+        let Some(support) = support else { return Self::NONE };
+        Self {
+            unnecessary: support.value_set.contains(&DiagnosticTag::UNNECESSARY),
+            deprecated: support.value_set.contains(&DiagnosticTag::DEPRECATED),
+        }
+    }
+}
+
+pub fn diagnostic_tags(tags: &[IdeTag], client: ClientTags) -> Option<Vec<DiagnosticTag>> {
+    let mapped: Vec<DiagnosticTag> = tags
+        .iter()
+        .filter_map(|tag| match tag {
+            IdeTag::Unnecessary if client.unnecessary => Some(DiagnosticTag::UNNECESSARY),
+            IdeTag::Deprecated if client.deprecated => Some(DiagnosticTag::DEPRECATED),
+            IdeTag::Unnecessary | IdeTag::Deprecated => None,
+        })
+        .collect();
+    if mapped.is_empty() {
+        return None;
+    }
+    Some(mapped)
 }
 
 pub fn diagnostic(line_index: &LineIndex, text: &str, diag: &IdeDiagnostic) -> Option<Diagnostic> {
@@ -75,6 +116,7 @@ pub fn diagnostic(line_index: &LineIndex, text: &str, diag: &IdeDiagnostic) -> O
         diag,
         PositionEncoding::Utf16,
         CodeDescriptions::Omit,
+        ClientTags::ALL,
     )
 }
 
@@ -105,11 +147,12 @@ pub fn diagnostic_with_encoding(
     diag: &IdeDiagnostic,
     encoding: PositionEncoding,
     code_descriptions: CodeDescriptions,
+    client_tags: ClientTags,
 ) -> Option<Diagnostic> {
     let range = range_with_encoding(line_index, text, diag.range, encoding)?;
     let severity = severity(diag.severity);
     let code = Some(NumberOrString::String(diag.code.as_str().to_string()));
-    let tags = diagnostic_tags(&diag.tags);
+    let tags = diagnostic_tags(&diag.tags, client_tags);
 
     Some(Diagnostic {
         range,
@@ -146,6 +189,7 @@ pub fn diagnostics(line_index: &LineIndex, text: &str, diags: &[IdeDiagnostic]) 
         diags,
         PositionEncoding::Utf16,
         CodeDescriptions::Omit,
+        ClientTags::ALL,
     )
 }
 
@@ -155,10 +199,13 @@ pub fn diagnostics_with_encoding(
     diags: &[IdeDiagnostic],
     encoding: PositionEncoding,
     code_descriptions: CodeDescriptions,
+    client_tags: ClientTags,
 ) -> Vec<Diagnostic> {
     diags
         .iter()
-        .filter_map(|d| diagnostic_with_encoding(line_index, text, d, encoding, code_descriptions))
+        .filter_map(|d| {
+            diagnostic_with_encoding(line_index, text, d, encoding, code_descriptions, client_tags)
+        })
         .collect()
 }
 
@@ -252,6 +299,10 @@ pub fn code_action_with_encoding(
             diag,
             encoding,
             CodeDescriptions::Omit,
+            // The attached diagnostic is what the client matches the action against,
+            // not something it renders from a publication: `publishDiagnostics.tagSupport`
+            // does not govern it, and tags keep travelling as they always have.
+            ClientTags::ALL,
         )?]),
         edit: Some(workspace_edit(uri, edits)),
         is_preferred: Some(true),
@@ -312,6 +363,7 @@ pub fn semantic_tokens_legend() -> SemanticTokensLegend {
         SemanticTokenModifier::new("async"),
         SemanticTokenModifier::new("declaration"),
         SemanticTokenModifier::new("definition"),
+        SemanticTokenModifier::DOCUMENTATION,
     ];
 
     SemanticTokensLegend { token_types, token_modifiers }
@@ -354,6 +406,9 @@ fn token_modifiers_bitset(mods: HlMod) -> u32 {
     }
     if mods.contains(HlMod::DEFINITION) {
         bitset |= 1 << 4;
+    }
+    if mods.contains(HlMod::DOCUMENTATION) {
+        bitset |= 1 << 5;
     }
     bitset
 }
@@ -442,7 +497,12 @@ mod tests {
     use super::*;
     use ide::DiagnosticCode;
 
-    fn projected_for(code: DiagnosticCode, message: &str, support: CodeDescriptions) -> Diagnostic {
+    fn projected_for(
+        code: DiagnosticCode,
+        message: &str,
+        support: CodeDescriptions,
+        client_tags: ClientTags,
+    ) -> Diagnostic {
         let text = "А = 1;";
         let line_index = LineIndex::new(text);
         let diag = IdeDiagnostic {
@@ -453,12 +513,110 @@ mod tests {
             tags: Vec::new(),
             fixes: Vec::new(),
         };
-        diagnostic_with_encoding(&line_index, text, &diag, PositionEncoding::Utf16, support)
-            .expect("проекция диагностики")
+        diagnostic_with_encoding(
+            &line_index,
+            text,
+            &diag,
+            PositionEncoding::Utf16,
+            support,
+            client_tags,
+        )
+        .expect("проекция диагностики")
     }
 
     fn projected(code: DiagnosticCode, message: &str) -> Diagnostic {
-        projected_for(code, message, CodeDescriptions::Publish)
+        projected_for(code, message, CodeDescriptions::Publish, ClientTags::ALL)
+    }
+
+    /// Возможности клиента собираются из того же JSON-документа, что приходит в
+    /// `initialize`, — вход тестов не расходится с проводом.
+    fn client_with(tags: &[DiagnosticTag]) -> ClientTags {
+        let caps: lsp_types::ClientCapabilities = serde_json::from_value(serde_json::json!({
+            "textDocument": {
+                "publishDiagnostics": { "tagSupport": { "valueSet": tags } }
+            }
+        }))
+        .expect("capabilities");
+        ClientTags::from_capabilities(&caps)
+    }
+
+    fn tagged(tags: Vec<IdeTag>, client: ClientTags) -> Diagnostic {
+        let text = "А = 1;";
+        let line_index = LineIndex::new(text);
+        let diag = IdeDiagnostic {
+            code: DiagnosticCode::LineLength,
+            message: "Строка слишком длинная".to_string(),
+            range: TextRange::new(0.into(), 1.into()),
+            severity: Severity::Warning,
+            tags,
+            fixes: Vec::new(),
+        };
+        diagnostic_with_encoding(
+            &line_index,
+            text,
+            &diag,
+            PositionEncoding::Utf16,
+            CodeDescriptions::Omit,
+            client,
+        )
+        .expect("проекция диагностики")
+    }
+
+    #[test]
+    fn tags_wait_for_the_client_to_ask_for_them() {
+        let unnecessary = vec![IdeTag::Unnecessary];
+        let deprecated = vec![IdeTag::Deprecated];
+
+        // Без `tagSupport` свойство обязано отсутствовать — даже когда диагностика
+        // несёт тег, и именно отсутствовать, а не быть пустым массивом.
+        assert_eq!(tagged(unnecessary.clone(), ClientTags::NONE).tags, None);
+        assert_eq!(tagged(deprecated.clone(), ClientTags::NONE).tags, None);
+
+        // Частичный valueSet: клиент объявил только `Unnecessary` — `Deprecated`
+        // не уезжает. Без этого входа реализация «шлём всё, если tagSupport вообще
+        // объявлен» проходила бы проверку и не проверяла ничего.
+        let only_unnecessary = client_with(&[DiagnosticTag::UNNECESSARY]);
+        assert_eq!(
+            tagged(deprecated.clone(), only_unnecessary).tags,
+            None,
+            "тег вне valueSet не отправляется"
+        );
+        assert_eq!(
+            tagged(unnecessary.clone(), only_unnecessary).tags,
+            Some(vec![DiagnosticTag::UNNECESSARY])
+        );
+
+        // Пустой valueSet — тоже «ничего не отправляем», а не пустой массив.
+        assert_eq!(tagged(unnecessary.clone(), client_with(&[])).tags, None);
+    }
+
+    #[test]
+    fn a_client_without_tag_support_gets_no_tags_at_all() {
+        // Разбор возможностей — отдельный вход от проекции: мутант «нет tagSupport →
+        // ALL» внутри `from_capabilities` не виден тестам на `ClientTags::NONE`.
+        let bare: lsp_types::ClientCapabilities =
+            serde_json::from_value(serde_json::json!({})).expect("capabilities");
+        assert_eq!(ClientTags::from_capabilities(&bare), ClientTags::NONE);
+    }
+
+    #[test]
+    fn each_tag_is_kept_by_its_own_half_of_the_value_set() {
+        // Мутант «не слать никогда» краснеет здесь: полный valueSet обязан
+        // пропустить оба тега, а не только один из них.
+        let both = client_with(&[DiagnosticTag::UNNECESSARY, DiagnosticTag::DEPRECATED]);
+        assert_eq!(
+            tagged(vec![IdeTag::Unnecessary], both).tags,
+            Some(vec![DiagnosticTag::UNNECESSARY])
+        );
+        assert_eq!(
+            tagged(vec![IdeTag::Deprecated], both).tags,
+            Some(vec![DiagnosticTag::DEPRECATED])
+        );
+        assert_eq!(
+            tagged(Vec::new(), both).tags,
+            None,
+            "диагностика без тегов не получает свойство"
+        );
     }
 
     #[test]
@@ -469,6 +627,7 @@ mod tests {
             DiagnosticCode::LineLength,
             "Строка слишком длинная",
             CodeDescriptions::Omit,
+            ClientTags::ALL,
         );
         assert!(quiet.code_description.is_none());
         assert!(
@@ -481,6 +640,7 @@ mod tests {
             DiagnosticCode::LineLength,
             "Строка слишком длинная",
             CodeDescriptions::Publish,
+            ClientTags::ALL,
         );
         assert!(loud.code_description.is_some());
     }
@@ -588,6 +748,52 @@ mod tests {
         assert_eq!(lsp_diag.code, Some(NumberOrString::String("EmptyCodeBlock".to_string())));
         assert_eq!(lsp_diag.source, Some("bsl-analyzer".to_string()));
         assert_eq!(lsp_diag.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+    }
+
+    /// Documentation tokens use the advertised modifier and negotiated Unicode units.
+    #[test]
+    fn test_documentation_semantic_tokens_unicode() {
+        let text = "// 😀 Параметры:\r\n// Имя - Строка\r\n";
+        let line_index = LineIndex::new(text);
+        let highlights: Vec<_> =
+            [("Параметры:", HlTag::Keyword), ("Имя", HlTag::Parameter), ("Строка", HlTag::Type)]
+                .into_iter()
+                .map(|(part, tag)| HlRange {
+                    range: TextRange::at(
+                        TextSize::from(text.find(part).unwrap() as u32),
+                        TextSize::of(part),
+                    ),
+                    tag,
+                    modifiers: HlMod::new().with(HlMod::DOCUMENTATION),
+                })
+                .collect();
+        let legend = semantic_tokens_legend();
+        let documentation = legend
+            .token_modifiers
+            .iter()
+            .position(|modifier| *modifier == SemanticTokenModifier::DOCUMENTATION)
+            .unwrap();
+        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+            let tokens = semantic_tokens_with_encoding(&line_index, text, &highlights, encoding);
+            assert_eq!(tokens.len(), 3);
+            for (token, highlight) in tokens.iter().zip(&highlights) {
+                assert_eq!(token.token_modifiers_bitset, 1 << documentation);
+                assert_eq!(
+                    legend.token_types[token.token_type as usize].as_str(),
+                    highlight.tag.as_str()
+                );
+            }
+            let (start, length) = match encoding {
+                PositionEncoding::Utf8 => ("// 😀 ".len(), "Параметры:".len()),
+                PositionEncoding::Utf16 => {
+                    ("// 😀 ".encode_utf16().count(), "Параметры:".encode_utf16().count())
+                }
+            };
+            assert_eq!(tokens[0].delta_start, start as u32);
+            assert_eq!(tokens[0].length, length as u32);
+            assert_eq!(tokens[1].delta_line, 1);
+            assert_eq!(tokens[1].delta_start, 3);
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@ use vfs::{loader, Vfs};
 
 use crate::analysis_host::AnalysisHost;
 use crate::call_hierarchy_index_state::CallHierarchyIndexState;
+use crate::lsp::to_proto::ClientTags;
 use crate::lsp::{PositionEncoding, Progress};
 use crate::mem_docs::MemDocs;
 use crate::task_pool;
@@ -185,6 +186,9 @@ pub struct WorkspaceBatchPlan {
     pub workspace_root: Option<PathBuf>,
     pub position_encoding: PositionEncoding,
     pub supports_code_description: bool,
+    /// Tags the client accepts (`tagSupport`), captured with the same handshake as
+    /// `supports_code_description`; the batch projects through the same rules.
+    pub supports_diagnostic_tags: ClientTags,
     pub chunk_size: usize,
     /// Bounded rayon pool (≈ `ncpu/2`) the chunk computes on, so the batch never saturates
     /// the cores interactive requests need. `None` if pool creation failed — the sweep
@@ -293,11 +297,19 @@ pub struct GlobalState {
     /// `Diagnostic.codeDescription`, so the standard's link may be attached as a
     /// property instead of travelling only inside the message.
     pub supports_code_description: bool,
+    /// Negotiated at `initialize`: which `Diagnostic.tags` the client accepts
+    /// (`publishDiagnostics.tagSupport`). `ClientTags::NONE` means the property is
+    /// not published at all.
+    pub supports_diagnostic_tags: ClientTags,
     /// Negotiated at `initialize`: whether the client honors versioned
     /// `WorkspaceEdit.documentChanges`. When it does, rename edits carry the open
     /// document's version so the client rejects them if the buffer moved on after
     /// the snapshot; otherwise the server falls back to unversioned `changes`.
     pub supports_workspace_edit_document_changes: bool,
+    /// Negotiated at `initialize`: the client's `rangeLimit` for folding ranges.
+    /// When the response would exceed it, the handler drops the deepest folds
+    /// first, so the outer skeleton survives (github#56).
+    pub folding_range_limit: Option<u32>,
     /// True when the pull diagnostic provider is advertised (config opt-in) *and* the
     /// client advertised `textDocument/diagnostic` support — i.e. the client drives
     /// diagnostics by pulling. In that mode push publishing is suppressed so a
@@ -481,7 +493,9 @@ impl GlobalState {
             position_encoding: PositionEncoding::default(),
             supports_insert_text_mode_adjust_indentation: false,
             supports_code_description: false,
+            supports_diagnostic_tags: ClientTags::NONE,
             supports_workspace_edit_document_changes: false,
+            folding_range_limit: None,
             pull_diagnostics_active: false,
             supports_workspace_diagnostic_refresh: false,
             diagnostics_generation: HashMap::new(),
@@ -1718,10 +1732,18 @@ mod vfs_race_tests {
         );
         assert_eq!(per_kind.event(), "BeforeWrite");
         assert!(
-            db.resolve_event_subscription_for_file(file_id, "ТолькоРасширение").is_none(),
-            "extension-only event subscriptions stay invisible until merged whole-config supports them"
+            db.resolve_event_subscription_for_file(file_id, "ТолькоРасширение").is_some(),
+            "an extension file sees subscriptions declared by its own extension"
         );
-        assert_eq!(db.event_subscription_names(file_id), vec!["ПередЗаписью".to_string()]);
+        assert_eq!(
+            db.main_event_subscription_names_for_file(file_id),
+            vec!["ПередЗаписью".to_string()],
+            "the separate main-only accessor must keep its old scope"
+        );
+        assert_eq!(
+            db.event_subscription_names(file_id),
+            vec!["ПередЗаписью".to_string(), "ТолькоРасширение".to_string()]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

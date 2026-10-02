@@ -226,6 +226,12 @@ impl<'a> AnalysisContext<'a> {
         self.provider.main_event_subscriptions(self.file_id)
     }
 
+    /// All event subscriptions visible to this file through its base and
+    /// extension dependency chain.
+    pub fn visible_event_subscriptions(&self) -> Vec<Arc<bsl_metadata::EventSubscription>> {
+        self.provider.visible_event_subscriptions(self.file_id)
+    }
+
     /// Main-configuration Role enumeration for diagnostics that need to scan
     /// declared roles while preserving previous main-only behavior.
     pub fn main_roles(&self) -> Vec<Arc<bsl_metadata::Role>> {

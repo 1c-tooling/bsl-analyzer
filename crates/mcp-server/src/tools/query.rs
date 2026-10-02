@@ -451,6 +451,40 @@ fn render_text(
 const DEFAULT_QUERY_LIMIT: u32 = 100;
 const MAX_QUERY_LIMIT: u32 = 1000;
 
+/// Whether `execute` may run this query: the first member of the parsed package must be
+/// a `SELECT` — `SDBL_SELECT_QUERY` whose first token really spells the keyword.
+///
+/// The check reads the parse rather than a prefix of the text: a leading comment or a
+/// run of blank lines must not hide the member's kind, and a non-SELECT behind the same
+/// prefix must not slip through. Only the first member is checked — the same scope the
+/// removed prefix gate had.
+///
+/// The node kind alone is not enough: a member opened by a clause keyword (`ГДЕ 1`)
+/// still produces a `SDBL_SELECT_QUERY` — empty and marked with an error — so the token
+/// inside has to spell `ВЫБРАТЬ`/`SELECT`.
+fn first_member_is_select(query: &str) -> bool {
+    use syntax::{SyntaxElement, SyntaxKind};
+
+    let parsed = parser::parse_sdbl(query);
+    let root = parsed.syntax_node();
+    let Some(SyntaxElement::Node(member)) =
+        root.children_with_tokens().find(|element| !element.kind().is_trivia())
+    else {
+        return false;
+    };
+    if member.kind() != SyntaxKind::SDBL_SELECT_QUERY {
+        return false;
+    }
+    member
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| !token.kind().is_trivia())
+        .is_some_and(|token| {
+            stdx::case::eq_ignore_case(token.text(), "ВЫБРАТЬ")
+                || stdx::case::eq_ignore_case(token.text(), "SELECT")
+        })
+}
+
 pub async fn execute_query(
     state: &SharedState,
     query: &str,
@@ -469,9 +503,7 @@ pub async fn execute_query(
         return Err(McpError::invalid_params("Пустой запрос", None));
     }
 
-    let prefix = query.trim();
-    let upper_start: String = prefix.chars().take(30).collect::<String>().to_uppercase();
-    if !upper_start.starts_with("ВЫБРАТЬ") && !upper_start.starts_with("SELECT") {
+    if !first_member_is_select(query) {
         return Err(McpError::invalid_params("Только SELECT/ВЫБРАТЬ запросы разрешены", None));
     }
 
@@ -571,6 +603,35 @@ mod tests {
                 actions.iter().any(|a| a == action),
                 "schema must advertise `{action}`: {body}",
             );
+        }
+    }
+
+    /// The gate reads the parse, not a prefix: leading comments and blank lines must
+    /// not hide the first member's kind — and must not let a non-SELECT through. The
+    /// clause-keyword inputs pin the second half of the check: their node kind is a
+    /// select, but the first token inside it is not the keyword.
+    #[test]
+    fn only_a_select_first_member_passes_the_execute_gate() {
+        for allowed in [
+            "ВЫБРАТЬ 1",
+            "выбрать 1",
+            "SELECT 1",
+            "// отчёт по остаткам\nВЫБРАТЬ 1",
+            "// один\n// два\n\n  \nВЫБРАТЬ 1",
+            "ВЫБРАТЬ 1; УНИЧТОЖИТЬ ВремТабл;",
+        ] {
+            assert!(first_member_is_select(allowed), "must be allowed: {allowed:?}");
+        }
+
+        for rejected in [
+            "// отчёт\nУНИЧТОЖИТЬ ВремТабл;",
+            "УНИЧТОЖИТЬ ВремТабл;",
+            "// один\n// два\nУНИЧТОЖИТЬ ВремТабл",
+            "ИЗ Т",
+            "ГДЕ 1",
+            "ОБЪЕДИНИТЬ ВЫБРАТЬ 1",
+        ] {
+            assert!(!first_member_is_select(rejected), "must be rejected: {rejected:?}");
         }
     }
 

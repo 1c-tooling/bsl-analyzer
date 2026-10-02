@@ -169,6 +169,9 @@ pub struct Register {
     #[serde(rename = "periodicity", default)]
     periodicity: Option<RegisterPeriodicity>,
 
+    #[serde(rename = "recorderSubordinate", default)]
+    recorder_subordinate: bool,
+
     #[serde(rename = "registerType", default)]
     register_type: Option<AccumulationRegisterType>,
 
@@ -226,6 +229,10 @@ impl Register {
 
     pub fn periodicity(&self) -> Option<RegisterPeriodicity> {
         self.periodicity
+    }
+
+    pub fn is_recorder_subordinate(&self) -> bool {
+        self.recorder_subordinate
     }
 
     pub fn register_type(&self) -> Option<AccumulationRegisterType> {
@@ -353,6 +360,7 @@ pub struct RegisterBuilder {
     attributes: Vec<RegisterAttribute>,
     periodicity: Option<RegisterPeriodicity>,
     register_type: Option<AccumulationRegisterType>,
+    recorder_subordinate: bool,
     enable_totals_slice_first: bool,
     enable_totals_slice_last: bool,
 }
@@ -413,6 +421,11 @@ impl RegisterBuilder {
         self
     }
 
+    pub fn recorder_subordinate(mut self, value: bool) -> Self {
+        self.recorder_subordinate = value;
+        self
+    }
+
     pub fn enable_totals_slice_first(mut self, value: bool) -> Self {
         self.enable_totals_slice_first = value;
         self
@@ -433,6 +446,7 @@ impl RegisterBuilder {
             attributes: self.attributes,
             periodicity: self.periodicity,
             register_type: self.register_type,
+            recorder_subordinate: self.recorder_subordinate,
             enable_totals_slice_first: self.enable_totals_slice_first,
             enable_totals_slice_last: self.enable_totals_slice_last,
         }

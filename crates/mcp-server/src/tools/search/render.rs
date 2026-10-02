@@ -30,7 +30,8 @@ pub(super) fn graph_id_for_hit(
     roots: Option<&bsl_search::WorkspaceRoots>,
     graph_root: Option<&ide::StripRoot>,
 ) -> Option<String> {
-    if hit.symbol_name.is_empty() {
+    let symbol = original_symbol(hit);
+    if symbol.is_empty() {
         return None;
     }
     let kind = hit.kind.to_lowercase();
@@ -40,7 +41,7 @@ pub(super) fn graph_id_for_hit(
         return None;
     }
     if Path::new(&hit.file_path).is_absolute() {
-        return ide::method_graph_id(&hit.file_path, &hit.symbol_name, graph_root);
+        return ide::method_graph_id(&hit.file_path, symbol, graph_root);
     }
     // Anchoring is possible only when the hit's own root is registered here. It need not be:
     // a hit read from a shared baseline carries the identifier the PUBLISHER's table gave it,
@@ -55,10 +56,14 @@ pub(super) fn graph_id_for_hit(
         roots.resolve_walked(&bsl_search::FileKey::new(&hit.root_id, &hit.file_path))
     });
     match anchored {
-        Some(abs) => ide::method_graph_id(&abs.to_string_lossy(), &hit.symbol_name, graph_root),
-        None => ide::method_graph_id(&hit.file_path, &hit.symbol_name, None)
+        Some(abs) => ide::method_graph_id(&abs.to_string_lossy(), symbol, graph_root),
+        None => ide::method_graph_id(&hit.file_path, symbol, None)
             .filter(|id| !id.starts_with("method/file/")),
     }
+}
+
+fn original_symbol(hit: &SearchHit) -> &str {
+    hit.source_span.as_ref().map_or(&hit.symbol_name, |span| &span.parent_symbol)
 }
 
 /// How many leading snippet lines the listing shows. The structured view mirrors exactly
@@ -530,7 +535,7 @@ fn hit_location(hit: &SearchHit) -> Result<loc::Location, loc::LocationUnavailab
         return Err(loc::LocationUnavailable::AbsolutePathWithoutPair);
     }
     let location = loc::Location::from_key(&hit.root_id, &hit.file_path);
-    if hit.symbol_name.is_empty() {
+    if original_symbol(hit).is_empty() {
         return Ok(location);
     }
     Ok(location.with_enclosing_range(Some(loc::PositionRange {
@@ -585,6 +590,7 @@ pub(super) fn code_hit_blocks(
         .map(|(i, fused)| {
             let rank = i + 1;
             let hit = &fused.hit;
+            let symbol = original_symbol(hit);
             let mut text = String::new();
             // An extension repeats the configuration's directory layout wholesale, so the same
             // relative path under two roots is ordinary rather than exotic. The owning root is
@@ -602,7 +608,7 @@ pub(super) fn code_hit_blocks(
                 hit.file_path,
                 hit.line_start + 1,
                 hit.line_end,
-                display_name(&hit.symbol_name),
+                display_name(symbol),
                 hit.kind,
             );
             let mut json = json!({
@@ -614,8 +620,18 @@ pub(super) fn code_hit_blocks(
                 "line_end": hit.line_end,
                 "kind": hit.kind,
             });
-            if !hit.symbol_name.is_empty() {
-                json["symbol"] = json!(hit.symbol_name);
+            if !symbol.is_empty() {
+                json["symbol"] = json!(symbol);
+            }
+            if let Some(span) = &hit.source_span {
+                json["source_span"] = json!({
+                    "byte_start": span.byte_start,
+                    "byte_end": span.byte_end,
+                    "parent_byte_start": span.parent_byte_start,
+                    "parent_byte_end": span.parent_byte_end,
+                    "part_index": span.part_index,
+                    "part_count": span.part_count,
+                });
             }
             enrich_platform_reference(&mut json, &hit.kind, &hit.symbol_name);
             if let Some(id) = graph_id_for_hit(hit, roots, graph_root) {
@@ -785,6 +801,41 @@ mod tests {
 
     fn fused(symbol: &str, modality: Modality) -> FusedHit {
         FusedHit { hit: code_hit("CommonModules/М/Ext/Module.bsl", symbol, "procedure"), modality }
+    }
+
+    #[test]
+    fn token_part_render_preserves_original_symbol_span_and_budget() {
+        let mut part = fused("ПроверитьИНН (часть 2)", Modality::Both);
+        part.hit.source_span = Some(bsl_search::SourceSpan {
+            parent_symbol: "ПроверитьИНН".into(),
+            byte_start: 20,
+            byte_end: 40,
+            parent_byte_start: 0,
+            parent_byte_end: 60,
+            part_index: 2,
+            part_count: 3,
+        });
+        let out = format_code_hits(&[part.clone()], None, usize::MAX);
+        let hit = &out.hits[0];
+        assert_eq!(hit["symbol"], "ПроверитьИНН");
+        assert_eq!(
+            hit["source_span"],
+            json!({
+                "byte_start": 20, "byte_end": 40,
+                "parent_byte_start": 0, "parent_byte_end": 60,
+                "part_index": 2, "part_count": 3,
+            })
+        );
+        assert_eq!(
+            hit["graph_id"],
+            json!(graph_id_for_hit(&fused("ПроверитьИНН", Modality::Both).hit, None, None))
+        );
+        assert!(!out.text.contains("часть 2"));
+        let cut = format_code_hits(&[part], None, out.text.len().div_ceil(4));
+        assert_eq!(cut.shown, 0, "source_span JSON contributes to the output budget");
+        let legacy =
+            format_code_hits(&[fused("ПроверитьИНН", Modality::Lexical)], None, usize::MAX);
+        assert!(legacy.hits[0].get("source_span").is_none());
     }
 
     #[test]
@@ -1114,6 +1165,7 @@ mod tests {
     #[test]
     fn doc_hit_structure_rounds_the_score_the_listing_prints() {
         let hits = vec![SearchHit {
+            source_span: None,
             collection: "platform".to_owned(),
             root_id: bsl_search::CONFIGURATION_ROOT_ID.to_owned(),
             file_path: "Массив.html".to_owned(),
@@ -1138,6 +1190,7 @@ mod tests {
         // 0.0625 is exact in binary and lands exactly halfway at 3 decimals: `{:.3}` breaks the
         // tie to even (0.062), arithmetic rounding breaks it away from zero (0.063).
         let hits = vec![SearchHit {
+            source_span: None,
             collection: "platform".to_owned(),
             root_id: bsl_search::CONFIGURATION_ROOT_ID.to_owned(),
             file_path: "Массив.html".to_owned(),
@@ -1317,7 +1370,7 @@ mod tests {
         let code = no_hits_response(None, Envelope::Yes, "search_code", None);
         let body = code.structured_content.unwrap();
         assert!(body["freshness"].get("drift_watch").is_none());
-        assert_eq!(body["schema_version"], "7");
+        assert_eq!(body["schema_version"], "8");
     }
 
     #[test]

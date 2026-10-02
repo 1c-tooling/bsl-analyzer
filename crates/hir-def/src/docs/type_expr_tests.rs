@@ -42,12 +42,12 @@ fn parses_russian_and_english_method_collection_see_returns() {
 }
 
 #[test]
-fn parses_structure_with_direct_fields_only() {
+fn parses_structure_fields_recursively() {
     let docs = parse_docs(&[
         "Возвращаемое значение:",
         "  Структура:",
-        "    * Имя - Строка - имя.",
-        "    ** Вложенное - Число - не поддерживается.",
+        "    * Адрес - Структура:",
+        "    ** Город - Строка - город.",
     ]);
 
     let Some(DocTypeExpr::Structure { fields }) = parse_type_expr(&docs.returned_value[0]) else {
@@ -55,7 +55,12 @@ fn parses_structure_with_direct_fields_only() {
     };
 
     assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].name, "Имя");
+    assert_eq!(fields[0].name, "Адрес");
+    let [DocTypeExpr::Structure { fields }] = fields[0].types.as_slice() else {
+        panic!("expected nested documented structure");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "Город");
     assert!(matches!(fields[0].types.as_slice(), [DocTypeExpr::TypeRef(_)]));
 }
 

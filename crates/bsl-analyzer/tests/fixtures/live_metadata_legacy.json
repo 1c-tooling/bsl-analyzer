@@ -9,6 +9,7 @@
   "name": "УдалённыйОбъект",
   "full_name": "Справочник.УдалённыйОбъект",
   "synonym": "Удалённый объект",
+  "ТабличныеЧасти": [{"name":"LegacyRows","synonym":"Legacy rows"}],
   "Реквизиты": [
     {"name":"SameAsWorkspace","synonym":"Same as workspace","type":"СправочникСсылка.Контрагенты"},
     {"name":"OnlyInOtherInfobase","synonym":"Only in other infobase","type":"СправочникСсылка.Контрагенты"}

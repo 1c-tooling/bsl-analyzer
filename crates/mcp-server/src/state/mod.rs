@@ -1,5 +1,5 @@
 mod bootstrap;
-pub use bootstrap::WorkspaceInitError;
+pub use bootstrap::{resolve_embedding_token_profile_values, WorkspaceInitError};
 mod embed;
 pub(crate) mod overlay_backlog;
 pub(crate) mod overlay_retry;
@@ -24,6 +24,7 @@ pub(crate) use types::{
     shared_engine, OverlayWarmupState, SemanticRuntimeStatus, SharedSearchEngine,
     WorkspaceSearchMode,
 };
+pub use types::{EmbeddingPrefixes, EmbeddingTokenProfile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReferenceSearchLifecycle {
@@ -39,6 +40,7 @@ pub(crate) struct ReferenceSearchState {
     progress: Arc<IndexProgress>,
     semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
     baseline: DeferredBaselineRuntime,
+    embedding_prefixes: types::EmbeddingPrefixes,
     lifecycle: Arc<Mutex<ReferenceSearchLifecycle>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
     /// The reference profile's own stop, for the one thing it shares with the workspace one:
@@ -695,8 +697,11 @@ impl SharedState {
                             let Some(baseline) = self.baseline.try_external() else {
                                 return unknown();
                             };
-                            match (baseline, engine.embedding_model(), engine.embedding_dimension())
-                            {
+                            match (
+                                baseline,
+                                engine.embedding_storage_identity(),
+                                engine.embedding_dimension(),
+                            ) {
                                 (Some(baseline), Some(model), Some(dim)) => match baseline
                                     .indexing_publication(
                                         model,
@@ -753,7 +758,7 @@ impl SharedState {
                             // Semantic identity and coverage do not gate lexical search, so an
                             // unverified publication still serves lexical hits.
                             match baseline.indexing_publication(
-                                engine.embedding_model().unwrap_or(""),
+                                engine.embedding_storage_identity().unwrap_or(""),
                                 engine.embedding_dimension().unwrap_or(0),
                                 engine.try_workspace_overlay_baseline_identity().as_ref(),
                             ) {

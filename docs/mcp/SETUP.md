@@ -190,7 +190,7 @@ codex mcp list
   |-----------|-----------|--------|
   | `EMBEDDING_URL` | базовый URL embedder'а | — (обязательно) |
   | `EMBEDDING_MODEL` | имя модели | `Qwen/Qwen3-Embedding-0.6B` |
-  | `EMBEDDING_DIM` | размерность вектора (должна совпасть с моделью) | `1024` |
+  | `EMBEDDING_DIM` | размерность вектора; не задана — поле `dimensions` не отправляется, индекс строится на 1024; модели другой ширины требуют значения (и эндпоинта, принимающего `dimensions`) | — (1024) |
   | `EMBEDDING_API_KEY` | ключ (для сервисов с Bearer-авторизацией) | — (опц.) |
   | `EMBEDDING_MAX_REQUEST_BYTES` | положительный предел одного сериализованного HTTP JSON body, байты | `1048576` (1 MiB) |
   | `EMBEDDING_PUBLISH_RETRY_BUDGET_SECS` | общий лимит повторных попыток публикации, секунды | `600` |
@@ -201,7 +201,6 @@ codex mcp list
   bsl-analyzer mcp install --target all --preset recommended --source-dir . \
     --env EMBEDDING_URL=https://your-embedder/v1 \
     --env EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B \
-    --env EMBEDDING_DIM=1024 \
     --env EMBEDDING_PUBLISH_RETRY_BUDGET_SECS=600 \
     --env EMBEDDING_API_KEY=sk-...
   ```
