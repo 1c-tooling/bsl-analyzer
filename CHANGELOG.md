@@ -238,6 +238,11 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
   (`parser::parse_sdbl`) — ведущий комментарий или пустые строки больше не
   отклоняют корректный SELECT, а не-SELECT за комментарием по-прежнему
   отклоняется (github#84).
+- CI: Windows-джоб `windows-mcp` больше не запускает голые `cargo test` — каждый
+  поимённый фильтр идёт через `run_exact`/`run_nonempty`, требующие хотя бы один
+  выполненный тест. Обёртки сохраняют вывод упавшего прогона, а
+  `scripts/test-ci-test-output.py` проверяет и сами обёртки, и то, что в джобе не
+  осталось непроверенных запусков (github#102).
 
 ### Changed
 

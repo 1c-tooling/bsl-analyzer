@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check the CI test wrappers preserve failures and reject empty test selections."""
+"""Check the CI test wrappers preserve failures and reject empty selections,
+and that the Windows job routes every `cargo test` through one."""
 
 from pathlib import Path
 import re
@@ -32,4 +33,18 @@ for block in wrappers:
         )
         assert (result.returncode == 0) == (passed > 0 and status == 0), result
         assert output in result.stdout, result
-print(f"PASS: {len(wrappers)} CI wrappers, success/empty/failure output")
+# The windows-mcp job is the only place the code runs under Windows, and its coverage
+# is a hand-written list of names. A bare `cargo test` there can select nothing and
+# stay green; every invocation in the job must go through a checked wrapper.
+job = re.search(
+    r"^  windows-mcp:$\n.*?(?=^  [a-zA-Z0-9_-]+:$\n|\Z)",
+    workflow.read_text(),
+    re.MULTILINE | re.DOTALL,
+)
+assert job, "no windows-mcp job in the workflow"
+unwrapped = job.group(0)
+for block in wrappers:
+    unwrapped = unwrapped.replace(block, "")
+bare_test = re.search(r'cargo\s+["\']?\s*test\b', unwrapped)
+assert not bare_test, "windows-mcp runs cargo test outside a wrapper"
+print(f"PASS: {len(wrappers)} CI wrappers, success/empty/failure output; windows-mcp wraps every cargo test")
