@@ -2344,6 +2344,76 @@ mod tests {
         assert!(!candidate.exists(), "the replacement was renamed, not copied");
     }
 
+    /// Four reads in flight, one of them the search-context provider's, all finish against the
+    /// old generation before the replacement is renamed in.
+    #[test]
+    fn a_replacement_waits_for_four_concurrent_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let path = graph_db_path(root);
+        let (candidate, _) = next_publication_beside(&path);
+
+        let mut held: Vec<_> =
+            (0..3).map(|_| graph.snapshot().expect("a read in flight")).collect();
+        let provider =
+            graph.store.checkout(None, Duration::from_millis(50)).expect("provider read");
+        let publisher = {
+            let (graph, candidate, path) = (graph.clone(), candidate.clone(), path.clone());
+            std::thread::spawn(move || {
+                publish_or_discard(&graph, &candidate, &path, Some("test-1"), true)
+            })
+        };
+        // The replacement is released only by the last of the four.
+        for snapshot in held.drain(..) {
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(!publisher.is_finished(), "the replacement waits for every read");
+            assert_eq!(snapshot.graph.freshness_token().unwrap().0, 7, "the old read stays whole");
+            drop(snapshot);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!publisher.is_finished(), "the fourth read still holds the replacement");
+        assert_eq!(provider.graph.freshness_token().unwrap().0, 7);
+        drop(provider);
+        assert!(matches!(publisher.join().unwrap().unwrap(), Replaced::Done(_)));
+    }
+
+    /// A request arriving during the pause waits for admission about two seconds, not for the
+    /// whole installation wait, and then gets `Busy` while the replacement is still pending.
+    #[test]
+    fn a_read_during_the_pause_is_refused_after_the_admission_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let path = graph_db_path(root);
+        let (candidate, _) = next_publication_beside(&path);
+
+        let held = graph.snapshot().expect("a read in flight");
+        let publisher = {
+            let (graph, candidate, path) = (graph.clone(), candidate.clone(), path.clone());
+            std::thread::spawn(move || {
+                publish_or_discard(&graph, &candidate, &path, Some("test-1"), true)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let outcome = graph.store.read(None, Duration::from_millis(50), |_| ());
+        let waited = started.elapsed();
+        assert_eq!(outcome, Err(crate::graph::GraphReadError::Busy));
+        assert!(waited >= Duration::from_millis(1900), "it waited for admission: {waited:?}");
+        assert!(waited < Duration::from_millis(3500), "but not for the whole wait: {waited:?}");
+        drop(held);
+        assert!(matches!(publisher.join().unwrap().unwrap(), Replaced::Done(_)));
+    }
+
     /// A read that outlasts the installation wait keeps the old graph serving: nothing is
     /// renamed, the prepared replacement stays for the next attempt, and lending resumes.
     #[test]
