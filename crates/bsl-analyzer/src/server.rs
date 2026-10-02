@@ -53,6 +53,7 @@ pub fn main_loop(connection: Connection) -> Result<()> {
         crate::lsp::to_proto::ClientTags::from_capabilities(&initialize_params.capabilities);
     let supports_workspace_edit_document_changes =
         client_supports_workspace_edit_document_changes(&initialize_params.capabilities);
+    let folding_range_limit = client_folding_range_limit(&initialize_params.capabilities);
 
     // The pull diagnostic provider is opt-in per configuration, so the scope must be
     // known before capabilities are advertised — before the VFS loader (and its own
@@ -104,6 +105,7 @@ pub fn main_loop(connection: Connection) -> Result<()> {
     state.supports_code_description = supports_code_description;
     state.supports_diagnostic_tags = supports_diagnostic_tags;
     state.supports_workspace_edit_document_changes = supports_workspace_edit_document_changes;
+    state.folding_range_limit = folding_range_limit;
     // Suppress push publishing only when the client will actually pull, so a
     // pull-capable client does not render open-buffer diagnostics twice; a client
     // that cannot pull keeps push even with the feature enabled.
@@ -180,6 +182,12 @@ fn client_supports_workspace_edit_document_changes(caps: &lsp_types::ClientCapab
         .and_then(|w| w.workspace_edit.as_ref())
         .and_then(|we| we.document_changes)
         .unwrap_or(false)
+}
+
+/// The client's `rangeLimit` for folding ranges, if it named one. The handler
+/// truncates an over-long `textDocument/foldingRange` response to it.
+fn client_folding_range_limit(caps: &lsp_types::ClientCapabilities) -> Option<u32> {
+    caps.text_document.as_ref()?.folding_range.as_ref()?.range_limit
 }
 
 /// Whether the client advertised pull-diagnostics support (`textDocument/diagnostic`).
@@ -1400,6 +1408,24 @@ mod tests {
         state.diagnostics_generation.insert(uri.clone(), 7);
         invalidate_diagnostics(&mut state, std::slice::from_ref(&uri));
         assert_eq!(state.diagnostics_generation[&uri], 8);
+    }
+
+    #[test]
+    fn folding_range_limit_comes_from_the_client_capabilities() {
+        let without = lsp_types::ClientCapabilities::default();
+        assert_eq!(client_folding_range_limit(&without), None);
+
+        let with_limit = lsp_types::ClientCapabilities {
+            text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                folding_range: Some(lsp_types::FoldingRangeClientCapabilities {
+                    range_limit: Some(5000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(client_folding_range_limit(&with_limit), Some(5000));
     }
 
     #[test]

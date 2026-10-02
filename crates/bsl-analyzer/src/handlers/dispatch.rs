@@ -168,6 +168,7 @@ impl RequestDispatcher<'_> {
             supports_workspace_edit_document_changes: self
                 .global_state
                 .supports_workspace_edit_document_changes,
+            folding_range_limit: self.global_state.folding_range_limit,
             task_sender: self.global_state.task_pool.pool.sender.clone(),
             call_hierarchy_index: self.global_state.call_hierarchy_index.ensure(),
             call_hierarchy_wait_policy: self.global_state.call_hierarchy_wait_policy,
@@ -648,6 +649,7 @@ mod tests {
                 .supports_insert_text_mode_adjust_indentation,
             supports_workspace_edit_document_changes: state
                 .supports_workspace_edit_document_changes,
+            folding_range_limit: state.folding_range_limit,
             task_sender: state.task_pool.pool.sender.clone(),
             call_hierarchy_index: state.call_hierarchy_index.ensure(),
             call_hierarchy_wait_policy: state.call_hierarchy_wait_policy,

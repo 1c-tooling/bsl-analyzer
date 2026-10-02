@@ -306,6 +306,10 @@ pub struct GlobalState {
     /// document's version so the client rejects them if the buffer moved on after
     /// the snapshot; otherwise the server falls back to unversioned `changes`.
     pub supports_workspace_edit_document_changes: bool,
+    /// Negotiated at `initialize`: the client's `rangeLimit` for folding ranges.
+    /// When the response would exceed it, the handler drops the deepest folds
+    /// first, so the outer skeleton survives (github#56).
+    pub folding_range_limit: Option<u32>,
     /// True when the pull diagnostic provider is advertised (config opt-in) *and* the
     /// client advertised `textDocument/diagnostic` support — i.e. the client drives
     /// diagnostics by pulling. In that mode push publishing is suppressed so a
@@ -491,6 +495,7 @@ impl GlobalState {
             supports_code_description: false,
             supports_diagnostic_tags: ClientTags::NONE,
             supports_workspace_edit_document_changes: false,
+            folding_range_limit: None,
             pull_diagnostics_active: false,
             supports_workspace_diagnostic_refresh: false,
             diagnostics_generation: HashMap::new(),
