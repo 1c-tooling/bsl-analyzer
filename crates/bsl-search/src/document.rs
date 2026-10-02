@@ -1,7 +1,9 @@
-use crate::domain::IndexedDocument;
+use crate::domain::{IndexedDocument, SourceSpan};
+use crate::error::{EmbeddingFailureCode, SearchError};
 use crate::ports::GraphContextProvider;
+use crate::token_policy::TokenPolicy;
 use crate::workspace_roots::FileKey;
-use code_chunk::{Chunk, ChunkKind};
+use code_chunk::{Chunk, ChunkKind, Chunker};
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -95,7 +97,268 @@ pub(crate) fn indexed_document_for_chunk(
         content_hash: blake3::hash(chunk.text.as_bytes()).to_hex().to_string(),
         text: chunk.text.clone(),
         graph_context,
+        source_span: None,
     }
+}
+
+/// Prepare token-bounded parts from original AST source spans before legacy chunk splitting.
+/// `check_singleton` must use the embedder's real serializer and byte ceiling.
+pub fn prepare_file_documents(
+    key: &FileKey,
+    source: &str,
+    provider: Option<&dyn GraphContextProvider>,
+    policy: &TokenPolicy,
+    document_prefix: &str,
+    mut check_singleton: impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<Vec<IndexedDocument>, SearchError> {
+    prepare_file_documents_with_context(
+        key,
+        source,
+        |chunk| {
+            Ok(match chunk.kind {
+                ChunkKind::Procedure | ChunkKind::Function => provider.and_then(|provider| {
+                    provider.graph_context(&key.path, &chunk.name, chunk.kind.label())
+                }),
+                ChunkKind::ModuleHeader => None,
+            })
+        },
+        policy,
+        document_prefix,
+        &mut check_singleton,
+    )
+}
+
+pub(crate) fn prepare_file_documents_with_context(
+    key: &FileKey,
+    source: &str,
+    mut render_context: impl FnMut(&Chunk) -> Result<Option<String>, SearchError>,
+    policy: &TokenPolicy,
+    document_prefix: &str,
+    check_singleton: &mut impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<Vec<IndexedDocument>, SearchError> {
+    let mut documents = Vec::new();
+    for parent in Chunker::source_chunks(source) {
+        let chunk = parent.chunk;
+        let kind = chunk.kind.label();
+        let context = render_context(&chunk)?;
+        let full_input = final_document_input(
+            key,
+            &chunk,
+            context.as_deref().unwrap_or(""),
+            &chunk.text,
+            document_prefix,
+        );
+        let ranges = if chunk.text.len() > crate::token_policy::MAX_SOURCE_WINDOW_BYTES {
+            Some(policy.split_source(&chunk.text, |part_index, slice| {
+                check_source_part(
+                    key,
+                    &chunk,
+                    kind,
+                    context.as_deref().unwrap_or(""),
+                    document_prefix,
+                    part_index,
+                    slice,
+                    policy,
+                    check_singleton,
+                )
+            })?)
+        } else {
+            match check_prepared_input(policy, &full_input, check_singleton) {
+                Ok(()) => None,
+                Err(error) if is_input_too_large(&error) => {
+                    Some(policy.split_source(&chunk.text, |part_index, slice| {
+                        check_source_part(
+                            key,
+                            &chunk,
+                            kind,
+                            context.as_deref().unwrap_or(""),
+                            document_prefix,
+                            part_index,
+                            slice,
+                            policy,
+                            check_singleton,
+                        )
+                    })?)
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        match ranges {
+            None => documents.push(prepared_document(
+                key,
+                &chunk,
+                context.clone(),
+                SourceSpan {
+                    parent_symbol: chunk.name.clone(),
+                    parent_byte_start: parent.source_byte_start,
+                    parent_byte_end: parent.source_byte_end,
+                    byte_start: parent.source_byte_start,
+                    byte_end: parent.source_byte_end,
+                    part_index: 1,
+                    part_count: 1,
+                },
+                chunk.text.clone(),
+            )),
+            Some(ranges) => {
+                let count = ranges.len() as u32;
+                for (index, range) in ranges.into_iter().enumerate() {
+                    let chunk_text = chunk.text[range.clone()].to_owned();
+                    let absolute_start = parent.source_byte_start + range.start as u32;
+                    let absolute_end = parent.source_byte_start + range.end as u32;
+                    let mut part = chunk.clone();
+                    part.name = if chunk.name.is_empty() {
+                        format!("Header (часть {})", index + 1)
+                    } else {
+                        format!("{} (часть {})", chunk.name, index + 1)
+                    };
+                    part.line_start +=
+                        chunk.text[..range.start].bytes().filter(|byte| *byte == b'\n').count()
+                            as u32;
+                    part.line_end = part.line_start
+                        + chunk_text.bytes().filter(|byte| *byte == b'\n').count() as u32
+                        + u32::from(!chunk_text.ends_with('\n'));
+                    documents.push(prepared_document(
+                        key,
+                        &part,
+                        context.clone(),
+                        SourceSpan {
+                            parent_symbol: chunk.name.clone(),
+                            parent_byte_start: parent.source_byte_start,
+                            parent_byte_end: parent.source_byte_end,
+                            byte_start: absolute_start,
+                            byte_end: absolute_end,
+                            part_index: index as u32 + 1,
+                            part_count: count,
+                        },
+                        chunk_text,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(documents)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_source_part(
+    key: &FileKey,
+    parent: &Chunk,
+    kind: &str,
+    graph_context: &str,
+    document_prefix: &str,
+    part_index: u32,
+    slice: &str,
+    policy: &TokenPolicy,
+    check_singleton: &mut impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
+    let name = if parent.name.is_empty() {
+        format!("Header (часть {part_index})")
+    } else {
+        format!("{} (часть {part_index})", parent.name)
+    };
+    let input = semantic_text_from_parts(&key.path, kind, &name, graph_context, slice);
+    check_prepared_input(policy, &format!("{document_prefix}{input}"), check_singleton)
+}
+
+pub(crate) fn prepare_indexed_documents(
+    key: &FileKey,
+    source: &str,
+    provider: Option<&dyn GraphContextProvider>,
+    embedder: Option<&crate::Embedder>,
+) -> Result<Vec<IndexedDocument>, SearchError> {
+    if let Some(embedder) = embedder {
+        if let Some(policy) = embedder.token_policy() {
+            return prepare_file_documents(
+                key,
+                source,
+                provider,
+                policy,
+                embedder.document_prefix(),
+                |input| embedder.check_singleton_input(input),
+            );
+        }
+    }
+    Ok(Chunker::chunk(source)
+        .iter()
+        .map(|chunk| indexed_document_for_chunk(key, chunk, provider))
+        .collect())
+}
+
+pub(crate) fn chunks_contexts_and_spans(
+    documents: &[IndexedDocument],
+) -> (Vec<Chunk>, Vec<Option<String>>, Vec<Option<SourceSpan>>) {
+    let mut chunks = Vec::with_capacity(documents.len());
+    let mut contexts = Vec::with_capacity(documents.len());
+    let mut spans = Vec::with_capacity(documents.len());
+    for document in documents {
+        let kind = match document.kind.as_str() {
+            "procedure" => ChunkKind::Procedure,
+            "function" => ChunkKind::Function,
+            _ => ChunkKind::ModuleHeader,
+        };
+        chunks.push(Chunk {
+            kind,
+            name: document.symbol_name.clone(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: document.line_start,
+            line_end: document.line_end,
+            text: document.text.clone(),
+        });
+        contexts.push(document.graph_context.clone());
+        spans.push(document.source_span.clone());
+    }
+    (chunks, contexts, spans)
+}
+
+fn check_prepared_input(
+    policy: &TokenPolicy,
+    input: &str,
+    check_singleton: &mut impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
+    policy.check(input)?;
+    check_singleton(input)
+}
+
+fn final_document_input(
+    key: &FileKey,
+    chunk: &Chunk,
+    graph_context: &str,
+    text: &str,
+    document_prefix: &str,
+) -> String {
+    format!(
+        "{document_prefix}{}",
+        semantic_text_from_parts(&key.path, chunk.kind.label(), &chunk.name, graph_context, text)
+    )
+}
+
+fn prepared_document(
+    key: &FileKey,
+    chunk: &Chunk,
+    graph_context: Option<String>,
+    source_span: SourceSpan,
+    text: String,
+) -> IndexedDocument {
+    IndexedDocument {
+        collection: "code".to_owned(),
+        root_id: key.root_id.clone(),
+        path: key.path.clone(),
+        symbol_name: chunk.name.clone(),
+        kind: chunk.kind.label().to_owned(),
+        line_start: chunk.line_start,
+        line_end: chunk.line_end,
+        content_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+        text,
+        graph_context,
+        source_span: Some(source_span),
+    }
+}
+
+fn is_input_too_large(error: &SearchError) -> bool {
+    error
+        .embedding_failure()
+        .is_some_and(|failure| failure.code == EmbeddingFailureCode::EmbeddingInputTooLarge)
 }
 
 #[cfg(test)]
@@ -114,6 +377,7 @@ mod tests {
             text: "Возврат 1;".to_owned(),
             content_hash: "h".to_owned(),
             graph_context: None,
+            source_span: None,
         }
     }
 
@@ -208,5 +472,103 @@ mod tests {
             semantic_text_for_indexed_document(&blank),
             semantic_text_for_indexed_document(&doc())
         );
+    }
+
+    #[test]
+    fn prepared_file_parts_cover_original_source_and_keep_parent_context() {
+        let Ok(path) = std::env::var("USER2_TOKENIZER_JSON") else { return };
+        let policy = TokenPolicy::load(
+            std::path::Path::new(&path),
+            "80d0433a2cfc55a4561b0e98b6f822decc48c9d457db498837223f9385ef3aff",
+            120,
+        )
+        .unwrap();
+        let source = format!("Процедура Тест()\r\n{}\r\nКонецПроцедуры", "x".repeat(2200));
+        let provider = FakeProvider;
+        let key = FileKey::configuration("CommonModules/Тест/Ext/Module.bsl");
+        let mut accepted_inputs = Vec::new();
+        let documents =
+            prepare_file_documents(&key, &source, Some(&provider), &policy, "", |input| {
+                if input.len() > 1000 {
+                    Err(crate::error::EmbeddingFailure::new(
+                        EmbeddingFailureCode::EmbeddingInputTooLarge,
+                    )
+                    .into())
+                } else {
+                    accepted_inputs.push(input.to_owned());
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert!(documents.len() > 1);
+        assert!(documents.iter().all(|document| document
+            .graph_context
+            .as_deref()
+            .unwrap()
+            .contains("Calls: ТестВызов")));
+        let spans = documents
+            .iter()
+            .map(|document| document.source_span.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(spans.first().unwrap().part_index, 1);
+        assert!(spans.iter().all(|span| span.part_count as usize == documents.len()));
+        assert!(spans.windows(2).all(|pair| pair[0].byte_end == pair[1].byte_start));
+        assert_eq!(spans.first().unwrap().byte_start, spans.first().unwrap().parent_byte_start);
+        assert_eq!(spans.last().unwrap().byte_end, spans.last().unwrap().parent_byte_end);
+        let reconstructed =
+            documents.iter().map(|document| document.text.as_str()).collect::<String>();
+        assert_eq!(reconstructed, source);
+        for document in &documents {
+            let span = document.source_span.as_ref().unwrap();
+            assert_eq!(span.parent_symbol, "Тест");
+            assert_eq!(&source[span.byte_start as usize..span.byte_end as usize], document.text);
+            assert!(accepted_inputs.contains(&semantic_text_for_indexed_document(document)));
+        }
+
+        let header_source = format!("Перем {}", "x".repeat(2200));
+        let header_docs =
+            prepare_file_documents(&key, &header_source, None, &policy, "", |input| {
+                if input.len() > 1000 {
+                    Err(crate::error::EmbeddingFailure::new(
+                        EmbeddingFailureCode::EmbeddingInputTooLarge,
+                    )
+                    .into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        let symbols = header_docs
+            .iter()
+            .map(|document| document.symbol_name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(symbols.len(), header_docs.len());
+        assert!(header_docs.iter().all(|document| document
+            .source_span
+            .as_ref()
+            .unwrap()
+            .parent_symbol
+            .is_empty()));
+
+        let large_source = format!("x=1; //{}", "x".repeat(535_405));
+        assert_eq!(large_source.len(), 535_412);
+        let largest_checked = std::cell::Cell::new(0usize);
+        let large_docs = prepare_file_documents(&key, &large_source, None, &policy, "", |input| {
+            largest_checked.set(largest_checked.get().max(input.len()));
+            Ok(())
+        })
+        .unwrap();
+        assert!(largest_checked.get() <= crate::token_policy::MAX_SOURCE_WINDOW_BYTES + 256);
+        assert_eq!(
+            large_docs.iter().map(|document| document.text.as_str()).collect::<String>(),
+            large_source
+        );
+        let large_spans = large_docs
+            .iter()
+            .map(|document| document.source_span.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(large_spans.first().unwrap().byte_start, 0);
+        assert_eq!(large_spans.last().unwrap().byte_end, large_source.len() as u32);
+        assert!(large_spans.windows(2).all(|parts| parts[0].byte_end == parts[1].byte_start));
     }
 }

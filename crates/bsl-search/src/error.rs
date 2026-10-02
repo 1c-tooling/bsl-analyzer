@@ -202,6 +202,15 @@ pub(crate) mod reason {
     pub(crate) const SNAPSHOT_REPUBLISHED_WHILE_PUBLISHING: ReasonCode =
         ReasonCode("snapshot_republished_while_publishing");
     pub(crate) const SCHEMA_NAME_TOO_LONG: ReasonCode = ReasonCode("schema_name_too_long");
+    pub(crate) const TOKEN_LAYOUT_CLAIM_MISMATCH: ReasonCode =
+        ReasonCode("token_layout_claim_mismatch");
+    pub(crate) const TOKEN_LAYOUT_CLAIM_MISSING: ReasonCode =
+        ReasonCode("token_layout_claim_missing");
+    pub(crate) const TOKEN_LAYOUT_CLAIM_REQUIRED: ReasonCode =
+        ReasonCode("token_layout_claim_required");
+    pub(crate) const TOKEN_LAYOUT_PROVENANCE_MISSING: ReasonCode =
+        ReasonCode("token_layout_provenance_missing");
+    pub(crate) const SOURCE_SPAN_INVALID: ReasonCode = ReasonCode("source_span_invalid");
 }
 
 /// The whole vocabulary. A code missing from here is not a named refusal at all.
@@ -220,6 +229,11 @@ const KNOWN_REASON_CODES: &[ReasonCode] = &[
     reason::ROOT_ID_NOT_PORTABLE,
     reason::SNAPSHOT_REPUBLISHED_WHILE_PUBLISHING,
     reason::SCHEMA_NAME_TOO_LONG,
+    reason::TOKEN_LAYOUT_CLAIM_MISMATCH,
+    reason::TOKEN_LAYOUT_CLAIM_MISSING,
+    reason::TOKEN_LAYOUT_CLAIM_REQUIRED,
+    reason::TOKEN_LAYOUT_PROVENANCE_MISSING,
+    reason::SOURCE_SPAN_INVALID,
 ];
 
 /// Refusals the caller may retry: the corpus is intact, the way to it was not.
@@ -435,6 +449,20 @@ mod tests {
             "helper_protocol_error: credential helper returned invalid JSON".to_owned(),
         );
         assert_eq!(err.reason_code(), Some("helper_protocol_error"));
+    }
+
+    #[test]
+    fn token_layout_and_source_span_refusals_are_registered() {
+        for prefix in [
+            "token_layout_claim_mismatch",
+            "token_layout_claim_missing",
+            "token_layout_claim_required",
+            "token_layout_provenance_missing",
+            "source_span_invalid",
+        ] {
+            let error = SearchError::ExternalBaseline(format!("{prefix}: invalid layout"));
+            assert_eq!(error.reason_code(), Some(prefix));
+        }
     }
 
     #[test]

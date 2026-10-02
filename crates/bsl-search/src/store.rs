@@ -1,4 +1,5 @@
 use crate::document::Document;
+use crate::domain::SourceSpan;
 use crate::error::SearchError;
 use crate::lifecycle::{Counts, Mutation, Outcome, Reason};
 use crate::workspace_roots::{FileKey, CONFIGURATION_ROOT_ID};
@@ -60,6 +61,11 @@ pub(crate) struct WorkspaceDriftStoreOutcome {
 pub type EmbeddingsSnapshot = (i64, Vec<(i64, Vec<f32>)>);
 pub(crate) type IndexEmbeddingSnapshot = (i64, Vec<(i64, Vec<f32>)>, usize);
 type OverlayEmbeddingPublication<'a> = (&'a str, usize, &'a HashMap<String, Vec<f32>>);
+const PROFILE_IDENTITY_PREFIX: &str = "profile-v1:";
+const PROFILE_IDENTITY_KEY: &str = "embedding_profile_identity";
+const PROFILE_DIMENSION_KEY: &str = "embedding_profile_dimension";
+const TOKEN_LAYOUT_CLAIM_KEY: &str = "token_layout_claim_v1";
+const TOKEN_LAYOUT_VERSION: &str = "token-segments-v1";
 
 /// One file prepared off-lock for an atomic workspace-root transition.
 pub(crate) struct WorkspaceTransitionFile {
@@ -67,6 +73,7 @@ pub(crate) struct WorkspaceTransitionFile {
     pub(crate) hash: Vec<u8>,
     pub(crate) chunks: Vec<Chunk>,
     pub(crate) graph_contexts: Vec<Option<String>>,
+    pub(crate) source_spans: Vec<Option<SourceSpan>>,
 }
 
 /// Persistent mutation set for one workspace-root transition.
@@ -77,6 +84,7 @@ pub(crate) struct WorkspaceStoreTransition<'a> {
     pub(crate) cleanup: &'a HashSet<FileKey>,
     pub(crate) tombstones: &'a HashSet<FileKey>,
     pub(crate) upserts: &'a [WorkspaceTransitionFile],
+    pub(crate) token_layout_claim: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -269,7 +277,213 @@ fn observe_count(
     *total = total.zip(count).map(|(a, b)| a.saturating_add(b));
 }
 
+fn token_layout_error() -> SearchError {
+    SearchError::Index("token layout mismatch".to_owned())
+}
+
+fn validate_source_spans(
+    spans: &[Option<SourceSpan>],
+    expected_len: usize,
+    require_complete: bool,
+) -> Result<(), SearchError> {
+    if spans.is_empty() && !require_complete {
+        return Ok(());
+    }
+    if spans.len() != expected_len || (require_complete && spans.iter().any(Option::is_none)) {
+        return Err(token_layout_error());
+    }
+    for span in spans.iter().flatten() {
+        if span.byte_start > span.byte_end
+            || span.parent_byte_start > span.parent_byte_end
+            || span.byte_start < span.parent_byte_start
+            || span.byte_end > span.parent_byte_end
+            || span.part_count == 0
+            || span.part_index == 0
+            || span.part_index > span.part_count
+        {
+            return Err(token_layout_error());
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_spans_for_chunks(
+    spans: &[Option<SourceSpan>],
+    chunks: &[Chunk],
+    require_complete: bool,
+) -> Result<(), SearchError> {
+    validate_source_spans(spans, chunks.len(), require_complete)?;
+    for (span, chunk) in spans.iter().zip(chunks) {
+        if span.as_ref().is_some_and(|span| {
+            span.parent_symbol.is_empty() && chunk.kind != code_chunk::ChunkKind::ModuleHeader
+        }) {
+            return Err(token_layout_error());
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_span_kind(span: &SourceSpan, chunk_kind: &str) -> Result<(), SearchError> {
+    validate_source_spans(&[Some(span.clone())], 1, true)?;
+    if span.parent_symbol.is_empty() && chunk_kind != "header" {
+        return Err(token_layout_error());
+    }
+    Ok(())
+}
+
+fn insert_source_span(
+    conn: &Connection,
+    table: &str,
+    chunk_id: i64,
+    span: &SourceSpan,
+) -> Result<(), SearchError> {
+    let sql = format!(
+        "INSERT INTO {table} (chunk_id, byte_start, byte_end, parent_byte_start, parent_byte_end, part_index, part_count, parent_symbol) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+    );
+    conn.execute(
+        &sql,
+        params![
+            chunk_id,
+            span.byte_start,
+            span.byte_end,
+            span.parent_byte_start,
+            span.parent_byte_end,
+            span.part_index,
+            span.part_count,
+            span.parent_symbol,
+        ],
+    )?;
+    Ok(())
+}
+
+fn source_span_from_row(
+    row: &rusqlite::Row<'_>,
+    start: usize,
+) -> rusqlite::Result<Option<SourceSpan>> {
+    use rusqlite::types::ValueRef;
+    // A value that does not fit its field is damage of the same kind as a missing one; reading
+    // it through the typed accessor would fail the whole row and the lexical hit with it.
+    let number = |offset: usize| -> rusqlite::Result<Option<u32>> {
+        Ok(match row.get_ref(start + offset)? {
+            ValueRef::Integer(value) => u32::try_from(value).ok(),
+            _ => None,
+        })
+    };
+    let parent_symbol = match row.get_ref(start)? {
+        ValueRef::Text(text) => std::str::from_utf8(text).ok().map(str::to_owned),
+        _ => None,
+    };
+    let byte_start = number(1)?;
+    let byte_end = number(2)?;
+    let parent_byte_start = number(3)?;
+    let parent_byte_end = number(4)?;
+    let part_index = number(5)?;
+    let part_count = number(6)?;
+    match (
+        parent_symbol,
+        byte_start,
+        byte_end,
+        parent_byte_start,
+        parent_byte_end,
+        part_index,
+        part_count,
+    ) {
+        (
+            Some(parent_symbol),
+            Some(byte_start),
+            Some(byte_end),
+            Some(parent_byte_start),
+            Some(parent_byte_end),
+            Some(part_index),
+            Some(part_count),
+        ) => Ok(Some(SourceSpan {
+            parent_symbol,
+            byte_start,
+            byte_end,
+            parent_byte_start,
+            parent_byte_end,
+            part_index,
+            part_count,
+        })),
+        (None, None, None, None, None, None, None) => Ok(None),
+        // Token-profile consumers validate the complete companion set before these readers run.
+        // A lexical-only reader can still serve the preserved chunk even if optional metadata is
+        // damaged or partial.
+        _ => Ok(None),
+    }
+}
+
+fn validate_complete_source_provenance(conn: &Connection) -> Result<(), SearchError> {
+    for (chunks, spans) in
+        [("chunks", "chunk_source_spans"), ("overlay_chunks", "overlay_chunk_source_spans")]
+    {
+        let count_sql =
+            format!("SELECT (SELECT COUNT(*) FROM {chunks}), (SELECT COUNT(*) FROM {spans})");
+        let (chunk_count, span_count): (i64, i64) =
+            conn.query_row(&count_sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        if chunk_count != span_count {
+            return Err(token_layout_error());
+        }
+        let sql = format!(
+            "SELECT s.byte_start, s.byte_end, s.parent_byte_start, s.parent_byte_end, s.part_index, s.part_count, s.parent_symbol, c.file_id, c.kind FROM {spans} s JOIN {chunks} c ON c.id = s.chunk_id ORDER BY c.file_id, s.parent_symbol, s.parent_byte_start, s.parent_byte_end, s.part_index"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        type ParentKey = (i64, String, u32, u32);
+        type PartOrdinals = (u32, HashSet<u32>);
+        let mut groups: HashMap<ParentKey, PartOrdinals> = HashMap::new();
+        let mut joined_count = 0i64;
+        while let Some(row) = rows.next()? {
+            joined_count += 1;
+            let span = SourceSpan {
+                byte_start: row.get(0)?,
+                byte_end: row.get(1)?,
+                parent_byte_start: row.get(2)?,
+                parent_byte_end: row.get(3)?,
+                part_index: row.get(4)?,
+                part_count: row.get(5)?,
+                parent_symbol: row.get(6)?,
+            };
+            let file_id: i64 = row.get(7)?;
+            let chunk_kind: String = row.get(8)?;
+            validate_source_span_kind(&span, &chunk_kind)?;
+            let key = (file_id, span.parent_symbol, span.parent_byte_start, span.parent_byte_end);
+            let entry = groups.entry(key).or_insert_with(|| (span.part_count, HashSet::new()));
+            if entry.0 != span.part_count || !entry.1.insert(span.part_index) {
+                return Err(token_layout_error());
+            }
+        }
+        if joined_count != span_count
+            || groups.values().any(|(count, indices)| {
+                indices.len() != *count as usize
+                    || !(1..=*count).all(|index| indices.contains(&index))
+            })
+        {
+            return Err(token_layout_error());
+        }
+    }
+    Ok(())
+}
+
 impl Store {
+    /// Pin or validate the opt-in source-part layout before callers load or publish snapshots.
+    /// A first claim is accepted only for an empty lexical store; existing rows need complete
+    /// matching provenance and an already matching claim.
+    pub fn ensure_token_layout_claim(
+        &self,
+        layout_version: &str,
+        claim: &str,
+    ) -> Result<(), SearchError> {
+        if layout_version != TOKEN_LAYOUT_VERSION || claim.is_empty() {
+            return Err(token_layout_error());
+        }
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::check_token_layout_claim(&tx, Some(claim), &[])?;
+        validate_complete_source_provenance(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: &Path) -> Result<Self, SearchError> {
         crate::lifecycle::startup_snapshot(path, "store");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -889,6 +1103,17 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_chunks_file
                 ON chunks(file_id);
 
+            CREATE TABLE IF NOT EXISTS chunk_source_spans (
+                chunk_id          INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+                byte_start        INTEGER NOT NULL,
+                byte_end          INTEGER NOT NULL,
+                parent_byte_start INTEGER NOT NULL,
+                parent_byte_end   INTEGER NOT NULL,
+                part_index        INTEGER NOT NULL,
+                part_count        INTEGER NOT NULL,
+                parent_symbol     TEXT NOT NULL
+            );
+
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 symbol_name,
                 text,
@@ -937,6 +1162,17 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_overlay_chunks_file
                 ON overlay_chunks(file_id);
+
+            CREATE TABLE IF NOT EXISTS overlay_chunk_source_spans (
+                chunk_id          INTEGER PRIMARY KEY REFERENCES overlay_chunks(id) ON DELETE CASCADE,
+                byte_start        INTEGER NOT NULL,
+                byte_end          INTEGER NOT NULL,
+                parent_byte_start INTEGER NOT NULL,
+                parent_byte_end   INTEGER NOT NULL,
+                part_index        INTEGER NOT NULL,
+                part_count        INTEGER NOT NULL,
+                parent_symbol     TEXT NOT NULL
+            );
 
             -- FTS index for overlay chunks.
             CREATE VIRTUAL TABLE IF NOT EXISTS overlay_chunks_fts USING fts5(
@@ -1245,6 +1481,16 @@ impl Store {
         path: &str,
         collection: &str,
     ) -> Result<(), SearchError> {
+        self.remove_file_with_token_layout(root_id, path, collection, None)
+    }
+
+    pub(crate) fn remove_file_with_token_layout(
+        &self,
+        root_id: &str,
+        path: &str,
+        collection: &str,
+        token_layout_claim: Option<&str>,
+    ) -> Result<(), SearchError> {
         let mut observation = Mutation::new(&self.path, Reason::FileDeleted);
         observation.record.files = 1;
         observation.record.examples.push(format!(
@@ -1254,7 +1500,8 @@ impl Store {
             crate::lifecycle::bounded(path, 128)
         ));
         let mut counts = Counts::default();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::match_token_layout_claim(&tx, token_layout_claim)?;
         tx.execute(
             "DELETE FROM chunks_fts WHERE rowid IN (
                  SELECT c.id FROM chunks c
@@ -1562,9 +1809,19 @@ impl Store {
     /// Commit one bounded, already-rendered context-refresh slice atomically. The caller keeps
     /// slices at `WORKSPACE_APPLY_BATCH_ROWS`; the two checkpoints refresh the lease heartbeat
     /// and turn a release before commit into a full rollback of this slice.
+    #[cfg(test)]
     pub(crate) fn apply_context_refresh_batch(
         &self,
         mutations: &[ContextRefreshMutation],
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> ControlFlow<(), Result<(usize, usize, usize), SearchError>> {
+        self.apply_context_refresh_batch_with_token_layout(mutations, None, checkpoint)
+    }
+
+    pub(crate) fn apply_context_refresh_batch_with_token_layout(
+        &self,
+        mutations: &[ContextRefreshMutation],
+        token_layout_claim: Option<&str>,
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> ControlFlow<(), Result<(usize, usize, usize), SearchError>> {
         if checkpoint().is_break() {
@@ -1572,10 +1829,16 @@ impl Store {
         }
         let observation = Mutation::new(&self.path, Reason::ContextChanged);
         self.observed_clears.store(0, Ordering::Relaxed);
-        let tx = match self.conn.unchecked_transaction() {
+        let tx = match rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        ) {
             Ok(tx) => tx,
             Err(error) => return ControlFlow::Continue(Err(error.into())),
         };
+        if let Err(error) = Self::match_token_layout_claim(&tx, token_layout_claim) {
+            return ControlFlow::Continue(Err(error));
+        }
         let marked_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
@@ -1744,7 +2007,15 @@ impl Store {
             embedding.map(|e| e.iter().flat_map(|f| f.to_le_bytes()).collect());
 
         let observation = Mutation::new(&self.path, Reason::Embedding);
-        self.conn.execute(
+        let tx = if embedding.is_some() {
+            rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?
+        } else {
+            rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?
+        };
+        if embedding.is_some() {
+            Self::check_legacy_embedding_write(&tx)?;
+        }
+        tx.execute(
             "INSERT INTO chunks (file_id, kind, symbol_name, is_export, annotations,
                                  line_start, line_end, text, embedding)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1760,11 +2031,13 @@ impl Store {
                 embedding_blob,
             ],
         )?;
+        let chunk_id = tx.last_insert_rowid();
+        tx.commit()?;
         observation.finish(
             Outcome::Committed,
             Counts { embeddings_written: u64::from(embedding.is_some()), ..Counts::default() },
         );
-        Ok(self.conn.last_insert_rowid())
+        Ok(chunk_id)
     }
 
     pub fn reindex_file(
@@ -1776,6 +2049,68 @@ impl Store {
         embeddings: Option<&[Vec<f32>]>,
     ) -> Result<i64, SearchError> {
         self.reindex_file_in_collection(root_id, path, hash, "code", chunks, embeddings, None)
+    }
+
+    // The embedding identity qualifies the optional vectors for this existing single-file write;
+    // keeping it explicit follows the collection writer's argument contract.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reindex_file_with_identity(
+        &mut self,
+        root_id: &str,
+        path: &str,
+        hash: &[u8],
+        chunks: &[Chunk],
+        embeddings: Option<&[Vec<f32>]>,
+        graph_contexts: Option<&[Option<String>]>,
+        model_id: &str,
+        dimension: usize,
+    ) -> Result<i64, SearchError> {
+        self.reindex_file_with_identity_and_source_spans(
+            root_id,
+            path,
+            hash,
+            chunks,
+            embeddings,
+            graph_contexts,
+            model_id,
+            dimension,
+            None,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reindex_file_with_identity_and_source_spans(
+        &mut self,
+        root_id: &str,
+        path: &str,
+        hash: &[u8],
+        chunks: &[Chunk],
+        embeddings: Option<&[Vec<f32>]>,
+        graph_contexts: Option<&[Option<String>]>,
+        model_id: &str,
+        dimension: usize,
+        token_layout_claim: Option<&str>,
+        source_spans: &[Option<SourceSpan>],
+    ) -> Result<i64, SearchError> {
+        let mut checkpoint = || ControlFlow::Continue(());
+        match self.reindex_file_in_collection_checkpointed_with_source_spans(
+            root_id,
+            path,
+            hash,
+            "code",
+            chunks,
+            embeddings,
+            graph_contexts,
+            Some((model_id, dimension)),
+            token_layout_claim,
+            source_spans,
+            &mut checkpoint,
+        )? {
+            ControlFlow::Continue(file_id) => Ok(file_id),
+            ControlFlow::Break(()) => unreachable!("the permit-all checkpoint cannot cancel"),
+        }
     }
 
     /// Apply every persistent part of a workspace-root transition in one SQLite transaction.
@@ -1806,7 +2141,15 @@ impl Store {
             .take(crate::lifecycle::MAX_EXAMPLES)
             .collect();
         let mut counts = Counts::default();
-        let tx = self.conn.transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        for file in change.upserts {
+            validate_source_spans_for_chunks(
+                &file.source_spans,
+                &file.chunks,
+                change.token_layout_claim.is_some(),
+            )?;
+        }
+        Self::check_token_layout_claim(&tx, change.token_layout_claim, &[])?;
         let mut rows = 0usize;
         let mut tick = || {
             rows += 1;
@@ -1992,6 +2335,9 @@ impl Store {
                 ])?;
                 let chunk_id = tx.last_insert_rowid();
                 fts_stmt.execute(params![chunk_id, chunk.name, chunk.text])?;
+                if let Some(span) = file.source_spans.get(index).and_then(Option::as_ref) {
+                    insert_source_span(&tx, "chunk_source_spans", chunk_id, span)?;
+                }
                 if tick() {
                     drop(fts_stmt);
                     drop(chunk_stmt);
@@ -2052,6 +2398,7 @@ impl Store {
             chunks,
             embeddings,
             graph_contexts,
+            None,
             checkpoint,
         )
     }
@@ -2080,6 +2427,7 @@ impl Store {
             chunks,
             embeddings,
             graph_contexts,
+            None,
             &mut checkpoint,
         )? {
             ControlFlow::Continue(file_id) => Ok(file_id),
@@ -2097,8 +2445,40 @@ impl Store {
         chunks: &[Chunk],
         embeddings: Option<&[Vec<f32>]>,
         graph_contexts: Option<&[Option<String>]>,
+        embedding_identity: Option<(&str, usize)>,
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> Result<ControlFlow<(), i64>, SearchError> {
+        self.reindex_file_in_collection_checkpointed_with_source_spans(
+            root_id,
+            path,
+            hash,
+            collection,
+            chunks,
+            embeddings,
+            graph_contexts,
+            embedding_identity,
+            None,
+            &[],
+            checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reindex_file_in_collection_checkpointed_with_source_spans(
+        &self,
+        root_id: &str,
+        path: &str,
+        hash: &[u8],
+        collection: &str,
+        chunks: &[Chunk],
+        embeddings: Option<&[Vec<f32>]>,
+        graph_contexts: Option<&[Option<String>]>,
+        embedding_identity: Option<(&str, usize)>,
+        token_layout_claim: Option<&str>,
+        source_spans: &[Option<SourceSpan>],
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> Result<ControlFlow<(), i64>, SearchError> {
+        validate_source_spans_for_chunks(source_spans, chunks, token_layout_claim.is_some())?;
         if checkpoint().is_break() {
             return Ok(ControlFlow::Break(()));
         }
@@ -2111,7 +2491,11 @@ impl Store {
             crate::lifecycle::bounded(path, 128)
         ));
         let mut counts = Counts::default();
-        let tx = self.conn.transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if embeddings.is_some() {
+            Self::guard_embedding_write(&tx, embedding_identity)?;
+        }
+        Self::check_token_layout_claim(&tx, token_layout_claim, source_spans)?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2183,6 +2567,9 @@ impl Store {
                 ])?;
 
                 let chunk_id = tx.last_insert_rowid();
+                if let Some(span) = source_spans.get(i).and_then(Option::as_ref) {
+                    insert_source_span(&tx, "chunk_source_spans", chunk_id, span)?;
+                }
                 fts_stmt.execute(params![chunk_id, chunk.name, chunk.text])?;
                 if (i + 1).is_multiple_of(crate::engine::WORKSPACE_APPLY_BATCH_ROWS)
                     && checkpoint().is_break()
@@ -2218,6 +2605,25 @@ impl Store {
         documents: &[Document],
         embeddings: Option<&[Vec<f32>]>,
     ) -> Result<i64, SearchError> {
+        self.reindex_documents_with_identity(
+            collection,
+            virtual_path,
+            hash,
+            documents,
+            embeddings,
+            None,
+        )
+    }
+
+    pub(crate) fn reindex_documents_with_identity(
+        &mut self,
+        collection: &str,
+        virtual_path: &str,
+        hash: &[u8],
+        documents: &[Document],
+        embeddings: Option<&[Vec<f32>]>,
+        embedding_identity: Option<(&str, usize)>,
+    ) -> Result<i64, SearchError> {
         let mut observation = Mutation::new(&self.path, Reason::HashChanged);
         observation.record.files = 1;
         observation.record.examples.push(format!(
@@ -2227,7 +2633,11 @@ impl Store {
             crate::lifecycle::bounded(virtual_path, 128)
         ));
         let mut counts = Counts::default();
-        let tx = self.conn.transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if embeddings.is_some() {
+            Self::guard_embedding_write(&tx, embedding_identity)?;
+        }
+        Self::check_token_layout_claim(&tx, None, &[])?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2286,6 +2696,7 @@ impl Store {
         Ok(file_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_reference_collection_if_stale(
         &mut self,
         collection: &str,
@@ -2293,6 +2704,25 @@ impl Store {
         fingerprint: &str,
         documents: &[Document],
         embeddings: Option<&[Vec<f32>]>,
+    ) -> Result<CollectionReplaceOutcome, SearchError> {
+        self.replace_reference_collection_with_identity(
+            collection,
+            virtual_path,
+            fingerprint,
+            documents,
+            embeddings,
+            None,
+        )
+    }
+
+    pub(crate) fn replace_reference_collection_with_identity(
+        &mut self,
+        collection: &str,
+        virtual_path: &str,
+        fingerprint: &str,
+        documents: &[Document],
+        embeddings: Option<&[Vec<f32>]>,
+        embedding_identity: Option<(&str, usize)>,
     ) -> Result<CollectionReplaceOutcome, SearchError> {
         let key = format!("reference_collection_fingerprint:{collection}");
         let mut observation = Mutation::new(&self.path, Reason::HashChanged);
@@ -2304,7 +2734,11 @@ impl Store {
             crate::lifecycle::bounded(virtual_path, 128)
         ));
         let mut counts = Counts::default();
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if embeddings.is_some() {
+            Self::guard_embedding_write(&tx, embedding_identity)?;
+        }
+        Self::check_token_layout_claim(&tx, None, &[])?;
         let committed = tx
             .query_row("SELECT value FROM meta WHERE key = ?1", [&key], |row| {
                 row.get::<_, String>(0)
@@ -2503,6 +2937,242 @@ impl Store {
         Ok((generation, data))
     }
 
+    pub(crate) fn load_index_embedding_snapshot_for_profile_with_token_layout(
+        &self,
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<IndexEmbeddingSnapshot, SearchError> {
+        let tx = self.conn.unchecked_transaction()?;
+        Self::check_embedding_profile(&tx, model_id, dim, false)?;
+        Self::verify_token_layout_claim(&tx, token_layout_claim)?;
+        let generation = Self::read_embedding_generation(&tx)?;
+        let (data, stored) = Self::read_index_embeddings(&tx, dim)?;
+        Ok((generation, data, stored))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_all_embeddings_with_profile(
+        &self,
+        model_id: &str,
+        dim: usize,
+    ) -> Result<EmbeddingsSnapshot, SearchError> {
+        self.load_all_embeddings_with_profile_and_token_layout(model_id, dim, None)
+    }
+
+    pub(crate) fn load_all_embeddings_with_profile_and_token_layout(
+        &self,
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<EmbeddingsSnapshot, SearchError> {
+        let (generation, data, _) = self
+            .load_index_embedding_snapshot_for_profile_with_token_layout(
+                model_id,
+                dim,
+                token_layout_claim,
+            )?;
+        Ok((generation, data))
+    }
+
+    pub(crate) fn embedding_profile_matches(
+        &self,
+        model_id: &str,
+        dim: usize,
+    ) -> Result<bool, SearchError> {
+        Self::check_embedding_profile(&self.conn, model_id, dim, false).map(|()| true).or_else(
+            |error| match error {
+                SearchError::Index(message) if message == "embedding profile mismatch" => Ok(false),
+                other => Err(other),
+            },
+        )
+    }
+
+    pub(crate) fn token_layout_claim_matches(
+        &self,
+        token_layout_claim: &str,
+    ) -> Result<bool, SearchError> {
+        let stored = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [TOKEN_LAYOUT_CLAIM_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(stored.as_deref() == Some(token_layout_claim))
+    }
+
+    pub(crate) fn stored_embedding_count(&self) -> Result<usize, SearchError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    fn claim_embedding_profile(
+        conn: &Connection,
+        model_id: &str,
+        dim: usize,
+    ) -> Result<(), SearchError> {
+        Self::check_embedding_profile(conn, model_id, dim, true)
+    }
+
+    fn guard_embedding_write(
+        conn: &Connection,
+        embedding_identity: Option<(&str, usize)>,
+    ) -> Result<(), SearchError> {
+        if let Some((model_id, dimension)) = embedding_identity {
+            Self::claim_embedding_profile(conn, model_id, dimension)
+        } else {
+            Self::check_legacy_embedding_write(conn)
+        }
+    }
+
+    /// Public legacy writers do not know a storage identity. Keep them usable on old unclaimed
+    /// stores, but prevent them from writing into a database already owned by a profile.
+    fn check_legacy_embedding_write(conn: &Connection) -> Result<(), SearchError> {
+        let claimed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key IN (?1, ?2))",
+            params![PROFILE_IDENTITY_KEY, PROFILE_DIMENSION_KEY],
+            |row| row.get(0),
+        )?;
+        if claimed {
+            Err(SearchError::Index("embedding profile mismatch".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_embedding_profile(
+        conn: &Connection,
+        model_id: &str,
+        dim: usize,
+        claim: bool,
+    ) -> Result<(), SearchError> {
+        let profiled = model_id.starts_with(PROFILE_IDENTITY_PREFIX);
+        let stored_identity = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [PROFILE_IDENTITY_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let stored_dimension = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [PROFILE_DIMENSION_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        match (stored_identity, stored_dimension) {
+            (Some(identity), Some(dimension)) => {
+                if identity == model_id && dimension.parse::<usize>().ok() == Some(dim) {
+                    return Ok(());
+                }
+                return Err(SearchError::Index("embedding profile mismatch".to_owned()));
+            }
+            (None, None) => {}
+            _ => return Err(SearchError::Index("embedding profile mismatch".to_owned())),
+        }
+        if !profiled {
+            return Ok(());
+        }
+
+        let vectors: i64 = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL) +
+                (SELECT COUNT(*) FROM overlay_chunks WHERE embedding IS NOT NULL) +
+                (SELECT COUNT(*) FROM overlay_embedding_cache)",
+            [],
+            |row| row.get(0),
+        )?;
+        if vectors != 0 {
+            return Err(SearchError::Index("embedding profile mismatch".to_owned()));
+        }
+        if claim {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                params![PROFILE_IDENTITY_KEY, model_id],
+            )?;
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                params![PROFILE_DIMENSION_KEY, dim.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn check_token_layout_claim(
+        conn: &Connection,
+        token_layout_claim: Option<&str>,
+        source_spans: &[Option<SourceSpan>],
+    ) -> Result<(), SearchError> {
+        let stored = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [TOKEN_LAYOUT_CLAIM_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        match (stored.as_deref(), token_layout_claim) {
+            (Some(existing), Some(requested)) if existing == requested => {
+                if !source_spans.is_empty() {
+                    validate_source_spans(source_spans, source_spans.len(), true)?;
+                }
+                Ok(())
+            }
+            (Some(_), _) => Err(token_layout_error()),
+            (None, None) => Ok(()),
+            (None, Some(requested)) => {
+                validate_source_spans(source_spans, source_spans.len(), true)?;
+                let rows: i64 = conn.query_row(
+                    "SELECT (SELECT COUNT(*) FROM chunks) +
+                            (SELECT COUNT(*) FROM overlay_chunks) +
+                            (SELECT COUNT(*) FROM overlay_embedding_cache)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if rows != 0 {
+                    return Err(token_layout_error());
+                }
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    params![TOKEN_LAYOUT_CLAIM_KEY, requested],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn verify_token_layout_claim(
+        conn: &Connection,
+        token_layout_claim: Option<&str>,
+    ) -> Result<(), SearchError> {
+        let stored = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [TOKEN_LAYOUT_CLAIM_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        match (stored.as_deref(), token_layout_claim) {
+            (Some(existing), Some(requested)) if existing == requested => {
+                validate_complete_source_provenance(conn)
+            }
+            (None, None) => Ok(()),
+            _ => Err(token_layout_error()),
+        }
+    }
+
+    fn match_token_layout_claim(
+        conn: &Connection,
+        token_layout_claim: Option<&str>,
+    ) -> Result<(), SearchError> {
+        let stored = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [TOKEN_LAYOUT_CLAIM_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        match (stored.as_deref(), token_layout_claim) {
+            (Some(existing), Some(requested)) if existing == requested => Ok(()),
+            (None, None) => Ok(()),
+            _ => Err(token_layout_error()),
+        }
+    }
+
     /// Preserve the number of stored BLOBs while reading them anyway, including rejected
     /// dimensions. An empty filtered vector index alone is not proof of an empty store.
     pub(crate) fn load_index_embedding_snapshot(
@@ -2579,9 +3249,12 @@ impl Store {
             .conn
             .query_row(
                 "SELECT c.kind, c.symbol_name, c.line_start, c.line_end, c.text,
-                        c.annotations, c.is_export, f.path, f.collection, f.root_id
+                        c.annotations, c.is_export, f.path, f.collection, f.root_id,
+                        s.parent_symbol, s.byte_start, s.byte_end, s.parent_byte_start,
+                        s.parent_byte_end, s.part_index, s.part_count
                  FROM chunks c
                  JOIN files f ON f.id = c.file_id
+                 LEFT JOIN chunk_source_spans s ON s.chunk_id = c.id
                  WHERE c.id = ?1",
                 params![chunk_id],
                 |row| {
@@ -2596,6 +3269,7 @@ impl Store {
                         text: row.get(4)?,
                         annotations: row.get::<_, Option<String>>(5)?,
                         is_export: row.get::<_, i32>(6)? != 0,
+                        source_span: source_span_from_row(row, 10)?,
                     })
                 },
             )
@@ -2622,9 +3296,12 @@ impl Store {
             let placeholders = std::iter::repeat_n("?", batch.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT c.id, c.kind, c.symbol_name, c.line_start, c.line_end, c.text,
-                        c.annotations, c.is_export, f.path, f.collection, f.root_id
+                        c.annotations, c.is_export, f.path, f.collection, f.root_id,
+                        s.parent_symbol, s.byte_start, s.byte_end, s.parent_byte_start,
+                        s.parent_byte_end, s.part_index, s.part_count
                  FROM chunks c
                  JOIN files f ON f.id = c.file_id
+                 LEFT JOIN chunk_source_spans s ON s.chunk_id = c.id
                  WHERE c.id IN ({placeholders})"
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -2642,6 +3319,7 @@ impl Store {
                         text: row.get(5)?,
                         annotations: row.get::<_, Option<String>>(6)?,
                         is_export: row.get::<_, i32>(7)? != 0,
+                        source_span: source_span_from_row(row, 11)?,
                     },
                 ))
             })?;
@@ -2710,18 +3388,33 @@ impl Store {
         &self,
         collection: Option<&str>,
     ) -> Result<Vec<crate::IndexedDocument>, SearchError> {
+        self.load_indexed_documents_with_token_layout_claim(collection, None)
+    }
+
+    pub fn load_indexed_documents_with_token_layout_claim(
+        &self,
+        collection: Option<&str>,
+        token_layout_claim: Option<&str>,
+    ) -> Result<Vec<crate::IndexedDocument>, SearchError> {
+        if let Some(claim) = token_layout_claim {
+            Self::verify_token_layout_claim(&self.conn, Some(claim))?;
+        }
         let query = if collection.is_some() {
             "SELECT f.collection, f.path, c.symbol_name, c.kind, c.line_start, c.line_end, c.text,
-                    c.graph_context, f.root_id
+                    c.graph_context, f.root_id, s.parent_symbol, s.byte_start, s.byte_end,
+                    s.parent_byte_start, s.parent_byte_end, s.part_index, s.part_count
              FROM chunks c
              JOIN files f ON f.id = c.file_id
+             LEFT JOIN chunk_source_spans s ON s.chunk_id = c.id
              WHERE f.collection = ?1
              ORDER BY f.collection, f.root_id, f.path, c.line_start, c.line_end, c.symbol_name"
         } else {
             "SELECT f.collection, f.path, c.symbol_name, c.kind, c.line_start, c.line_end, c.text,
-                    c.graph_context, f.root_id
+                    c.graph_context, f.root_id, s.parent_symbol, s.byte_start, s.byte_end,
+                    s.parent_byte_start, s.parent_byte_end, s.part_index, s.part_count
              FROM chunks c
              JOIN files f ON f.id = c.file_id
+             LEFT JOIN chunk_source_spans s ON s.chunk_id = c.id
              ORDER BY f.collection, f.root_id, f.path, c.line_start, c.line_end, c.symbol_name"
         };
 
@@ -2740,6 +3433,7 @@ impl Store {
                     content_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
                     text,
                     graph_context: row.get(7)?,
+                    source_span: source_span_from_row(row, 9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -2757,6 +3451,7 @@ impl Store {
                     content_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
                     text,
                     graph_context: row.get(7)?,
+                    source_span: source_span_from_row(row, 9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -2799,6 +3494,7 @@ impl Store {
                         content_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
                         text,
                         graph_context: row.get(8)?,
+                        source_span: None,
                     },
                 ))
             })?
@@ -2880,9 +3576,11 @@ impl Store {
     pub fn set_chunk_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<(), SearchError> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let observation = Mutation::new(&self.path, Reason::Embedding);
-        let written = self
-            .conn
-            .execute("UPDATE chunks SET embedding = ?2 WHERE id = ?1", params![chunk_id, blob])?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::check_legacy_embedding_write(&tx)?;
+        let written =
+            tx.execute("UPDATE chunks SET embedding = ?2 WHERE id = ?1", params![chunk_id, blob])?;
+        tx.commit()?;
         observation.finish(
             Outcome::Committed,
             Counts { embeddings_written: written as u64, ..Counts::default() },
@@ -2892,9 +3590,30 @@ impl Store {
 
     /// Commit one prepared embedding batch atomically.
     pub fn set_chunk_embeddings(&self, embeddings: &[(i64, Vec<f32>)]) -> Result<(), SearchError> {
+        self.set_chunk_embeddings_with_identity(embeddings, None)
+    }
+
+    pub(crate) fn set_chunk_embeddings_with_identity(
+        &self,
+        embeddings: &[(i64, Vec<f32>)],
+        embedding_identity: Option<(&str, usize)>,
+    ) -> Result<(), SearchError> {
+        self.set_chunk_embeddings_with_token_layout(embeddings, embedding_identity, None)
+    }
+
+    pub(crate) fn set_chunk_embeddings_with_token_layout(
+        &self,
+        embeddings: &[(i64, Vec<f32>)],
+        embedding_identity: Option<(&str, usize)>,
+        token_layout_claim: Option<&str>,
+    ) -> Result<(), SearchError> {
         let observation = Mutation::new(&self.path, Reason::Embedding);
         let mut counts = Counts::default();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if !embeddings.is_empty() {
+            Self::guard_embedding_write(&tx, embedding_identity)?;
+        }
+        Self::match_token_layout_claim(&tx, token_layout_claim)?;
         for (chunk_id, embedding) in embeddings {
             let blob: Vec<u8> = embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
             counts.embeddings_written += tx.execute(
@@ -3318,6 +4037,33 @@ impl Store {
         chunks: &[Chunk],
         embeddings: Option<&[Vec<f32>]>,
     ) -> Result<i64, SearchError> {
+        self.upsert_overlay_file_with_chunks_and_source_spans(
+            root_id,
+            path,
+            hash,
+            collection,
+            chunks,
+            embeddings,
+            None,
+            None,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_overlay_file_with_chunks_and_source_spans(
+        &mut self,
+        root_id: &str,
+        path: &str,
+        hash: &[u8],
+        collection: &str,
+        chunks: &[Chunk],
+        embeddings: Option<&[Vec<f32>]>,
+        _graph_contexts: Option<&[Option<String>]>,
+        token_layout_claim: Option<&str>,
+        source_spans: &[Option<SourceSpan>],
+    ) -> Result<i64, SearchError> {
+        validate_source_spans_for_chunks(source_spans, chunks, token_layout_claim.is_some())?;
         let mut observation = Mutation::new(&self.path, Reason::HashChanged);
         observation.record.files = 1;
         observation.record.examples.push(format!(
@@ -3327,7 +4073,11 @@ impl Store {
             crate::lifecycle::bounded(path, 128)
         ));
         let mut counts = Counts::default();
-        let tx = self.conn.transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if embeddings.is_some() {
+            Self::check_legacy_embedding_write(&tx)?;
+        }
+        Self::check_token_layout_claim(&tx, token_layout_claim, source_spans)?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3394,6 +4144,14 @@ impl Store {
                     chunk.text,
                     embedding_blob,
                 ])?;
+                if let Some(span) = source_spans.get(i).and_then(Option::as_ref) {
+                    insert_source_span(
+                        &tx,
+                        "overlay_chunk_source_spans",
+                        tx.last_insert_rowid(),
+                        span,
+                    )?;
+                }
 
                 let chunk_id = tx.last_insert_rowid();
                 fts_stmt.execute(params![chunk_id, chunk.name, chunk.text])?;
@@ -3408,6 +4166,15 @@ impl Store {
     }
 
     pub fn remove_overlay_file(&self, root_id: &str, path: &str) -> Result<(), SearchError> {
+        self.remove_overlay_file_with_token_layout(root_id, path, None)
+    }
+
+    pub(crate) fn remove_overlay_file_with_token_layout(
+        &self,
+        root_id: &str,
+        path: &str,
+        token_layout_claim: Option<&str>,
+    ) -> Result<(), SearchError> {
         let mut observation = Mutation::new(&self.path, Reason::FileDeleted);
         observation.record.files = 1;
         observation.record.examples.push(format!(
@@ -3416,7 +4183,9 @@ impl Store {
             crate::lifecycle::bounded(root_id, 64),
             crate::lifecycle::bounded(path, 128)
         ));
-        self.conn.execute(
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::match_token_layout_claim(&tx, token_layout_claim)?;
+        tx.execute(
             "DELETE FROM overlay_chunks_fts WHERE rowid IN (
                  SELECT c.id FROM overlay_chunks c
                  JOIN overlay_files f ON f.id = c.file_id
@@ -3424,10 +4193,11 @@ impl Store {
              )",
             params![root_id, path],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM overlay_files WHERE root_id = ?1 AND path = ?2",
             params![root_id, path],
         )?;
+        tx.commit()?;
         observation.finish(
             Outcome::Committed,
             Counts { overlay_vectors_removed: None, ..Counts::default() },
@@ -3481,9 +4251,12 @@ impl Store {
         let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
             "SELECT c.kind, c.symbol_name, c.line_start, c.line_end, c.text,
-                    c.annotations, c.is_export, f.path, f.collection, f.root_id
+                    c.annotations, c.is_export, f.path, f.collection, f.root_id,
+                    s.parent_symbol, s.byte_start, s.byte_end, s.parent_byte_start,
+                    s.parent_byte_end, s.part_index, s.part_count
              FROM overlay_chunks c
              JOIN overlay_files f ON f.id = c.file_id
+             LEFT JOIN overlay_chunk_source_spans s ON s.chunk_id = c.id
              WHERE c.id IN ({})",
             placeholders
         );
@@ -3502,6 +4275,7 @@ impl Store {
                 text: row.get(4)?,
                 annotations: row.get::<_, Option<String>>(5)?,
                 is_export: row.get::<_, i32>(6)? != 0,
+                source_span: source_span_from_row(row, 10)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -3634,10 +4408,11 @@ impl Store {
 
     /// Persist the two shared Phase-C caches in one cancellable transaction. A break drops the
     /// transaction, allowing the caller to retain and retry the same in-memory publication.
-    pub(crate) fn apply_overlay_publication(
+    pub(crate) fn apply_overlay_publication_with_token_layout(
         &self,
         fingerprints: Option<(&str, &HashMap<FileKey, PersistedFingerprint>)>,
         embeddings: Option<OverlayEmbeddingPublication<'_>>,
+        token_layout_claim: Option<&str>,
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> Result<ControlFlow<()>, SearchError> {
         if checkpoint().is_break() {
@@ -3645,7 +4420,13 @@ impl Store {
         }
         let observation = Mutation::new(&self.path, Reason::Embedding);
         let mut counts = Counts::default();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::match_token_layout_claim(&tx, token_layout_claim)?;
+        if let Some((model_id, dimension, entries)) = embeddings {
+            if !entries.is_empty() {
+                Self::claim_embedding_profile(&tx, model_id, dimension)?;
+            }
+        }
         let mut rows = 0usize;
         let mut tick = || {
             rows += 1;
@@ -3780,6 +4561,7 @@ impl Store {
         model_id: &str,
         dimension: usize,
     ) -> Result<HashMap<String, Vec<f32>>, SearchError> {
+        Self::check_embedding_profile(&self.conn, model_id, dimension, false)?;
         let dimension = dimension as i64;
         let mut stmt = self.conn.prepare(
             "SELECT embedding_key, embedding
@@ -3812,7 +4594,12 @@ impl Store {
         let batch = crate::lifecycle::Batch::new(&self.path, Reason::Embedding);
         let result = batch.context().in_scope(|| {
             let dimension = dimension as i64;
-            let mut stmt = self.conn.prepare(
+            let tx =
+                rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            if !entries.is_empty() {
+                Self::claim_embedding_profile(&tx, model_id, dimension as usize)?;
+            }
+            let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO overlay_embedding_cache
              (embedding_key, model_id, dimension, embedding)
              VALUES (?1, ?2, ?3, ?4)",
@@ -3826,6 +4613,8 @@ impl Store {
                     Counts { embeddings_written: written as u64, ..Counts::default() },
                 );
             }
+            drop(stmt);
+            tx.commit()?;
             Ok(())
         });
         batch.finish(if result.is_ok() { Outcome::Completed } else { Outcome::Failed });
@@ -3979,6 +4768,7 @@ pub struct ChunkInfo {
     pub text: String,
     pub annotations: Option<String>,
     pub is_export: bool,
+    pub source_span: Option<SourceSpan>,
 }
 
 #[derive(Debug, Clone)]
@@ -4106,6 +4896,20 @@ mod tests {
         let path = dir.path().join("missing.db");
         assert!(Store::open_existing(&path).is_err());
         assert!(!path.exists(), "the refusal must leave no file behind");
+    }
+
+    #[test]
+    fn embedding_snapshot_is_read_only_while_peer_holds_writer_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let store = Store::open(&path).unwrap();
+        let generation = store.embedding_generation().unwrap();
+        let reader = Store::open_reader(&path).unwrap();
+        let peer = rusqlite::Connection::open(&path).unwrap();
+        peer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (observed, vectors, stored) = reader.load_index_embedding_snapshot(4).unwrap();
+        assert_eq!((observed, vectors.len(), stored), (generation, 0, 0));
+        peer.execute_batch("ROLLBACK").unwrap();
     }
 
     /// A store in the shape the release before composite keys wrote, built with
@@ -5321,6 +6125,379 @@ mod tests {
     }
 
     #[test]
+    fn embedding_profile_claim_blocks_unproven_and_foreign_vectors() {
+        let hash = blake3::hash(b"profile-test");
+        let document = [sample_chunk("Профиль")];
+        let vector = [vec![0.1_f32, 0.2]];
+        let mut unproven = Store::in_memory().unwrap();
+        unproven
+            .reindex_file(
+                CONFIGURATION_ROOT_ID,
+                "profile.bsl",
+                hash.as_bytes(),
+                &document,
+                Some(&vector),
+            )
+            .unwrap();
+        let before = unproven.load_all_embeddings(2).unwrap();
+        assert!(unproven
+            .reindex_file_with_identity(
+                CONFIGURATION_ROOT_ID,
+                "profile.bsl",
+                hash.as_bytes(),
+                &document,
+                Some(&vector),
+                None,
+                "profile-v1:new-inputs",
+                2,
+            )
+            .is_err());
+        assert_eq!(unproven.load_all_embeddings(2).unwrap(), before);
+        assert!(!unproven.text_search("Профиль", 1, Some("code")).unwrap().is_empty());
+        assert_eq!(
+            unproven
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key = ?1",
+                    [PROFILE_IDENTITY_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let mut claimed = Store::in_memory().unwrap();
+        claimed
+            .reindex_file_with_identity(
+                CONFIGURATION_ROOT_ID,
+                "profile.bsl",
+                hash.as_bytes(),
+                &document,
+                Some(&vector),
+                None,
+                "profile-v1:active",
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            claimed.load_all_embeddings_with_profile("profile-v1:active", 2).unwrap().1.len(),
+            1
+        );
+        let chunk_id =
+            claimed.chunk_ids_for_file("code", CONFIGURATION_ROOT_ID, "profile.bsl").unwrap()[0];
+        assert!(claimed.set_chunk_embedding(chunk_id, &[9.0, 9.0]).is_err());
+        assert!(claimed
+            .reindex_file(
+                CONFIGURATION_ROOT_ID,
+                "profile.bsl",
+                hash.as_bytes(),
+                &[sample_chunk("Legacy write")],
+                Some(&[vec![9.0, 9.0]]),
+            )
+            .is_err());
+        assert_eq!(
+            claimed.load_all_embeddings_with_profile("profile-v1:active", 2).unwrap().1[0].1,
+            vector[0]
+        );
+        assert!(claimed.load_all_embeddings_with_profile("wire-alias", 2).is_err());
+        assert!(claimed.load_all_embeddings_with_profile("profile-v1:other", 2).is_err());
+    }
+
+    fn source_span() -> SourceSpan {
+        SourceSpan {
+            parent_symbol: "A".to_owned(),
+            byte_start: 0,
+            byte_end: 3,
+            parent_byte_start: 0,
+            parent_byte_end: 3,
+            part_index: 1,
+            part_count: 1,
+        }
+    }
+
+    #[test]
+    fn token_layout_accepts_real_module_header_ingest_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header-layout.db");
+        let claim = "profile-v1:header-layout-test";
+        let source = "Перем А;\r\n  \r\n";
+        let source_chunks = code_chunk::Chunker::source_chunks(source);
+        assert_eq!(source_chunks.len(), 1);
+        let prepared = &source_chunks[0];
+        assert_eq!(prepared.chunk.kind, ChunkKind::ModuleHeader);
+        assert!(prepared.chunk.name.is_empty());
+        let chunks = vec![prepared.chunk.clone()];
+        let spans = vec![Some(SourceSpan {
+            parent_symbol: prepared.chunk.name.clone(),
+            byte_start: prepared.source_byte_start,
+            byte_end: prepared.source_byte_end,
+            parent_byte_start: prepared.source_byte_start,
+            parent_byte_end: prepared.source_byte_end,
+            part_index: 1,
+            part_count: 1,
+        })];
+
+        {
+            let mut store = Store::open(&path).unwrap();
+            store
+                .reindex_file_with_identity_and_source_spans(
+                    CONFIGURATION_ROOT_ID,
+                    "header.bsl",
+                    blake3::hash(source.as_bytes()).as_bytes(),
+                    &chunks,
+                    None,
+                    None,
+                    claim,
+                    2,
+                    Some(claim),
+                    &spans,
+                )
+                .unwrap();
+            store.ensure_token_layout_claim("token-segments-v1", claim).unwrap();
+        }
+
+        let reopened = Store::open(&path).unwrap();
+        reopened.ensure_token_layout_claim("token-segments-v1", claim).unwrap();
+        let documents = reopened
+            .load_indexed_documents_with_token_layout_claim(Some("code"), Some(claim))
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].source_span, spans[0]);
+    }
+
+    /// Damaged provenance must not take the preserved text with it: lexical readers serve the
+    /// chunk without a span whether the damage is a negative, an oversized or a non-numeric value.
+    #[test]
+    fn damaged_source_span_values_leave_lexical_readers_serving_the_chunk() {
+        let claim = "profile-v1:token-layout-test";
+        for damage in ["part_index = -1", "byte_end = 4294967296", "part_count = 'x'"] {
+            let mut store = Store::in_memory().unwrap();
+            for (path, overlay) in [("a.bsl", false), ("overlay.bsl", true)] {
+                if overlay {
+                    store
+                        .upsert_overlay_file_with_chunks_and_source_spans(
+                            CONFIGURATION_ROOT_ID,
+                            path,
+                            b"overlay",
+                            "code",
+                            &[sample_chunk("Overlay")],
+                            None,
+                            None,
+                            Some(claim),
+                            &[Some(source_span())],
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .reindex_file_with_identity_and_source_spans(
+                            CONFIGURATION_ROOT_ID,
+                            path,
+                            b"hash",
+                            &[sample_chunk("A")],
+                            None,
+                            None,
+                            claim,
+                            2,
+                            Some(claim),
+                            &[Some(source_span())],
+                        )
+                        .unwrap();
+                }
+            }
+            for table in ["chunk_source_spans", "overlay_chunk_source_spans"] {
+                store.conn.execute(&format!("UPDATE {table} SET {damage}"), []).unwrap();
+            }
+
+            let hit = store.text_search("A", 10, Some("code")).unwrap();
+            let chunk_id = hit[0].chunk_id;
+            assert_eq!(store.chunk_by_id(chunk_id).unwrap().unwrap().source_span, None, "{damage}");
+            assert_eq!(
+                store.chunks_by_ids(&[chunk_id]).unwrap()[&chunk_id].source_span,
+                None,
+                "{damage}"
+            );
+            let documents = store.load_indexed_documents(Some("code")).unwrap();
+            assert_eq!(documents.len(), 1, "{damage}");
+            assert!(documents.iter().all(|document| document.source_span.is_none()), "{damage}");
+            let overlay_ids = store
+                .conn
+                .prepare("SELECT id FROM overlay_chunks")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(store.overlay_chunks_by_ids(&overlay_ids).unwrap()[0].source_span, None);
+        }
+    }
+
+    #[test]
+    fn token_layout_claim_persists_provenance_and_requires_matching_snapshot_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token-layout.db");
+        let claim = "profile-v1:token-layout-test";
+        let vector = [vec![0.25_f32, 0.5]];
+        {
+            let mut store = Store::open(&path).unwrap();
+            store
+                .reindex_file_with_identity_and_source_spans(
+                    CONFIGURATION_ROOT_ID,
+                    "a.bsl",
+                    b"hash",
+                    &[sample_chunk("A")],
+                    Some(&vector),
+                    None,
+                    claim,
+                    2,
+                    Some(claim),
+                    &[Some(source_span())],
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM chunk_source_spans", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            store
+                .upsert_overlay_file_with_chunks_and_source_spans(
+                    CONFIGURATION_ROOT_ID,
+                    "overlay.bsl",
+                    b"overlay",
+                    "code",
+                    &[sample_chunk("Overlay")],
+                    None,
+                    None,
+                    Some(claim),
+                    &[Some(source_span())],
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM overlay_chunk_source_spans", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert!(store
+                .load_index_embedding_snapshot_for_profile_with_token_layout(claim, 2, Some(claim),)
+                .is_ok());
+            assert!(store
+                .load_index_embedding_snapshot_for_profile_with_token_layout(claim, 2, None)
+                .is_err());
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM overlay_chunk_source_spans", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .load_index_embedding_snapshot_for_profile_with_token_layout(claim, 2, Some(claim))
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+        let documents = store
+            .load_indexed_documents_with_token_layout_claim(Some("code"), Some(claim))
+            .unwrap();
+        assert_eq!(documents[0].source_span, Some(source_span()));
+        let lexical_fallback = store.load_indexed_documents(Some("code")).unwrap();
+        assert_eq!(lexical_fallback[0].source_span, Some(source_span()));
+        store
+            .remove_overlay_file_with_token_layout(
+                CONFIGURATION_ROOT_ID,
+                "overlay.bsl",
+                Some(claim),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM overlay_chunk_source_spans", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "deleting an overlay chunk cascades to its companion provenance row"
+        );
+        store.conn.execute("UPDATE chunk_source_spans SET part_index = 0", []).unwrap();
+        assert!(store
+            .load_index_embedding_snapshot_for_profile_with_token_layout(claim, 2, Some(claim))
+            .is_err());
+    }
+
+    #[test]
+    fn token_layout_refuses_legacy_rows_and_rolls_back_claim_with_failed_metadata_insert() {
+        let claim = "profile-v1:token-layout-test";
+        let mut legacy = Store::in_memory().unwrap();
+        legacy
+            .reindex_file(CONFIGURATION_ROOT_ID, "legacy.bsl", b"old", &[sample_chunk("Old")], None)
+            .unwrap();
+        let old_chunks = legacy.chunk_count().unwrap();
+        assert!(legacy
+            .reindex_file_with_identity_and_source_spans(
+                CONFIGURATION_ROOT_ID,
+                "legacy.bsl",
+                b"new",
+                &[sample_chunk("New")],
+                None,
+                None,
+                claim,
+                2,
+                Some(claim),
+                &[Some(source_span())],
+            )
+            .is_err());
+        assert_eq!(legacy.chunk_count().unwrap(), old_chunks);
+        assert!(legacy.file_hash(CONFIGURATION_ROOT_ID, "legacy.bsl").unwrap().is_some());
+
+        let mut rollback = Store::in_memory().unwrap();
+        rollback
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_source_span BEFORE INSERT ON chunk_source_spans
+                 BEGIN SELECT RAISE(FAIL, 'rejected'); END;",
+            )
+            .unwrap();
+        assert!(rollback
+            .reindex_file_with_identity_and_source_spans(
+                CONFIGURATION_ROOT_ID,
+                "new.bsl",
+                b"new",
+                &[sample_chunk("New")],
+                None,
+                None,
+                claim,
+                2,
+                Some(claim),
+                &[Some(source_span())],
+            )
+            .is_err());
+        assert_eq!(rollback.file_count().unwrap(), 0);
+        assert_eq!(rollback.chunk_count().unwrap(), 0);
+        assert_eq!(
+            rollback
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key IN (?1, ?2, ?3)",
+                    params![PROFILE_IDENTITY_KEY, PROFILE_DIMENSION_KEY, TOKEN_LAYOUT_CLAIM_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn chunk_by_id_returns_metadata() {
         let mut store = Store::in_memory().unwrap();
         let hash = blake3::hash(b"test");
@@ -5922,6 +7099,7 @@ mod tests {
                     cleanup: &HashSet::new(),
                     tombstones: &HashSet::new(),
                     upserts: &[],
+                    token_layout_claim: None,
                 },
                 &mut || ControlFlow::Continue(()),
             )
@@ -6182,6 +7360,7 @@ mod tests {
                         &[sample_chunk("C")],
                         None,
                         None,
+                        None,
                         &mut || {
                             polls += 1;
                             if polls == 2 {
@@ -6277,7 +7456,8 @@ mod tests {
                             changed_root_ids: &roots,
                             cleanup: &keys,
                             tombstones: &HashSet::new(),
-                            upserts: &[]
+                            upserts: &[],
+                            token_layout_claim: None,
                         },
                         &mut || ControlFlow::Continue(())
                     )

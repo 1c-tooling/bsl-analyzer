@@ -373,6 +373,15 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 /// key rotation and tuning do not fork the backend — and no secret-derived bytes
 /// land in a socket name.
 pub fn embedding_config_fingerprint() -> u64 {
+    let prefixes = crate::EmbeddingPrefixes {
+        query: std::env::var("EMBEDDING_QUERY_PREFIX").unwrap_or_default(),
+        document: std::env::var("EMBEDDING_DOCUMENT_PREFIX").unwrap_or_default(),
+        token_profile: None,
+    };
+    embedding_config_fingerprint_with_prefixes(&prefixes)
+}
+
+pub fn embedding_config_fingerprint_with_prefixes(prefixes: &crate::EmbeddingPrefixes) -> u64 {
     const KEYS: [&str; 4] =
         ["EMBEDDING_URL", "EMBEDDING_MODEL", "EMBEDDING_DIM", "EMBEDDING_PROVIDER"];
     let mut hasher = blake3::Hasher::new();
@@ -384,9 +393,40 @@ pub fn embedding_config_fingerprint() -> u64 {
         }
         hasher.update(b"\0");
     }
+    if !prefixes.query.is_empty() || !prefixes.document.is_empty() {
+        hasher.update(b"input-prefixes-v1");
+        for prefix in [&prefixes.query, &prefixes.document] {
+            hasher.update(&(prefix.len() as u64).to_le_bytes());
+            hasher.update(prefix.as_bytes());
+        }
+    }
+    if let Some(profile) = &prefixes.token_profile {
+        hasher.update(b"token-policy-profile-v1\0");
+        hasher.update(&profile.max_input_tokens.to_le_bytes());
+        hasher.update(bsl_search::SEGMENTATION_VERSION.as_bytes());
+        hasher.update(profile.tokenizer_file.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(profile.tokenizer_sha256.as_bytes());
+    }
+    if prefixes.token_profile.is_some() {
+        hasher.update(b"request-bytes=");
+        match bsl_search::EmbedderConfig::request_bytes_from_env() {
+            Ok(max_request_bytes) => hasher.update(&max_request_bytes.to_le_bytes()),
+            Err(_) => hasher.update(
+                std::env::var("EMBEDDING_MAX_REQUEST_BYTES").unwrap_or_default().as_bytes(),
+            ),
+        };
+        hasher.update(b"\0");
+    }
     let bytes = hasher.finalize();
     u64::from_le_bytes(bytes.as_bytes()[..8].try_into().expect("blake3 yields >= 8 bytes"))
 }
+
+pub const EMBEDDING_QUERY_PREFIX_ENV: &str = "BSL_MCP_EFFECTIVE_EMBEDDING_QUERY_PREFIX";
+pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "BSL_MCP_EFFECTIVE_EMBEDDING_DOCUMENT_PREFIX";
+pub const EMBEDDING_MAX_INPUT_TOKENS_ENV: &str = "BSL_MCP_EFFECTIVE_EMBEDDING_MAX_INPUT_TOKENS";
+pub const EMBEDDING_TOKENIZER_FILE_ENV: &str = "BSL_MCP_EFFECTIVE_EMBEDDING_TOKENIZER_FILE";
+pub const EMBEDDING_TOKENIZER_SHA256_ENV: &str = "BSL_MCP_EFFECTIVE_EMBEDDING_TOKENIZER_SHA256";
 
 /// Env var carrying the spawning proxy's frozen topology fingerprint to the daemon
 /// child, so both sides key the SAME rendezvous even if the config changes between
@@ -556,6 +596,59 @@ mod tests {
         // No assertion on the absolute value (depends on ambient env); just that the
         // function is callable and stable within one environment.
         assert_eq!(embedding_config_fingerprint(), embedding_config_fingerprint());
+    }
+
+    #[test]
+    fn effective_prefix_pair_partitions_profile_without_credentials() {
+        let empty = crate::EmbeddingPrefixes::default();
+        let query = crate::EmbeddingPrefixes {
+            query: "q: ".into(),
+            document: String::new(),
+            token_profile: None,
+        };
+        let document = crate::EmbeddingPrefixes {
+            query: String::new(),
+            document: "d: ".into(),
+            token_profile: None,
+        };
+        assert_ne!(
+            embedding_config_fingerprint_with_prefixes(&empty),
+            embedding_config_fingerprint_with_prefixes(&query)
+        );
+        assert_ne!(
+            embedding_config_fingerprint_with_prefixes(&query),
+            embedding_config_fingerprint_with_prefixes(&document)
+        );
+    }
+
+    #[test]
+    fn token_profile_changes_broker_identity() {
+        let base = crate::EmbeddingPrefixes::default();
+        let profile = |max_input_tokens, tokenizer_file: &str, tokenizer_sha256: &str| {
+            crate::EmbeddingPrefixes {
+                token_profile: Some(crate::EmbeddingTokenProfile {
+                    max_input_tokens,
+                    tokenizer_file: PathBuf::from(tokenizer_file),
+                    tokenizer_sha256: tokenizer_sha256.to_owned(),
+                    token_policy: None,
+                }),
+                ..base.clone()
+            }
+        };
+        let a =
+            embedding_config_fingerprint_with_prefixes(&profile(8192, "/a/tokenizer.json", "abc"));
+        assert_ne!(
+            a,
+            embedding_config_fingerprint_with_prefixes(&profile(8193, "/a/tokenizer.json", "abc"))
+        );
+        assert_ne!(
+            a,
+            embedding_config_fingerprint_with_prefixes(&profile(8192, "/b/tokenizer.json", "abc"))
+        );
+        assert_ne!(
+            a,
+            embedding_config_fingerprint_with_prefixes(&profile(8192, "/a/tokenizer.json", "def"))
+        );
     }
 
     #[test]

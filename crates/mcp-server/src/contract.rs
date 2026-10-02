@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "3.2";
+pub const CONTRACT_VERSION: &str = "3.3";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -156,7 +156,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: WORKSPACE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("7"),
+        output_schema_version: Some("9"),
         default_enabled: true,
     },
     tool("query", QUERY_ACTIONS),
@@ -206,7 +206,7 @@ const REFERENCE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: REFERENCE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("6"),
+        output_schema_version: Some("7"),
         default_enabled: true,
     },
     SYNTAX_HELP,
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn indexing_discovery_contract() {
         use crate::indexing::{Indexing, Kind, State, Target};
-        assert_eq!(CONTRACT_VERSION, "3.2");
+        assert_eq!(CONTRACT_VERSION, "3.3");
         let indexing = serde_json::to_value(Indexing::single(Target::new(
             Kind::Reference,
             State::Ready,
@@ -551,6 +551,21 @@ mod tests {
         for profile in [McpProfile::Workspace, McpProfile::Reference] {
             let schema = output_schema(profile, "search").unwrap();
             let validator = jsonschema::validator_for(&schema).unwrap();
+            if profile == McpProfile::Workspace {
+                let mut body = json!({
+                    "action":"search_code", "schema_version":"8", "indexing":indexing,
+                    "hits":[{"symbol":"Тест", "source_span": {
+                        "byte_start":0, "byte_end":10, "parent_byte_start":0,
+                        "parent_byte_end":20, "part_index":1, "part_count":2
+                    }}], "shown":1, "total":1
+                });
+                assert!(validator.is_valid(&body));
+                body["hits"][0]["source_span"]["part_index"] = json!(0);
+                assert!(!validator.is_valid(&body));
+                body["hits"][0]["source_span"]["part_index"] = json!(1);
+                body["hits"][0]["source_span"]["parent_symbol"] = json!("internal");
+                assert!(!validator.is_valid(&body));
+            }
             let mut actual = crate::tools::search::docs_not_ready("find_docs");
             Indexing::single(Target::new(
                 Kind::Reference,
@@ -561,7 +576,7 @@ mod tests {
             assert!(validator.is_valid(actual.structured_content.as_ref().unwrap()));
             for action in ["search_code", "find_docs", "search_docs"] {
                 let version = if action == "search_code" && profile == McpProfile::Workspace {
-                    "7"
+                    "8"
                 } else {
                     "6"
                 };
@@ -574,8 +589,17 @@ mod tests {
                     assert!(!validator.is_valid(&body));
                 }
             }
-            let mut status = json!({"action":"status","schema_version":"3","profile":"reference","state":"ready","indexing":indexing});
+            let mut status = json!({"action":"status","schema_version":"4","profile":"reference","state":"ready","indexing":indexing});
             assert!(validator.is_valid(&status));
+            status["embedding_profile"] = json!({
+                "wire_model": "served-alias",
+                "storage_identity": "profile-v1:0123",
+                "dimension": 768,
+            });
+            assert!(validator.is_valid(&status));
+            status["embedding_profile"]["query_prefix"] = json!("must stay undisclosed");
+            assert!(!validator.is_valid(&status));
+            status.as_object_mut().unwrap().remove("embedding_profile");
             status.as_object_mut().unwrap().remove("indexing");
             assert!(!validator.is_valid(&status));
             assert!(validator.is_valid(&json!({"action":"list_platform","schema_version":"1","items":[],"shown":0,"total":0,"budget_exhausted":false})));
@@ -902,7 +926,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "3.2",
+              "contract_version": "3.3",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -932,8 +956,8 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:63a9e96880002c29049b85f76cd9528061c72ffa0aa500384c44716d70501d42",
-                        "output_schema_version": "6",
+                        "output_schema_fingerprint": "blake3:16ac68a2b10e4a20342f41a6fc435182996213e917a75a8a25077d3021f3d4c5",
+                        "output_schema_version": "7",
                         "params": [
                           {
                             "name": "action",
@@ -1250,8 +1274,8 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:53b026ab8c57f8b8241d822016322968ec90ec4a95e2f206e114cc6fb38a74bd",
-                        "output_schema_version": "7",
+                        "output_schema_fingerprint": "blake3:253ed1cc1c5757ff39f5de35cdd81d724ab9509c93e6730f60c8302a4c11a553",
+                        "output_schema_version": "9",
                         "params": [
                           {
                             "name": "action",

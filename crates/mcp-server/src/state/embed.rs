@@ -275,6 +275,7 @@ impl SharedState {
         embed_flight: Arc<EmbedFlight>,
         overlay_retry: Option<Arc<super::overlay_retry::OverlayRetry>>,
         root_drift_epoch: Arc<AtomicU64>,
+        embedding_prefixes: super::types::EmbeddingPrefixes,
         lease: crate::workspace_lease::WorkspaceLease,
         publish_retry_budget: std::time::Duration,
     ) -> Arc<
@@ -302,6 +303,7 @@ impl SharedState {
                 &lease,
                 signal,
                 publish_retry_budget,
+                Some(&embedding_prefixes),
             );
             // Context refresh may have NULLed more chunks, so kick after both mutations and let
             // the existing single-flights absorb all pending work in one rerun.
@@ -314,6 +316,7 @@ impl SharedState {
                     &embed_flight,
                     &lease,
                     publish_retry_budget,
+                    Some(&embedding_prefixes),
                 );
             }
             if pending_overlay_embeddings {
@@ -821,6 +824,7 @@ impl SharedState {
                 return super::WorkspaceSearchApply::Released;
             }
             #[cfg(test)]
+            #[allow(deprecated, reason = "test fault injection retains Rust 1.91 compatibility")]
             if FORCE_OVERLAY_PUBLICATION_REFUSALS
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
@@ -957,6 +961,7 @@ impl SharedState {
             lease,
             signal,
             super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+            None,
         )
     }
 
@@ -975,6 +980,7 @@ impl SharedState {
         lease: &crate::workspace_lease::WorkspaceLease,
         signal: crate::graph::GraphPublishSignal,
         publish_retry_budget: std::time::Duration,
+        embedding_prefixes: Option<&super::types::EmbeddingPrefixes>,
     ) -> bool {
         let crate::graph::GraphPublishSignal {
             drift_pending,
@@ -1106,6 +1112,7 @@ impl SharedState {
                 embed_flight,
                 lease,
                 publish_retry_budget,
+                embedding_prefixes,
             );
         }
         topology_handled
@@ -1115,6 +1122,8 @@ impl SharedState {
     /// shared embed single-flight — the same pass workspace boot uses, so the two never race an
     /// index swap. When no embedder is configured the kick returns without claiming (lexical
     /// results, already fresh from the refresh, are the whole story).
+    // Reuse the existing owner/single-flight controls with the same frozen input profile.
+    #[allow(clippy::too_many_arguments)]
     fn kick_context_reembed(
         engine: &SharedSearchEngine,
         stop: &super::OwnerStop,
@@ -1123,6 +1132,7 @@ impl SharedState {
         embed_flight: &Arc<EmbedFlight>,
         lease: &crate::workspace_lease::WorkspaceLease,
         publish_retry_budget: std::time::Duration,
+        embedding_prefixes: Option<&super::types::EmbeddingPrefixes>,
     ) {
         // A no-embedder engine has nothing to re-embed; resolve the DB path only if semantic
         // is live so we never claim the flight for a pass that would do nothing.
@@ -1132,7 +1142,7 @@ impl SharedState {
                 .and_then(|engine| engine.has_semantic().then(|| engine.db_path().to_path_buf()))
         });
         let Some(db_path) = db_path else { return };
-        let config = match Self::embedding_config() {
+        let config = match Self::embedding_config_with_prefixes(embedding_prefixes) {
             Ok(Some(config)) => config,
             Ok(None) => return,
             Err(error) => {
@@ -1298,6 +1308,7 @@ impl SharedState {
                                 } else {
                                     &FORCE_EMBED_PUBLICATION_REFUSALS
                                 };
+                                #[allow(deprecated, reason = "test fault injection retains Rust 1.91 compatibility")]
                                 if forced
                                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                                         remaining.checked_sub(1)
@@ -2154,6 +2165,7 @@ mod tests {
             Arc::clone(&flight),
             None,
             Arc::new(AtomicU64::new(0)),
+            super::super::types::EmbeddingPrefixes::default(),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
@@ -2212,6 +2224,7 @@ mod tests {
             super::EmbedFlight::new(),
             None,
             Arc::new(AtomicU64::new(0)),
+            super::super::types::EmbeddingPrefixes::default(),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
@@ -2654,6 +2667,7 @@ mod tests {
             &embed_flight,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+            None,
         );
 
         // Poll until the background pass swaps the fresh vector into the live engine.
@@ -2729,6 +2743,7 @@ mod tests {
             &embed_flight,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+            None,
         );
         assert!(embed_flight.is_in_flight(), "the existing claim is untouched");
         assert!(
@@ -2803,6 +2818,7 @@ mod tests {
             Arc::clone(&embed_flight),
             None,
             Arc::new(AtomicU64::new(0)),
+            super::super::types::EmbeddingPrefixes::default(),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
@@ -4424,6 +4440,7 @@ mod tests {
             &embed_flight,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+            None,
         );
 
         let deadline = Instant::now() + Duration::from_secs(20);

@@ -190,6 +190,9 @@ fn file_blake3(path: &Path) -> Result<String, (SearchError, Reason)> {
 /// Try to load a persisted index consistent with the current embeddings. `None` means the
 /// caller must rebuild and prepare a new publication. Never returns a stale/wrong index.
 pub fn try_load(store: &Store, key: &PersistKey) -> Option<VectorIndex> {
+    if !store.embedding_profile_matches(key.model_id, key.dim).ok()? {
+        return None;
+    }
     let result = (|| {
         let sidecar =
             read_sidecar(&sidecar_path(key.db_path)).map_err(|reason| (reason, "sidecar"))?;

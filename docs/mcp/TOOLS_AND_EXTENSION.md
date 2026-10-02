@@ -52,19 +52,27 @@
 
 ### Версии и lifecycle справочной поверхности
 
-`search` публикует tool-wide `outputSchema`: `search_code` (включая `not_ready`) — версии `7`,
+При opt-in `maxInputTokens`/`tokenizerFile`/`tokenizerSha256` результат `search_code`
+показывает исходный `symbol` и необязательный `source_span`: `byte_start`, `byte_end`,
+`parent_byte_start`, `parent_byte_end`, `part_index`, `part_count`. Байтовые диапазоны
+относятся к полному исходному файлу, начинаются с нуля и не включают конец;
+номер части начинается с единицы. Части одного метода остаются отдельными hits.
+Без token policy `source_span` отсутствует. Версия `8` описывает эту форму code hit;
+веса и порядок fusion не меняются.
+
+`search` публикует tool-wide `outputSchema` версии `9` в workspace и `7` в reference: `search_code` (включая `not_ready`) — версии `8`,
 `find_docs` и `search_docs` (включая `not_ready`) — версии `6`; варианты различаются по
 `action` и `schema_version`. Номера действий независимы: `search_code` ранее получил версию `5` из-за
 `freshness.drift_watch`. Контракт `3.0` добавил indexing и повысил версии
 `search_code` до `6`, справочных действий до `5`; контракт `3.1` добавляет необязательную
 диагностику `semantic_failure` и повышает их до `7` и `6`;
-`list_platform` имеет версию `1`; `status` обоих профилей имеет точную форму
-`{action:"status",schema_version:"3",profile,state,indexing}` с необязательным
-`semantic_failure`, где `state` — `ready|loading|busy|failed`.
-Машинный контракт имеет версию `3.2`. `metadata` live object возвращает `schema_version="2"`
+`list_platform` имеет версию `1`; `status` обоих профилей имеет версию `4` и форму
+`{action:"status",schema_version:"4",profile,state,indexing}` с необязательными
+`semantic_failure` и `embedding_profile`; профиль содержит `wire_model`, `storage_identity`
+и `dimension`. `state` — `ready|loading|busy|failed`. Машинный контракт имеет версию `3.3`. `metadata` live object возвращает `schema_version="2"`
 с `completeness` и `truncated`; live `tree` и `object` учитывают общий `max_output_tokens`.
-`syntax_help` имеет версию `2`, а все успешные варианты `symbol_info`, включая transient
-`status="loading"`, — версию `1`.
+`syntax_help` имеет версию `2`, а все успешные варианты
+`symbol_info`, включая transient `status="loading"`, — версию `1`.
 
 Справочный индекс проходит состояния `Uninitialized → Loading → Ready` либо `Failed`.
 Во время загрузки поиск возвращает структурированный `not_ready`, terminal `Failed` —
@@ -858,7 +866,7 @@ waiting и terminal состояниях устаревшие числа не п
 `structuredContent`. Машинный потребитель читает поля, а не разбирает колонки:
 
 ```json tool=search
-{"action":"search_code","schema_version":"7",
+{"action":"search_code","schema_version":"8",
  "hits":[{"rank":1,"modality":"L","root_id":"","path":"CommonModules/Утилиты/Ext/Module.bsl",
           "line_start":181,"line_end":201,"symbol":"ПроверитьИНН","kind":"procedure",
           "graph_id":"method/common/Утилиты/ПроверитьИНН",
@@ -975,7 +983,7 @@ overlay; состояние другого владельца не сбрасы�
 Статус `reference` остаётся лексически готовым:
 
 ```json tool=search
-{"action":"status","schema_version":"3","profile":"reference","state":"ready",
+{"action":"status","schema_version":"4","profile":"reference","state":"ready",
  "indexing":{"schema_version":"1","targets":[
   {"kind":"reference","state":"ready","phase":null,"progress":null,"pass_id":null,"reason_code":null}]},
  "semantic_failure":{"code":"embedding_request_too_large"}}
@@ -993,7 +1001,7 @@ overlay; состояние другого владельца не сбрасы�
 Локальный отказ workspace-сборки сообщает измеренные байты:
 
 ```json tool=search
-{"action":"status","schema_version":"3","profile":"workspace","state":"ready",
+{"action":"status","schema_version":"4","profile":"workspace","state":"ready",
  "indexing":{"schema_version":"1","targets":[
   {"kind":"lexical","state":"ready","phase":null,"progress":null,"pass_id":null,"reason_code":null},
   {"kind":"semantic","state":"failed","phase":null,"progress":null,"pass_id":null,
@@ -1006,7 +1014,7 @@ overlay; состояние другого владельца не сбрасы�
 этот отказ не меняет состояние уже построенного индекса:
 
 ```json tool=search
-{"action":"search_code","schema_version":"7","hits":[],"shown":0,"total":0,
+{"action":"search_code","schema_version":"8","hits":[],"shown":0,"total":0,
  "degraded":"semantic skipped: embedding failed",
  "indexing":{"schema_version":"1","targets":[
   {"kind":"lexical","state":"ready","phase":null,"progress":null,"pass_id":null,"reason_code":null},
@@ -1245,9 +1253,9 @@ connection URL и учётные данные не записывают.
 
 ### Структурированный прогресс индексации
 
-Machine contract `3.2` публикуется через `bsl-analyzer contract` и ресурс
+Machine contract `3.3` публикуется через `bsl-analyzer contract` и ресурс
 `bsl-analyzer://contract`; схемы доступны в `tools/list`. Версии: search hits/not-ready
-`7` для `search_code` и `6` для docs-действий, search status `3`, graph schema
+`8` для `search_code` и `6` для docs-действий, search status `4`, graph schema
 descriptor `35`, indexing `1`;
 `list_platform` остаётся `1`. У legacy graph status/loading нет нового корневого
 `schema_version`.
@@ -1289,7 +1297,7 @@ descriptor `35`, indexing `1`;
 используют тот же sample; counter equality сама по себе не доказывает ready.
 
 ```json tool=search
-{"action":"search_code","schema_version":"7","status":"not_ready",
+{"action":"search_code","schema_version":"8","status":"not_ready",
  "detail":"semantic indexing","retry_after_ms":1500,
  "progress":{"active":true,"chunks":{"done":12,"total":48},"batches":{"done":1,"total":4},"pct":25},
  "indexing":{"schema_version":"1","targets":[
@@ -1318,6 +1326,6 @@ fingerprint, подходящий model/dimension и свежий cache (TTL 60 
 coverage/identity — соответствующий unknown. Graph stale — waiting/stale_generation,
 reload — running; ошибки и terminal outcomes сохраняются до нового запуска.
 
-Strict consumers квалифицируют `3.2` перед своим развёртыванием. Rollback — предыдущий
+Strict consumers квалифицируют `3.3` перед своим развёртыванием. Rollback — предыдущий
 квалифицированный binary и соответствующий contract, без конвертации индекса.
 Отсутствие `indexing` у старого контракта означает недоступную telemetry, не готовность.

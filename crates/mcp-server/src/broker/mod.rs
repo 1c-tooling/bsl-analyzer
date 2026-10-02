@@ -13,7 +13,9 @@ pub mod proxy;
 pub(crate) mod security;
 
 pub use name::{
-    backend_name, embedding_config_fingerprint, workspace_topology_fingerprint, BackendKey,
-    TOPOLOGY_FP_ENV,
+    backend_name, embedding_config_fingerprint, embedding_config_fingerprint_with_prefixes,
+    workspace_topology_fingerprint, BackendKey, EMBEDDING_DOCUMENT_PREFIX_ENV,
+    EMBEDDING_MAX_INPUT_TOKENS_ENV, EMBEDDING_QUERY_PREFIX_ENV, EMBEDDING_TOKENIZER_FILE_ENV,
+    EMBEDDING_TOKENIZER_SHA256_ENV, TOPOLOGY_FP_ENV,
 };
 pub use security::{peer_pid_available, SUPERVISED_PID_PLATFORMS};

@@ -98,9 +98,47 @@ pub(super) fn build_workspace_code(
     // seen, and those counters are the numbers the refusal reports.
     let declared: Vec<std::path::PathBuf> =
         roots.entries().map(|(_, path)| path.to_path_buf()).collect();
-    engine.initialize_workspace_roots(roots)?;
+    engine.initialize_workspace_roots(roots.clone())?;
 
     let walk = project_model::SourceSet::scan(&declared);
+    if let Some(config) = super::postgres::embedder_config(project)? {
+        if config.token_policy.is_some() {
+            let embedder = bsl_search::Embedder::new(config);
+            let mut documents = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut indexed_files = 0;
+            let mut unreadable_files = 0;
+            for file in &walk.files {
+                if file.role != project_model::FileRole::Source {
+                    continue;
+                }
+                let Some(key) = roots.root_of(&file.walked, &file.canonical) else {
+                    continue;
+                };
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                let content = match std::fs::read_to_string(&file.walked) {
+                    Ok(content) => content,
+                    Err(_) => {
+                        unreadable_files += 1;
+                        continue;
+                    }
+                };
+                let prepared = bsl_search::prepare_file_documents(
+                    &key,
+                    &content,
+                    None,
+                    embedder.token_policy().expect("checked above"),
+                    embedder.document_prefix(),
+                    |input| embedder.check_singleton_input(input),
+                )?;
+                indexed_files += usize::from(!prepared.is_empty());
+                documents.extend(prepared);
+            }
+            return Ok(WorkspaceCorpus { indexed_files, documents, walk, unreadable_files });
+        }
+    }
     let ingest = engine.ingest_scanned_fts(&walk)?;
     let documents = engine.load_indexed_documents(Some("code"))?;
     Ok(WorkspaceCorpus {

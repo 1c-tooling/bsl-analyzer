@@ -663,6 +663,7 @@ impl WorkspaceLease {
                 }
             });
             #[cfg(test)]
+            #[allow(deprecated, reason = "test fault injection retains Rust 1.91 compatibility")]
             if self.inner.fail_checkpoint_lock.swap(false, Ordering::SeqCst)
                 || self.inner.fail_checkpoint_lock_countdown.fetch_update(
                     Ordering::SeqCst,

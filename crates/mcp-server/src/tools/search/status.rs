@@ -567,6 +567,13 @@ pub(super) fn search_status_with_cap(
     // Everything below is engine-free; release the lock now so a concurrent search never
     // queues behind status rendering. `index_building` is captured while the guard is held.
     let index_building = guard.as_ref().is_some_and(|g| g.is_none());
+    let embedding_profile = guard
+        .as_ref()
+        .and_then(|guard| guard.as_ref())
+        .and_then(SearchEngine::embedding_profile)
+        .map(|(wire_model, storage_identity, dimension)| {
+            (wire_model.to_owned(), storage_identity.to_owned(), dimension)
+        });
     if !engine_busy {
         tracing::debug!(
             elapsed_ms = guard_held_start.elapsed().as_millis() as u64,
@@ -673,10 +680,17 @@ pub(super) fn search_status_with_cap(
     };
     let mut body = json!({
         "action": "status",
-        "schema_version": "3",
+        "schema_version": super::types::search_schema_version("status"),
         "profile": profile.as_str(),
         "state": state,
     });
+    if let Some((wire_model, storage_identity, dimension)) = embedding_profile {
+        body["embedding_profile"] = json!({
+            "wire_model": wire_model,
+            "storage_identity": storage_identity,
+            "dimension": dimension,
+        });
+    }
     if let Some(failure) = semantic_failure {
         body["semantic_failure"] = json!(failure);
     }
@@ -970,7 +984,7 @@ mod tests {
         for profile in [crate::McpProfile::Workspace, crate::McpProfile::Reference] {
             let result = run(profile, OverlayWarmupState::Pending);
             let body = result.structured_content.unwrap();
-            assert_eq!(body["schema_version"], "3");
+            assert_eq!(body["schema_version"], "4");
             assert_eq!(body["state"], "ready");
             assert_eq!(body["semantic_failure"], serde_json::json!(main_failure));
             assert!(result.content[0].as_text().unwrap().text.contains("embedding_timeout"));

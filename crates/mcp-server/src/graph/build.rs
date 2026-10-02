@@ -1389,13 +1389,18 @@ impl<'e> FusedChunkWriter<'e> {
                 rel.to_path_buf()
             } else {
                 let canonical_root = self.canonical_source_root.as_ref()?;
-                disk_path.canonicalize().ok()?.strip_prefix(canonical_root).ok()?.to_path_buf()
+                // The producer already emits canonical paths. Keep their key after a
+                // file disappears, so the read below can report ReadError without mutation.
+                if let Ok(rel) = disk_path.strip_prefix(canonical_root) {
+                    rel.to_path_buf()
+                } else {
+                    disk_path.canonicalize().ok()?.strip_prefix(canonical_root).ok()?.to_path_buf()
+                }
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
             return (!rel.is_empty()).then(|| bsl_search::FileKey::configuration(rel));
         };
-        let canonical = disk_path.canonicalize().ok()?;
-        roots.root_of(disk_path, &canonical)
+        roots.key_of_path(disk_path)
     }
 }
 

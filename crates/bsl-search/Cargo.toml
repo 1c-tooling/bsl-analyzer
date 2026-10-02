@@ -19,6 +19,8 @@ postgres = "0.19"
 r2d2_postgres = "0.18"
 
 blake3 = "1.8"
+sha2 = "0.11"
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
 
 ureq = { version = "3.2", features = ["json"] }
 

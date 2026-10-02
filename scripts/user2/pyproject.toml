@@ -1,0 +1,24 @@
+[project]
+name = "bsl-user2-pilot"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch==2.8.0+cu128",
+  "sentence-transformers==5.5.1",
+  "transformers==5.1.0",
+  "datasets==4.2.0",
+  "numpy==2.3.2",
+  "c1rb",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+c1rb = { git = "https://github.com/PruhaNLP/1C-RB.git", rev = "5f2c67c6a50b74560c9f783900a119c83883e618" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

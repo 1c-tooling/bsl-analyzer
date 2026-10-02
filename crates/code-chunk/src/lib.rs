@@ -28,6 +28,14 @@ pub struct Chunk {
     pub text: String,
 }
 
+/// A parent chunk paired with its exact byte range in the original source.
+#[derive(Debug, Clone)]
+pub struct SourceChunk {
+    pub chunk: Chunk,
+    pub source_byte_start: u32,
+    pub source_byte_end: u32,
+}
+
 const MAX_CHUNK_BYTES: usize = 32 * 1024;
 
 /// Suffix [`split_large_chunk`] appends to each part of an over-large method chunk.
@@ -54,8 +62,30 @@ impl Chunker {
     }
 
     pub fn chunk_parsed(root: &syntax::SyntaxNode, source: &str) -> Vec<Chunk> {
-        let line_index = LineIndex::new(source);
+        let mut result = Vec::new();
+        for source_chunk in Self::source_chunks_parsed(root, source) {
+            let mut chunk = source_chunk.chunk;
+            if chunk.kind == ChunkKind::ModuleHeader {
+                chunk.text = source.trim_end().to_owned();
+            }
+            if chunk.text.len() <= MAX_CHUNK_BYTES {
+                result.push(chunk);
+            } else {
+                result.extend(split_large_chunk(chunk));
+            }
+        }
+        result
+    }
 
+    /// Return unsplit chunks with their original source spans, before legacy
+    /// byte-based splitting normalizes line endings.
+    pub fn source_chunks(source: &str) -> Vec<SourceChunk> {
+        let parse = parser::parse(source);
+        Self::source_chunks_parsed(&parse.syntax_node(), source)
+    }
+
+    pub fn source_chunks_parsed(root: &syntax::SyntaxNode, source: &str) -> Vec<SourceChunk> {
+        let line_index = LineIndex::new(source);
         let mut chunks = Vec::new();
 
         for node in root.descendants() {
@@ -82,39 +112,37 @@ impl Chunker {
             let start_byte = u32::from(range.start());
             let end_byte = u32::from(range.end());
 
-            chunks.push(Chunk {
-                kind,
-                name,
-                is_export,
-                annotations,
-                line_start: line_index.line_of(start_byte),
-                line_end: line_index.line_of(end_byte.saturating_sub(1)) + 1,
-                text: source[start_byte as usize..end_byte as usize].to_owned(),
+            chunks.push(SourceChunk {
+                chunk: Chunk {
+                    kind,
+                    name,
+                    is_export,
+                    annotations,
+                    line_start: line_index.line_of(start_byte),
+                    line_end: line_index.line_of(end_byte.saturating_sub(1)) + 1,
+                    text: source[start_byte as usize..end_byte as usize].to_owned(),
+                },
+                source_byte_start: start_byte,
+                source_byte_end: end_byte,
             });
         }
 
         if chunks.is_empty() && has_meaningful_content(source) {
-            chunks.push(Chunk {
-                kind: ChunkKind::ModuleHeader,
-                name: String::new(),
-                is_export: false,
-                annotations: Vec::new(),
-                line_start: 0,
-                line_end: line_index.line_of(source.len() as u32),
-                text: source.trim_end().to_owned(),
+            chunks.push(SourceChunk {
+                chunk: Chunk {
+                    kind: ChunkKind::ModuleHeader,
+                    name: String::new(),
+                    is_export: false,
+                    annotations: Vec::new(),
+                    line_start: 0,
+                    line_end: line_index.line_of(source.len() as u32),
+                    text: source.to_owned(),
+                },
+                source_byte_start: 0,
+                source_byte_end: source.len() as u32,
             });
         }
-
-        let mut result = Vec::new();
-        for chunk in chunks {
-            if chunk.text.len() <= MAX_CHUNK_BYTES {
-                result.push(chunk);
-            } else {
-                result.extend(split_large_chunk(chunk));
-            }
-        }
-
-        result
+        chunks
     }
 }
 
@@ -327,5 +355,24 @@ mod tests {
             assert_eq!(a.line_end, b.line_end);
             assert_eq!(a.text, b.text);
         }
+    }
+
+    #[test]
+    fn source_chunks_keep_exact_parent_spans_before_legacy_split() {
+        let source = "Процедура Тест()\r\n\tВозврат \"ё\";\r\nКонецПроцедуры\r\n";
+        let chunks = Chunker::source_chunks(source);
+        assert_eq!(chunks.len(), 1);
+        let parent = &chunks[0];
+        assert_eq!(
+            &source[parent.source_byte_start as usize..parent.source_byte_end as usize],
+            parent.chunk.text
+        );
+        assert!(parent.chunk.text.contains("\r\n"));
+
+        let header = "Перем А;\r\n  \r\n";
+        let header_chunk = Chunker::source_chunks(header).pop().unwrap();
+        assert_eq!(header_chunk.chunk.text, header);
+        assert_eq!(header_chunk.source_byte_end as usize, header.len());
+        assert_eq!(Chunker::chunk(header)[0].text, header.trim_end());
     }
 }
