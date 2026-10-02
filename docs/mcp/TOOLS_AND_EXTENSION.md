@@ -1223,9 +1223,9 @@ connection URL и учётные данные не записывают.
 
 ### Структурированный прогресс индексации
 
-Machine contract `3.2` публикуется через `bsl-analyzer contract` и ресурс
+Machine contract `3.3` публикуется через `bsl-analyzer contract` и ресурс
 `bsl-analyzer://contract`; схемы доступны в `tools/list`. Версии: search hits/not-ready
-`7` для `search_code` и `6` для docs-действий, search status `4`, graph schema
+`8` для `search_code` и `6` для docs-действий, search status `4`, graph schema
 descriptor `35`, indexing `1`;
 `list_platform` остаётся `1`. У legacy graph status/loading нет нового корневого
 `schema_version`.
@@ -1296,6 +1296,6 @@ fingerprint, подходящий model/dimension и свежий cache (TTL 60 
 coverage/identity — соответствующий unknown. Graph stale — waiting/stale_generation,
 reload — running; ошибки и terminal outcomes сохраняются до нового запуска.
 
-Strict consumers квалифицируют `3.2` перед своим развёртыванием. Rollback — предыдущий
+Strict consumers квалифицируют `3.3` перед своим развёртыванием. Rollback — предыдущий
 квалифицированный binary и соответствующий contract, без конвертации индекса.
 Отсутствие `indexing` у старого контракта означает недоступную telemetry, не готовность.

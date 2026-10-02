@@ -360,13 +360,25 @@ fn source_span_from_row(
     row: &rusqlite::Row<'_>,
     start: usize,
 ) -> rusqlite::Result<Option<SourceSpan>> {
-    let parent_symbol: Option<String> = row.get(start)?;
-    let byte_start: Option<u32> = row.get(start + 1)?;
-    let byte_end: Option<u32> = row.get(start + 2)?;
-    let parent_byte_start: Option<u32> = row.get(start + 3)?;
-    let parent_byte_end: Option<u32> = row.get(start + 4)?;
-    let part_index: Option<u32> = row.get(start + 5)?;
-    let part_count: Option<u32> = row.get(start + 6)?;
+    use rusqlite::types::ValueRef;
+    // A value that does not fit its field is damage of the same kind as a missing one; reading
+    // it through the typed accessor would fail the whole row and the lexical hit with it.
+    let number = |offset: usize| -> rusqlite::Result<Option<u32>> {
+        Ok(match row.get_ref(start + offset)? {
+            ValueRef::Integer(value) => u32::try_from(value).ok(),
+            _ => None,
+        })
+    };
+    let parent_symbol = match row.get_ref(start)? {
+        ValueRef::Text(text) => std::str::from_utf8(text).ok().map(str::to_owned),
+        _ => None,
+    };
+    let byte_start = number(1)?;
+    let byte_end = number(2)?;
+    let parent_byte_start = number(3)?;
+    let parent_byte_end = number(4)?;
+    let part_index = number(5)?;
+    let part_count = number(6)?;
     match (
         parent_symbol,
         byte_start,
@@ -6251,6 +6263,72 @@ mod tests {
             .unwrap();
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].source_span, spans[0]);
+    }
+
+    /// Damaged provenance must not take the preserved text with it: lexical readers serve the
+    /// chunk without a span whether the damage is a negative, an oversized or a non-numeric value.
+    #[test]
+    fn damaged_source_span_values_leave_lexical_readers_serving_the_chunk() {
+        let claim = "profile-v1:token-layout-test";
+        for damage in ["part_index = -1", "byte_end = 4294967296", "part_count = 'x'"] {
+            let mut store = Store::in_memory().unwrap();
+            for (path, overlay) in [("a.bsl", false), ("overlay.bsl", true)] {
+                if overlay {
+                    store
+                        .upsert_overlay_file_with_chunks_and_source_spans(
+                            CONFIGURATION_ROOT_ID,
+                            path,
+                            b"overlay",
+                            "code",
+                            &[sample_chunk("Overlay")],
+                            None,
+                            None,
+                            Some(claim),
+                            &[Some(source_span())],
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .reindex_file_with_identity_and_source_spans(
+                            CONFIGURATION_ROOT_ID,
+                            path,
+                            b"hash",
+                            &[sample_chunk("A")],
+                            None,
+                            None,
+                            claim,
+                            2,
+                            Some(claim),
+                            &[Some(source_span())],
+                        )
+                        .unwrap();
+                }
+            }
+            for table in ["chunk_source_spans", "overlay_chunk_source_spans"] {
+                store.conn.execute(&format!("UPDATE {table} SET {damage}"), []).unwrap();
+            }
+
+            let hit = store.text_search("A", 10, Some("code")).unwrap();
+            let chunk_id = hit[0].chunk_id;
+            assert_eq!(store.chunk_by_id(chunk_id).unwrap().unwrap().source_span, None, "{damage}");
+            assert_eq!(
+                store.chunks_by_ids(&[chunk_id]).unwrap()[&chunk_id].source_span,
+                None,
+                "{damage}"
+            );
+            let documents = store.load_indexed_documents(Some("code")).unwrap();
+            assert_eq!(documents.len(), 1, "{damage}");
+            assert!(documents.iter().all(|document| document.source_span.is_none()), "{damage}");
+            let overlay_ids = store
+                .conn
+                .prepare("SELECT id FROM overlay_chunks")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(store.overlay_chunks_by_ids(&overlay_ids).unwrap()[0].source_span, None);
+        }
     }
 
     #[test]

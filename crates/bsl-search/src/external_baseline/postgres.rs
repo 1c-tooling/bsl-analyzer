@@ -1991,10 +1991,21 @@ impl SnapshotContentStore for PostgresBaselineAdapter {
                 self.table("content_objects")
             )
         };
+        // Publication requires a span only for code documents; other collections keep theirs
+        // when one was published and otherwise read back without provenance.
+        let code_file_objects = visible_files
+            .iter()
+            .filter(|file| file.collection == "code")
+            .map(|file| file.file_object_id.as_str())
+            .collect::<HashSet<_>>();
         let mut items_by_file_object = HashMap::<String, Vec<FileObjectItem>>::new();
         for row in client.query(&items_query, &[&file_object_ids])? {
             let file_object_id: String = row.get("file_object_id");
-            let source_span = if self.token_layout_claim.is_some() {
+            let source_span = if self.token_layout_claim.is_none() {
+                None
+            } else if code_file_objects.contains(file_object_id.as_str())
+                || row.try_get::<_, Option<String>>("parent_symbol")?.is_some()
+            {
                 Some(source_span_from_row(&row)?)
             } else {
                 None
@@ -5467,6 +5478,51 @@ mod tests {
         assert!(mismatched.is_err());
         let after = counts();
         assert_eq!(before, after, "foreign and mismatched claims must preserve published rows");
+    }
+
+    /// Only code documents carry a source span. A claimed schema also stores documents of
+    /// other collections (the reference corpus), and reading them back must not demand
+    /// provenance rows the publication never had to write.
+    #[test]
+    #[ignore = "requires an isolated live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn token_layout_claim_reads_back_documents_without_source_spans() {
+        let url = std::env::var("BSL_TEST_PG_URL")
+            .expect("BSL_TEST_PG_URL must point to an isolated live Postgres");
+        let layout = crate::token_policy::SEGMENTATION_VERSION;
+        let claim = "profile-v1:reference-fixture";
+        let schema = unique_schema("tokenref");
+        let base = PostgresBaselineAdapter::new(
+            ExternalBaselineConfig::postgres(url).with_schema(&schema),
+        )
+        .unwrap();
+        let _guard = TestSchemaGuard { adapter: base.clone(), schema: schema.clone() };
+        base.migrate_storage().unwrap();
+        let adapter = base.with_token_layout_claim(layout, claim).unwrap();
+        adapter.ensure_token_layout_claim(layout, claim).unwrap();
+
+        let platform = indexed_document("platform", "docs/A.md", "A", 1, "platform-a", "body");
+        let mut code = indexed_document("code", "src/A.bsl", "A", 1, "code-a", "abc");
+        code.source_span = Some(SourceSpan {
+            parent_symbol: "A".to_owned(),
+            byte_start: 0,
+            byte_end: 3,
+            parent_byte_start: 0,
+            parent_byte_end: 3,
+            part_index: 1,
+            part_count: 1,
+        });
+        let snapshot = Snapshot::new("mixed", CorpusId::Reference);
+        adapter
+            .publish_snapshot(
+                &snapshot,
+                &SnapshotPublishMetadata::default(),
+                &[platform.clone(), code.clone()],
+            )
+            .unwrap();
+
+        let mut documents = adapter.load_snapshot_documents(&snapshot).unwrap();
+        documents.sort_by(|left, right| left.collection.cmp(&right.collection));
+        assert_eq!(documents, vec![code, platform]);
     }
 
     #[test]

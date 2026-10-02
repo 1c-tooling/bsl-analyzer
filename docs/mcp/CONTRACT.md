@@ -213,7 +213,7 @@ assert major == "3" and int(minor) >= 1
 `build_version` остаётся в документе, но для feature-detection он не нужен —
 именно ради этого и введена отдельная версия.
 
-В контракте `3.2` инструмент `search` публикует `outputSchema` версии `8` в workspace и reference:
+В контракте `3.3` инструмент `search` публикует `outputSchema` версии `9` в workspace и `7` в reference:
 hits и `not_ready` используют `schema_version="8"` для `search_code` и `"6"` для справки, `status` обоих профилей —
 `"4"`, `list_platform` сохраняет `"1"`. Добавлены необязательное поле статуса `embedding_profile`
 и необязательный закрытый объект

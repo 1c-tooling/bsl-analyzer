@@ -801,7 +801,15 @@ fn resolve_embedding_prefixes(
     let frozen_document = env::var(mcp_server::broker::EMBEDDING_DOCUMENT_PREFIX_ENV).ok();
     let frozen = frozen_query.zip(frozen_document);
     if let Some((query, document)) = frozen.as_ref() {
-        return Ok(resolve_embedding_prefix_values(None, None, None, Some((query, document))));
+        return frozen_embedding_prefixes(
+            query,
+            document,
+            [
+                env::var_os(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV),
+                env::var_os(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV),
+                env::var_os(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV),
+            ],
+        );
     }
     let config = source_dir.map(project_model::Project::new).transpose()?;
     let embedding = config.as_ref().map(|project| &project.config.search.baseline.embedding);
@@ -815,6 +823,19 @@ fn resolve_embedding_prefixes(
     );
     profile.token_profile = resolve_token_profile(config.as_ref(), source_dir)?;
     Ok(profile)
+}
+
+fn frozen_embedding_prefixes(
+    query: &str,
+    document: &str,
+    frozen_profile: [Option<std::ffi::OsString>; 3],
+) -> Result<mcp_server::EmbeddingPrefixes, Box<dyn Error + Send + Sync>> {
+    let mut prefixes = resolve_embedding_prefix_values(None, None, None, Some((query, document)));
+    // The launcher froze the whole input profile, so neither the project file nor the
+    // ambient environment may add a token profile the launcher did not key on.
+    prefixes.token_profile =
+        resolve_token_profile_values(None, None, frozen_profile, [None, None, None])?;
+    Ok(prefixes)
 }
 
 fn resolve_embedding_prefix_values(
@@ -1578,11 +1599,11 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_command, decode_password, resolve_embedding_prefix_values, resolve_onec_password,
-        resolve_serve_mode_with_override, resolve_token_profile_values, resolve_workspace_cache,
-        validate_backend_pid, validate_onec_settings, validate_serve_args,
-        warn_on_wildcard_allowlist, HttpServeOptions, McpCommand, McpProfileCli, McpServeArgs,
-        McpServeMode, ServeModeContext,
+        daemon_command, decode_password, frozen_embedding_prefixes,
+        resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
+        resolve_token_profile_values, resolve_workspace_cache, validate_backend_pid,
+        validate_onec_settings, validate_serve_args, warn_on_wildcard_allowlist, HttpServeOptions,
+        McpCommand, McpProfileCli, McpServeArgs, McpServeMode, ServeModeContext,
     };
     use clap::Parser;
     use std::io;
@@ -1718,6 +1739,94 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    /// The broker keys the backend on the profile it resolved and hands the daemon only the
+    /// frozen environment. A daemon that rebuilt a different profile from that environment
+    /// would bind under another key and serve with another token policy.
+    #[test]
+    fn daemon_rebuilds_the_broker_token_profile_from_its_frozen_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"document":1,"query":2,"extra":3,"hello":4},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bsl-analyzer.toml"),
+            "[search.baseline.embedding]\nmaxInputTokens = 8192\ntokenizerFile = \"tokenizer.json\"\ntokenizerSha256 = \"a58e529fb53e63963f904605eee152d54676591a555ca3072b51bdb680e993c9\"\n",
+        )
+        .unwrap();
+        let project = project_model::Project::new(dir.path()).unwrap();
+        let broker = mcp_server::EmbeddingPrefixes {
+            query: "query: ".to_owned(),
+            document: "document: ".to_owned(),
+            token_profile: resolve_token_profile_values(
+                Some(&project),
+                Some(dir.path()),
+                [None, None, None],
+                [None, None, None],
+            )
+            .unwrap(),
+        };
+        assert!(broker.token_profile.is_some(), "the fixture must configure a token profile");
+        let source = dir.path().canonicalize().unwrap();
+        let cache = mcp_server::WorkspaceCacheLayout::for_workspace(&source);
+        let command = daemon_command(
+            PathBuf::from("bsl-analyzer").as_path(),
+            &source,
+            &cache,
+            &serve_args(McpServeMode::Broker, None),
+            42,
+            &broker,
+        );
+        let frozen = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        };
+
+        let daemon = frozen_embedding_prefixes(
+            &frozen(mcp_server::broker::EMBEDDING_QUERY_PREFIX_ENV).unwrap().to_string_lossy(),
+            &frozen(mcp_server::broker::EMBEDDING_DOCUMENT_PREFIX_ENV).unwrap().to_string_lossy(),
+            [
+                frozen(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV),
+                frozen(mcp_server::broker::EMBEDDING_TOKENIZER_FILE_ENV),
+                frozen(mcp_server::broker::EMBEDDING_TOKENIZER_SHA256_ENV),
+            ],
+        )
+        .unwrap();
+
+        let profile =
+            daemon.token_profile.as_ref().expect("the daemon must keep the token profile");
+        assert!(profile.token_policy.is_some(), "the daemon must load the frozen tokenizer");
+        let expected = broker.token_profile.as_ref().unwrap();
+        assert_eq!(profile.max_input_tokens, expected.max_input_tokens);
+        assert_eq!(profile.tokenizer_file, expected.tokenizer_file);
+        assert_eq!(profile.tokenizer_sha256, expected.tokenizer_sha256);
+        assert_eq!(
+            mcp_server::broker::embedding_config_fingerprint_with_prefixes(&daemon),
+            mcp_server::broker::embedding_config_fingerprint_with_prefixes(&broker),
+        );
+
+        let without_profile =
+            mcp_server::EmbeddingPrefixes { token_profile: None, ..broker.clone() };
+        let command = daemon_command(
+            PathBuf::from("bsl-analyzer").as_path(),
+            &source,
+            &cache,
+            &serve_args(McpServeMode::Broker, None),
+            42,
+            &without_profile,
+        );
+        assert!(command.get_envs().any(|(name, value)| name
+            == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_MAX_INPUT_TOKENS_ENV)
+            && value.is_none()));
+        assert!(frozen_embedding_prefixes("query: ", "document: ", [None, None, None])
+            .unwrap()
+            .token_profile
+            .is_none());
     }
 
     #[test]
