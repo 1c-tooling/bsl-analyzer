@@ -234,6 +234,10 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
 - LSP: `Diagnostic.tags` отправляются с учётом `publishDiagnostics.tagSupport` —
   массив фильтруется по объявленному клиентом `valueSet`, а без `tagSupport`
   свойство не отправляется вовсе (github#95).
+- MCP `query(execute)`: гейт «только SELECT» решается по разбору
+  (`parser::parse_sdbl`) — ведущий комментарий или пустые строки больше не
+  отклоняют корректный SELECT, а не-SELECT за комментарием по-прежнему
+  отклоняется (github#84).
 
 ### Changed
 
