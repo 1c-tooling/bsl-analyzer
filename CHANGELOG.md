@@ -231,6 +231,10 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
 - `UnusedParameters`/`UnusedLocalMethod`: в модуле объекта внешнего отчёта (ERF)
   `ПриКомпоновкеРезультата`/`OnComposeResult` — платформенное событие, поэтому
   его параметры и метод больше не считаются неиспользуемыми (github#101).
+- MCP `query(execute)`: гейт «только SELECT» решается по разбору
+  (`parser::parse_sdbl`) — ведущий комментарий или пустые строки больше не
+  отклоняют корректный SELECT, а не-SELECT за комментарием по-прежнему
+  отклоняется (github#84).
 
 ### Changed
 
