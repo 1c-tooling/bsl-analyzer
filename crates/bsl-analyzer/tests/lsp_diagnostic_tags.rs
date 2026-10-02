@@ -1,4 +1,4 @@
-//! `Diagnostic.tags` against `publishDiagnostics.tagSupport` (github#95): the server
+//! `Diagnostic.tags` against `publishDiagnostics.tagSupport`: the server
 //! sends only the tags a client declared in its `valueSet`, and omits the property
 //! entirely when the capability was never announced.
 
