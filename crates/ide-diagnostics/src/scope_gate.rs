@@ -1,8 +1,15 @@
 //! Applies the configured [`base_db::AnalysisScope`] (vendor-diff filter) to
 //! the final diagnostics pipeline: a file entirely outside the scope skips
 //! analysis before any handler runs (file-gate), and individual diagnostics on
-//! unchanged lines are dropped at the same finalization points as inline
+//! unchanged lines are dropped in the finalization, immediately before inline
 //! suppression (line-gate).
+//!
+//! Before, not after: suppression both hides findings and adds its own
+//! meta-diagnostics about broken directives (`suppression.rs`), and those must
+//! not be gated — their subject is the directive, not the line, which is why
+//! directives themselves cannot suppress them and the baseline protects them
+//! too (github#61). Running the gate first means they are born out of its
+//! reach.
 
 use std::path::PathBuf;
 
@@ -145,6 +152,90 @@ mod tests {
         assert!(
             !has_self_assign(&off_changed_line),
             "a diagnostic on an unchanged line must be dropped: {off_changed_line:?}"
+        );
+    }
+
+    /// The suppression module's meta-diagnostics point at the directive, not at a code
+    /// line, and the line gate must not cut them: the gate runs before suppression, so
+    /// they are added after it (github#61). Swapping those two finalization steps back
+    /// makes this test red.
+    #[test]
+    fn meta_diagnostics_survive_the_line_gate() {
+        // 1-based: line 2 carries the broken directive, line 3 the in-scope
+        // self-assignment, line 4 an out-of-scope one. Only line 3 is changed.
+        let code = "Процедура Тест()\n    // bsl-analyzer:disable-next-line NoSuchRule\n    А = А;\n    Б = Б;\nКонецПроцедуры\n";
+        let diags = check_file_diagnostics_with_config(
+            code,
+            config_with_scope(scope_for(Some(vec![[3, 3]]))),
+        );
+
+        assert!(
+            diags.iter().any(|d| d.code == DiagnosticCode::UnknownSuppressionCode),
+            "a broken directive on an unchanged line must still be named: {diags:#?}"
+        );
+        let survivors: Vec<_> =
+            diags.iter().filter(|d| d.code == DiagnosticCode::SelfAssign).collect();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "the gate must cut the unchanged-line self-assignment: {diags:#?}"
+        );
+        assert_eq!(
+            code[..usize::from(survivors[0].range.start())].matches('\n').count(),
+            2,
+            "the surviving self-assignment must be the in-scope line 3: {survivors:#?}"
+        );
+    }
+
+    /// Область анализа не воскрешает и проигравшего пары `SelfAssign` /
+    /// `GlobalPropertyNotWritable`: пара решается на полном наборе, до строчной
+    /// политики (github#61). Оператор многострочный, имя-победитель стоит на
+    /// неизменённой строке, а диапазон проигравшего пересекает область —
+    /// перестановка `supersede_dominated` и гейта вернула бы `SelfAssign`.
+    #[test]
+    fn line_gate_does_not_resurrect_the_superseded_loser() {
+        let code = "Процедура Тест()\n    Справочники =\n        Справочники;\nКонецПроцедуры\n";
+
+        // Контроль: обе строки оператора в области — победитель на месте,
+        // проигравший вытеснен им ещё до политики.
+        let full = check_file_diagnostics_with_config(
+            code,
+            config_with_scope(scope_for(Some(vec![[2, 3]]))),
+        );
+        assert!(
+            full.iter().any(|d| d.code == DiagnosticCode::GlobalPropertyNotWritable),
+            "the fixture must emit the winner: {full:#?}"
+        );
+        assert!(!has_self_assign(&full), "the winner must supersede the loser: {full:#?}");
+
+        // Третий контроль: с выключенным победителем проигравший виден — фикстура
+        // действительно производит пару, а не пустоту, в которой нечего воскрешать.
+        let mut without_winner = DiagnosticsConfig::all_enabled();
+        without_winner.disabled.push(DiagnosticCode::GlobalPropertyNotWritable);
+        let loser_only = check_file_diagnostics_with_config(code, without_winner);
+        assert!(
+            has_self_assign(&loser_only),
+            "the fixture must emit the loser too: {loser_only:#?}"
+        );
+
+        // Только строка 3 (правая часть) в области: победитель со строки 2
+        // срезан гейтом, проигравший — уже вытеснен; пара не воскресает.
+        let gated = check_file_diagnostics_with_config(
+            code,
+            config_with_scope(scope_for(Some(vec![[3, 3]]))),
+        );
+        let survivors: Vec<_> = gated
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code,
+                    DiagnosticCode::SelfAssign | DiagnosticCode::GlobalPropertyNotWritable
+                )
+            })
+            .collect();
+        assert!(
+            survivors.is_empty(),
+            "the pair must not come back through the gate: {survivors:#?}"
         );
     }
 
