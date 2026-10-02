@@ -131,6 +131,65 @@ fn an_english_closer_typo_is_the_only_error() {
     assert!(messages[0].contains("вызов или присваивание"), "{messages:?}");
 }
 
+/// Опечатка в `КонецПопытки` до ветки `Исключение`: список тела `Попытки`
+/// кончается на `Исключение`, и опечатка закрывателя попадает в него. О пропаже
+/// `КонецПопытки` он обязан помнить сам — иначе финальное ожидание повторяет
+/// уже сказанное (github#88).
+#[test]
+fn a_typo_of_the_try_closer_before_the_except_clause_is_reported_once() {
+    let input = "Процедура П()\nПопытка\nКонецПопыткии;\nКонецПроцедуры";
+    let messages = messages(input, true);
+
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages.iter().any(|message| message.contains("Исключение")),
+        "пропавшая ветка обязана быть названа: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|message| message.contains("КонецПопытки")),
+        "об опечатке сообщили дважды: {messages:?}"
+    );
+}
+
+/// Тот же вход, но с веткой `Исключение`: опечатка попадает во второй список и
+/// гасится там. Контроль ради — у этого входа ответ не меняется.
+#[test]
+fn a_typo_of_the_try_closer_after_the_except_clause_names_no_closer() {
+    let input = "Процедура П()\nПопытка\nИсключение\nКонецПопыткии;\nКонецПроцедуры";
+    let messages = messages(input, true);
+
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("вызов или присваивание"), "{messages:?}");
+}
+
+/// Обратное направление: опечатка в теле глушит финальное ожидание только того
+/// закрывателя, на который она похожа. Честно пропавший `КонецПопытки` и
+/// опечатка `Исключение` ничего лишнего не глушат.
+#[test]
+fn only_the_closer_the_typo_resembled_is_suppressed() {
+    // `Исключение` на месте, `КонецПопытки` честно пропал: молчать нельзя.
+    let missing = messages("Процедура П()\nПопытка\nИсключение\nКонецПроцедуры", true);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0].contains("КонецПопытки"), "{missing:?}");
+
+    // Опечатка `Исключение`: о ней сообщают как о неизвестном операторе, а
+    // пропажу `КонецПопытки` финальное ожидание обязано назвать.
+    let except_typo = messages("Процедура П()\nПопытка\nИсключениее;\nКонецПроцедуры", true);
+    assert_eq!(except_typo.len(), 2, "{except_typo:?}");
+    assert!(
+        except_typo.iter().any(|message| message.contains("вызов или присваивание")),
+        "{except_typo:?}"
+    );
+    assert!(
+        except_typo.iter().any(|message| message.contains("КонецПопытки")),
+        "опечатка `Исключение` не отменяет пропажу `КонецПопытки`: {except_typo:?}"
+    );
+    assert!(
+        !except_typo.iter().any(|message| message.contains("Исключение")),
+        "о пропаже `Исключение` сообщили бы второй раз: {except_typo:?}"
+    );
+}
+
 /// Обрыв файла — не вторая ошибка, а единственная: подавлять её нечем.
 #[test]
 fn a_truncated_block_is_reported_even_after_a_recovery() {
