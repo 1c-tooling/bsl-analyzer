@@ -6150,10 +6150,10 @@ mod tests {
         fs::set_permissions(&module, open).unwrap();
 
         // And the probe runs with the request pool DRAINED, which is the ordinary state under
-        // a handful of concurrent graph calls. The probe must open a descriptor of its own:
-        // through the request pool it gets `None`, reads that as "this publication left nothing
-        // unread", heals nothing and doubles its pause — for a workspace that is now perfectly
-        // readable.
+        // a handful of concurrent graph calls. A background reader takes a handle like any
+        // other, so it gets none: that must read as "not measured" and leave the debt owed,
+        // never as "this publication left nothing unread", which would double its pause for a
+        // workspace that is now perfectly readable.
         let mut held = Vec::new();
         while let Some(snapshot) = graph.snapshot() {
             held.push(snapshot);
@@ -6163,8 +6163,11 @@ mod tests {
 
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.drive();
+        assert!(graph.owes_recovery(), "a probe that got no handle measured nothing");
         drop(held);
 
+        lock_recover(&graph.debt).probe_now(Instant::now());
+        graph.drive();
         wait_until(&graph, "the readable module to be rebuilt", || {
             graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
         });
