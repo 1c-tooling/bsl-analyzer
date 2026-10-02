@@ -236,6 +236,28 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
 - `UnusedParameters`/`UnusedLocalMethod`: в модуле объекта внешнего отчёта (ERF)
   `ПриКомпоновкеРезультата`/`OnComposeResult` — платформенное событие, поэтому
   его параметры и метод больше не считаются неиспользуемыми (github#101).
+- LSP: `Diagnostic.tags` отправляются с учётом `publishDiagnostics.tagSupport` —
+  массив фильтруется по объявленному клиентом `valueSet`, а без `tagSupport`
+  свойство не отправляется вовсе (github#95).
+- MCP `query(execute)`: гейт «только SELECT» решается по разбору
+  (`parser::parse_sdbl`) — ведущий комментарий или пустые строки больше не
+  отклоняют корректный SELECT, а не-SELECT за комментарием по-прежнему
+  отклоняется (github#84).
+- CI: Windows-джоб `windows-mcp` больше не запускает голые `cargo test` — каждый
+  поимённый фильтр идёт через `run_exact`/`run_nonempty`, требующие хотя бы один
+  выполненный тест. Обёртки сохраняют вывод упавшего прогона, а
+  `scripts/test-ci-test-output.py` проверяет и сами обёртки, и то, что в джобе не
+  осталось непроверенных запусков (github#102).
+- embeddings: при незаданном `EMBEDDING_DIM` поле `dimensions` больше не
+  отправляется — OpenAI-совместимые эндпоинты, отвергающие параметр
+  (`litellm.UnsupportedParamsError`), принимают запрос, а ширину задаёт модель
+  (индекс строится на 1024; модели другой ширины требуют явного `EMBEDDING_DIM`)
+  (github#124). Значение, заданное, но негодное, теперь даёт отказ
+  `embedding_invalid_config`, а не молчаливую подмену.
+- LSP `textDocument/foldingRange`: ответ урезается по `rangeLimit` клиента —
+  первыми уходят самые глубоко вложенные складки, при равной глубине самые
+  короткие — а номера строк считаются один раз, в `ide`, вместо второй проекции
+  через индекс открытого буфера (github#56, github#55).
 
 ### Changed
 

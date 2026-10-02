@@ -59,10 +59,12 @@ pub(super) fn embedder_config(
         return Ok(None);
     };
     let max_request_bytes = bsl_search::EmbedderConfig::request_bytes_from_env()?;
-    let dim = emb
-        .dimension
-        .or_else(|| env::var("EMBEDDING_DIM").ok().and_then(|value| value.parse().ok()))
-        .or(Some(1024));
+    // Same contract as the MCP server: an undeclared width sends no `dimensions`, so
+    // a baseline published here keeps the storage identity the server will claim.
+    let dim = match emb.dimension {
+        Some(dim) => Some(dim),
+        None => bsl_search::EmbedderConfig::dim_from_env()?,
+    };
 
     Ok(Some(bsl_search::EmbedderConfig {
         base_url,

@@ -122,6 +122,32 @@ pub(crate) fn success(_: usize, body: &[u8]) -> (u16, String) {
     (200, json!({"data":data}).to_string())
 }
 
+/// An undeclared width leaves `dimensions` out of the request entirely: an endpoint
+/// that refuses the parameter (`litellm.UnsupportedParamsError` among them) answers
+/// only then, and the width is the model's own.
+#[test]
+fn payload_transport_omits_an_undeclared_dimension() {
+    let embedder = Embedder::new(EmbedderConfig { dim: None, ..Default::default() });
+    let body = embedder.serialize_request(&["ASCII"]).unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(value.get("dimensions").is_none(), "an unset width must not be sent: {value}");
+}
+
+/// The width the client resolves for itself is still checked: an undeclared one
+/// resolves to the historical 1024, so a response of another width is a settled
+/// invalid answer — never vectors indexed under a contract nobody declared.
+#[test]
+fn payload_transport_refuses_a_response_of_an_undeclared_other_width() {
+    let server = PayloadServer::new(|_, _| {
+        (200, json!({"data":[{"index":0,"embedding":[1,2,3]}]}).to_string())
+    });
+    let mut config = server.config(4096);
+    config.dim = None;
+    let error = Embedder::new(config).embed_batch(&["a"]).unwrap_err();
+    assert_eq!(error.to_string(), "embedding_invalid_response");
+    assert_eq!(server.requests().len(), 1, "a settled wrong width is not retried");
+}
+
 #[test]
 fn payload_transport_serialized_ranges_and_exact_boundary() {
     let server = PayloadServer::new(success);
