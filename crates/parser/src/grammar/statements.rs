@@ -1,12 +1,13 @@
 use crate::Sig;
 
 use crate::event::NodeKind;
+use crate::parser::token_set::TokenSet;
 use crate::parser::Parser;
 
 use super::expressions;
 
 pub fn stmt_list(p: &mut Parser, terminator: Sig) -> bool {
-    stmt_list_of(p, &[terminator], terminator)
+    !stmt_list_of(p, &[terminator], &[terminator]).is_empty()
 }
 
 pub fn statement(p: &mut Parser) -> bool {
@@ -150,7 +151,8 @@ fn if_stmt(p: &mut Parser) {
 
         p.expect(T![KwThen]);
 
-        let mut recovered = stmt_list_of(p, &[T![KwElsIf], T![KwElse], T![KwEndIf]], T![KwEndIf]);
+        let mut recovered =
+            stmt_list_of(p, &[T![KwElsIf], T![KwElse], T![KwEndIf]], &[T![KwEndIf]]);
 
         while p.at(T![KwElsIf]) {
             p.check_iteration_limit();
@@ -158,20 +160,24 @@ fn if_stmt(p: &mut Parser) {
             p.bump();
             p.within_boundary(at_then, expressions::expression);
             p.expect(T![KwThen]);
-            recovered |= stmt_list_of(p, &[T![KwElsIf], T![KwElse], T![KwEndIf]], T![KwEndIf]);
+            recovered = recovered.union(stmt_list_of(
+                p,
+                &[T![KwElsIf], T![KwElse], T![KwEndIf]],
+                &[T![KwEndIf]],
+            ));
             em.complete(p, NodeKind::ElseIfClause);
         }
 
         if p.at(T![KwElse]) {
             let em = p.start();
             p.bump();
-            recovered |= stmt_list_of(p, &[T![KwEndIf]], T![KwEndIf]);
+            recovered = recovered.union(stmt_list_of(p, &[T![KwEndIf]], &[T![KwEndIf]]));
             em.complete(p, NodeKind::ElseClause);
         }
         recovered
     });
 
-    expect_stmt_list_terminator(p, T![KwEndIf], recovered);
+    expect_stmt_list_terminator(p, T![KwEndIf], recovered.contains(T![KwEndIf]));
 
     p.eat(T![Semicolon]);
 
@@ -267,18 +273,25 @@ fn try_stmt(p: &mut Parser) {
     let m = p.start();
     p.bump();
 
-    let recovered = p.within_boundary(at_try_closer, |p| {
-        let recovered = stmt_list(p, T![KwExcept]);
+    let (body_typos, except_typos) = p.within_boundary(at_try_closer, |p| {
+        // Тело идёт до `Исключение`, но опечатка `КонецПопытки` попадает в него
+        // раньше: список обязан запомнить оба закрывателя, о пропаже которых
+        // спросят после него.
+        let body_typos = stmt_list_of(p, &[T![KwExcept]], &[T![KwExcept], T![KwEndTry]]);
 
-        expect_stmt_list_terminator(p, T![KwExcept], recovered);
+        expect_stmt_list_terminator(p, T![KwExcept], body_typos.contains(T![KwExcept]));
 
         let em = p.start();
-        let recovered = stmt_list(p, T![KwEndTry]);
+        let except_typos = stmt_list_of(p, &[T![KwEndTry]], &[T![KwEndTry]]);
         em.complete(p, NodeKind::ExceptClause);
-        recovered
+        (body_typos, except_typos)
     });
 
-    expect_stmt_list_terminator(p, T![KwEndTry], recovered);
+    expect_stmt_list_terminator(
+        p,
+        T![KwEndTry],
+        body_typos.contains(T![KwEndTry]) || except_typos.contains(T![KwEndTry]),
+    );
 
     p.eat(T![Semicolon]);
 
@@ -439,14 +452,20 @@ fn assignment_or_call(p: &mut Parser) -> bool {
 
 /// Список операторов до одного из `terminators`.
 ///
-/// Возвращает не «было восстановление», а «восстановление съело слово, похожее на
-/// `closer`» — тот закрыватель, о пропаже которого сообщат сразу после списка. Только
-/// такое слово — испорченная попытка закрыть конструкцию, и только после него вторая
-/// жалоба была бы дублем. Список ветки `Если` кончается ещё на `ИначеЕсли` и `Иначе`, но
-/// опечатка в них конструкцию не закрывает и структурную ошибку не отменяет.
-fn stmt_list_of(p: &mut Parser, terminators: &[Sig], closer: Sig) -> bool {
+/// Возвращает не «было восстановление», а множество закрывателей из `closers`,
+/// опечатки которых оно съело: только такое слово — испорченная попытка закрыть
+/// конструкцию, и только после него вторая жалоба о пропаже закрывателя была бы
+/// дублем. Посторонний оператор такой поблажки не даёт: конструкция после него
+/// по-прежнему не закрыта, и сказать об этом больше некому. Список ветки `Если`
+/// кончается ещё на `ИначеЕсли` и `Иначе`, но опечатка в них конструкцию не
+/// закрывает и структурную ошибку не отменяет.
+///
+/// Закрывателей несколько там, где список кончается раньше, чем следующий
+/// успевает стать ожидаемым: тело `Попытки` останавливается на `Исключение`, но
+/// опечатка `КонецПопытки` попадает в него до этого.
+fn stmt_list_of(p: &mut Parser, terminators: &[Sig], closers: &[Sig]) -> TokenSet {
     let m = p.start();
-    let mut recovered_closer_typo = false;
+    let mut recovered_closer_typos = TokenSet::empty();
 
     // The list ends at its own terminator and at every closer further out.
     // Rules inside refuse to consume an enclosing closer, so a list waiting
@@ -460,10 +479,15 @@ fn stmt_list_of(p: &mut Parser, terminators: &[Sig], closer: Sig) -> bool {
 
         let head = p.token_pos();
         if statement(p) {
-            recovered_closer_typo |= p.resembles_closer(head, closer);
+            for closer in closers {
+                if p.resembles_closer(head, *closer) {
+                    recovered_closer_typos =
+                        recovered_closer_typos.union(TokenSet::new(&[*closer]));
+                }
+            }
         }
     }
 
     m.complete(p, NodeKind::StmtList);
-    recovered_closer_typo
+    recovered_closer_typos
 }
