@@ -6106,6 +6106,8 @@ mod tests {
             "and the graph must read behind while that publication stands",
         );
         assert!(graph.owes_recovery(), "the publication it left is owed a probe");
+        // A read still held would keep the rebuild from replacing the file under it.
+        drop(snapshot);
 
         fs::set_permissions(&hidden, open).unwrap();
         lock_recover(&graph.debt).probe_now(Instant::now());
@@ -6140,6 +6142,8 @@ mod tests {
         let snapshot = graph.snapshot().expect("a ready graph publishes a snapshot");
         assert!(snapshot.unread_files() > 0, "the fixture needs a module the build could not read");
         assert!(graph.owes_recovery(), "an unread module owes a probe");
+        // A read still held would keep the rebuild from replacing the file under it.
+        drop(snapshot);
 
         // Restored WITHOUT touching the bytes: mtime and length are what they were, so no
         // fingerprint comparison can see this.
