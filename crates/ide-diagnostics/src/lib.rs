@@ -168,10 +168,7 @@ pub fn apply_extension_merge<'db>(
     // Ordinary module (and any extension file with no resolvable base): byte-identical to the
     // standalone pass, minus any in-code suppression directives.
     if weaving.is_none() && effective.is_none() {
-        supersede_dominated(&mut standalone);
-        suppression::apply(db, file_id, config, &mut standalone);
-        scope_gate::apply(db, file_set, file_id, config, &mut standalone);
-        normalize_diagnostics(&mut standalone);
+        finalize_diagnostics(db, file_id, config, file_set, &mut standalone);
         return standalone;
     }
 
@@ -241,11 +238,52 @@ pub fn apply_extension_merge<'db>(
         standalone.extend(effective::remap_inserted(eff_base_sensitive, &effmod.segments));
     }
 
-    supersede_dominated(&mut standalone);
-    suppression::apply(db, file_id, config, &mut standalone);
-    scope_gate::apply(db, file_set, file_id, config, &mut standalone);
-    normalize_diagnostics(&mut standalone);
+    finalize_diagnostics(db, file_id, config, file_set, &mut standalone);
     standalone
+}
+
+/// The single finalization sequence every surface reaches its answer through: both exits
+/// of [`apply_extension_merge`] call this one body, so a fifth filter cannot be added to
+/// one branch and forgotten in the other.
+///
+/// The four steps and why they stand in this order:
+///
+/// 1. [`supersede_dominated`] — precision, not policy: it decides what the computed set
+///    *is*, dropping an imprecise account (`SelfAssign`) contradicted by the precise one
+///    on the same statement (`GlobalPropertyNotWritable`). The two filters that follow
+///    hide findings the user asked to stop seeing; the pair's choice is already made
+///    before any of them runs, so hiding the winner later cannot swap the pair around —
+///    pinned in `global_property_not_writable::tests` (suppression) and
+///    `scope_gate::tests` (the line gate).
+/// 2. [`scope_gate::apply`] — the source-scope policy: findings on unchanged lines do
+///    not survive. It only removes, so for source diagnostics it commutes with the step
+///    below; its position here is decided by what that step *adds*, not by what it
+///    removes.
+/// 3. [`suppression::apply`] — the inline-directive policy and the suppression module's
+///    own meta-diagnostics. The metas report a broken directive, not a code line, and
+///    are protected from directives and from the baseline; the gate must not cut them
+///    either, so they are born after it (github#61). Running the gate first is what
+///    keeps them out of its reach — swapping these two steps drops a typo'd directive on
+///    an unchanged line again, and `scope_gate::tests` pins that.
+/// 4. [`normalize_diagnostics`] — the deterministic order. Last, so it sees every
+///    producer's output, including the metas added in step 3.
+fn finalize_diagnostics(
+    db: &dyn ide_db::RootDatabase,
+    file_id: vfs::FileId,
+    config: &DiagnosticsConfig,
+    file_set: Option<&vfs::file_set::FileSet>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Callers file-gate before computing anything, but the metas of step 3 are born after
+    // the line gate, so the finalization re-checks it itself rather than trust every caller.
+    if !scope_gate::file_in_scope(db, file_set, file_id, config) {
+        diagnostics.clear();
+        return;
+    }
+    supersede_dominated(diagnostics);
+    scope_gate::apply(db, file_set, file_id, config, diagnostics);
+    suppression::apply(db, file_id, config, diagnostics);
+    normalize_diagnostics(diagnostics);
 }
 
 /// The layer a paired base module can overturn, and therefore the layer every
