@@ -112,7 +112,306 @@ pub(crate) fn indexed_document_for_chunk(
         content_hash: blake3::hash(chunk.text.as_bytes()).to_hex().to_string(),
         text: chunk.text.clone(),
         graph_context,
+        source_span: None,
+    };
+    (document, context_failed)
+}
+
+/// Prepare token-bounded parts from original AST source spans before legacy chunk splitting.
+/// `check_singleton` must use the embedder's real serializer and byte ceiling.
+pub fn prepare_file_documents(
+    key: &FileKey,
+    source: &str,
+    provider: Option<&dyn GraphContextProvider>,
+    policy: &TokenPolicy,
+    document_prefix: &str,
+    check_singleton: impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<Vec<IndexedDocument>, SearchError> {
+    prepare_file_documents_owing(key, source, provider, policy, document_prefix, check_singleton)
+        .map(|(documents, _)| documents)
+}
+
+/// Like [`prepare_file_documents`], and also says whether the provider failed to render some
+/// chunk's context: the caller then owes that file a re-render, as with
+/// [`indexed_document_for_chunk`].
+pub(crate) fn prepare_file_documents_owing(
+    key: &FileKey,
+    source: &str,
+    provider: Option<&dyn GraphContextProvider>,
+    policy: &TokenPolicy,
+    document_prefix: &str,
+    mut check_singleton: impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<(Vec<IndexedDocument>, bool), SearchError> {
+    let mut context_failed = false;
+    let documents = prepare_file_documents_with_context(
+        key,
+        source,
+        |chunk| {
+            Ok(match (chunk.kind, provider) {
+                (ChunkKind::Procedure | ChunkKind::Function, Some(provider)) => {
+                    match provider.try_graph_context(&key.path, &chunk.name, chunk.kind.label()) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            tracing::debug!(
+                                root = %key.root_id,
+                                path = %key.path,
+                                method = %chunk.name,
+                                "graph context render failed; the file owes a re-render: {error}"
+                            );
+                            context_failed = true;
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            })
+        },
+        policy,
+        document_prefix,
+        &mut check_singleton,
+    )?;
+    Ok((documents, context_failed))
+}
+
+pub(crate) fn prepare_file_documents_with_context(
+    key: &FileKey,
+    source: &str,
+    mut render_context: impl FnMut(&Chunk) -> Result<Option<String>, SearchError>,
+    policy: &TokenPolicy,
+    document_prefix: &str,
+    check_singleton: &mut impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<Vec<IndexedDocument>, SearchError> {
+    let mut documents = Vec::new();
+    for parent in Chunker::source_chunks(source) {
+        let chunk = parent.chunk;
+        let kind = chunk.kind.label();
+        let context = render_context(&chunk)?;
+        let full_input = final_document_input(
+            key,
+            &chunk,
+            context.as_deref().unwrap_or(""),
+            &chunk.text,
+            document_prefix,
+        );
+        let ranges = if chunk.text.len() > crate::token_policy::MAX_SOURCE_WINDOW_BYTES {
+            Some(policy.split_source(&chunk.text, |part_index, slice| {
+                check_source_part(
+                    key,
+                    &chunk,
+                    kind,
+                    context.as_deref().unwrap_or(""),
+                    document_prefix,
+                    part_index,
+                    slice,
+                    policy,
+                    check_singleton,
+                )
+            })?)
+        } else {
+            match check_prepared_input(policy, &full_input, check_singleton) {
+                Ok(()) => None,
+                Err(error) if is_input_too_large(&error) => {
+                    Some(policy.split_source(&chunk.text, |part_index, slice| {
+                        check_source_part(
+                            key,
+                            &chunk,
+                            kind,
+                            context.as_deref().unwrap_or(""),
+                            document_prefix,
+                            part_index,
+                            slice,
+                            policy,
+                            check_singleton,
+                        )
+                    })?)
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        match ranges {
+            None => documents.push(prepared_document(
+                key,
+                &chunk,
+                context.clone(),
+                SourceSpan {
+                    parent_symbol: chunk.name.clone(),
+                    parent_byte_start: parent.source_byte_start,
+                    parent_byte_end: parent.source_byte_end,
+                    byte_start: parent.source_byte_start,
+                    byte_end: parent.source_byte_end,
+                    part_index: 1,
+                    part_count: 1,
+                },
+                chunk.text.clone(),
+            )),
+            Some(ranges) => {
+                let count = ranges.len() as u32;
+                for (index, range) in ranges.into_iter().enumerate() {
+                    let chunk_text = chunk.text[range.clone()].to_owned();
+                    let absolute_start = parent.source_byte_start + range.start as u32;
+                    let absolute_end = parent.source_byte_start + range.end as u32;
+                    let mut part = chunk.clone();
+                    part.name = if chunk.name.is_empty() {
+                        format!("Header (часть {})", index + 1)
+                    } else {
+                        format!("{} (часть {})", chunk.name, index + 1)
+                    };
+                    part.line_start +=
+                        chunk.text[..range.start].bytes().filter(|byte| *byte == b'\n').count()
+                            as u32;
+                    part.line_end = part.line_start
+                        + chunk_text.bytes().filter(|byte| *byte == b'\n').count() as u32
+                        + u32::from(!chunk_text.ends_with('\n'));
+                    documents.push(prepared_document(
+                        key,
+                        &part,
+                        context.clone(),
+                        SourceSpan {
+                            parent_symbol: chunk.name.clone(),
+                            parent_byte_start: parent.source_byte_start,
+                            parent_byte_end: parent.source_byte_end,
+                            byte_start: absolute_start,
+                            byte_end: absolute_end,
+                            part_index: index as u32 + 1,
+                            part_count: count,
+                        },
+                        chunk_text,
+                    ));
+                }
+            }
+        }
     }
+    Ok(documents)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_source_part(
+    key: &FileKey,
+    parent: &Chunk,
+    kind: &str,
+    graph_context: &str,
+    document_prefix: &str,
+    part_index: u32,
+    slice: &str,
+    policy: &TokenPolicy,
+    check_singleton: &mut impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
+    let name = if parent.name.is_empty() {
+        format!("Header (часть {part_index})")
+    } else {
+        format!("{} (часть {part_index})", parent.name)
+    };
+    let input = semantic_text_from_parts(&key.path, kind, &name, graph_context, slice);
+    check_prepared_input(policy, &format!("{document_prefix}{input}"), check_singleton)
+}
+
+/// The documents of a file, split by the embedder's token policy when it has one, and whether
+/// the provider failed to render some chunk's context (the file then owes a re-render).
+pub(crate) fn prepare_indexed_documents(
+    key: &FileKey,
+    source: &str,
+    provider: Option<&dyn GraphContextProvider>,
+    embedder: Option<&crate::Embedder>,
+) -> Result<(Vec<IndexedDocument>, bool), SearchError> {
+    if let Some(embedder) = embedder {
+        if let Some(policy) = embedder.token_policy() {
+            return prepare_file_documents_owing(
+                key,
+                source,
+                provider,
+                policy,
+                embedder.document_prefix(),
+                |input| embedder.check_singleton_input(input),
+            );
+        }
+    }
+    let mut context_failed = false;
+    let documents = Chunker::chunk(source)
+        .iter()
+        .map(|chunk| {
+            let (document, failed) = indexed_document_for_chunk(key, chunk, provider);
+            context_failed |= failed;
+            document
+        })
+        .collect();
+    Ok((documents, context_failed))
+}
+
+pub(crate) fn chunks_contexts_and_spans(
+    documents: &[IndexedDocument],
+) -> (Vec<Chunk>, Vec<Option<String>>, Vec<Option<SourceSpan>>) {
+    let mut chunks = Vec::with_capacity(documents.len());
+    let mut contexts = Vec::with_capacity(documents.len());
+    let mut spans = Vec::with_capacity(documents.len());
+    for document in documents {
+        let kind = match document.kind.as_str() {
+            "procedure" => ChunkKind::Procedure,
+            "function" => ChunkKind::Function,
+            _ => ChunkKind::ModuleHeader,
+        };
+        chunks.push(Chunk {
+            kind,
+            name: document.symbol_name.clone(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: document.line_start,
+            line_end: document.line_end,
+            text: document.text.clone(),
+        });
+        contexts.push(document.graph_context.clone());
+        spans.push(document.source_span.clone());
+    }
+    (chunks, contexts, spans)
+}
+
+fn check_prepared_input(
+    policy: &TokenPolicy,
+    input: &str,
+    check_singleton: &mut impl FnMut(&str) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
+    policy.check(input)?;
+    check_singleton(input)
+}
+
+fn final_document_input(
+    key: &FileKey,
+    chunk: &Chunk,
+    graph_context: &str,
+    text: &str,
+    document_prefix: &str,
+) -> String {
+    format!(
+        "{document_prefix}{}",
+        semantic_text_from_parts(&key.path, chunk.kind.label(), &chunk.name, graph_context, text)
+    )
+}
+
+fn prepared_document(
+    key: &FileKey,
+    chunk: &Chunk,
+    graph_context: Option<String>,
+    source_span: SourceSpan,
+    text: String,
+) -> IndexedDocument {
+    IndexedDocument {
+        collection: "code".to_owned(),
+        root_id: key.root_id.clone(),
+        path: key.path.clone(),
+        symbol_name: chunk.name.clone(),
+        kind: chunk.kind.label().to_owned(),
+        line_start: chunk.line_start,
+        line_end: chunk.line_end,
+        content_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+        text,
+        graph_context,
+        source_span: Some(source_span),
+    }
+}
+
+fn is_input_too_large(error: &SearchError) -> bool {
+    error
+        .embedding_failure()
+        .is_some_and(|failure| failure.code == EmbeddingFailureCode::EmbeddingInputTooLarge)
 }
 
 #[cfg(test)]
