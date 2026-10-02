@@ -274,6 +274,12 @@ fn finalize_diagnostics(
     file_set: Option<&vfs::file_set::FileSet>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Callers file-gate before computing anything, but the metas of step 3 are born after
+    // the line gate, so the finalization re-checks it itself rather than trust every caller.
+    if !scope_gate::file_in_scope(db, file_set, file_id, config) {
+        diagnostics.clear();
+        return;
+    }
     supersede_dominated(diagnostics);
     scope_gate::apply(db, file_set, file_id, config, diagnostics);
     suppression::apply(db, file_id, config, diagnostics);

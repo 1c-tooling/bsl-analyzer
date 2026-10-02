@@ -187,6 +187,32 @@ mod tests {
         );
     }
 
+    /// The finalization honours the file-gate on its own, not only through its callers:
+    /// suppression metas are born after the line gate, so for a file outside the scope
+    /// they would otherwise be the only survivors of a merge exit called directly.
+    #[test]
+    fn merge_exit_yields_nothing_for_an_out_of_scope_file_with_a_broken_directive() {
+        let code = "Процедура Тест()\n    // bsl-analyzer:disable-next-line NoSuchRule\n    А = А;\nКонецПроцедуры\n";
+        let (db, file_id) = create_test_db(code);
+
+        // Control: in scope, the merge exit names the broken directive.
+        let in_scope = config_with_scope(scope_for(None));
+        let named = crate::apply_extension_merge(&db, file_id, &in_scope, None, None, Vec::new());
+        assert!(
+            named.iter().any(|d| d.code == DiagnosticCode::UnknownSuppressionCode),
+            "the fixture must produce the meta: {named:#?}"
+        );
+
+        let out_of_scope = config_with_scope(Arc::new(AnalysisScope::from_report(
+            "vendor",
+            Path::new("/"),
+            [("other.bsl".to_string(), None)],
+        )));
+        let none =
+            crate::apply_extension_merge(&db, file_id, &out_of_scope, None, None, Vec::new());
+        assert!(none.is_empty(), "out-of-scope file must yield nothing: {none:#?}");
+    }
+
     /// Область анализа не воскрешает и проигравшего пары `SelfAssign` /
     /// `GlobalPropertyNotWritable`: пара решается на полном наборе, до строчной
     /// политики (github#61). Оператор многострочный, имя-победитель стоит на
