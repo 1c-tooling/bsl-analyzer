@@ -5138,7 +5138,14 @@ mod tests {
         wait_until_graph_ready(state.graph());
         assert!(eventually(&|| state.graph().status_report().drift_watch == Some("watching")));
         let hub = state.change_hub().expect("a workspace boot owns a hub").clone();
-        let revision = state.graph().status_report().revision;
+        // The report leaves the revision out while a background read holds the graph's lock
+        // or every handle, so the sample is waited for rather than taken once.
+        let sampled = std::cell::Cell::new(None);
+        assert!(eventually(&|| {
+            sampled.set(state.graph().status_report().revision);
+            sampled.get().is_some()
+        }));
+        let revision = sampled.get();
         let cursors = hub.active_cursor_count();
 
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
