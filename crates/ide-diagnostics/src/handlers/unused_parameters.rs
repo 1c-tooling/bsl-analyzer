@@ -4,6 +4,7 @@ use crate::utils::platform_event_handlers::{
     is_platform_event_handler, is_report_object_module_event_handler, ModuleOwner,
 };
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+use bsl_metadata::traits::MdObject;
 use hir::{Expr, ModItem};
 use ide_db::TextRange;
 use rustc_hash::FxHashSet;
@@ -66,6 +67,17 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         }
     }
 
+    for subscription in ctx.visible_event_subscriptions() {
+        if let Some(handler) = subscription.parse_handler() {
+            if metadata.common_module.as_ref().is_some_and(|module| {
+                handler.module_name.fold_lower() == module.name().fold_lower()
+            }) && !handler.method_name.is_empty()
+            {
+                fixed_signature_handlers.insert(handler.method_name.fold_lower());
+            }
+        }
+    }
+
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
     for reg in &summary.notify_regs {
@@ -94,6 +106,13 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     }
 
     for (local_id, _) in module_bodies.iter_bodies() {
+        if item_tree.method(local_id).is_some_and(|method| {
+            method.annotations().iter().any(|annotation| annotation.kind.is_interception())
+        }) {
+            if let Some(name) = get_method_name(&item_tree, local_id) {
+                fixed_signature_handlers.insert(name.fold_lower());
+            }
+        }
         if let Some(name) = get_method_name(&item_tree, local_id) {
             let lower = name.fold_lower();
             if attachable_prefixes.iter().any(|prefix| lower.starts_with(prefix)) {
@@ -718,6 +737,80 @@ EndProcedure
               message: Уберите неиспользуемый параметр "Параметр2"
               severity: Warning"#]],
         );
+    }
+
+    #[test]
+    fn extension_interception_keeps_the_platform_signature() {
+        let code = r#"&После("ОбработкаЗаполнения")
+Процедура ПослеЗаполнения(ДанныеЗаполнения, СтандартнаяОбработка)
+    Вызов(ДанныеЗаполнения);
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedParameters, expect![[r#""#]]);
+    }
+
+    #[test]
+    fn change_and_validate_interception_keeps_the_original_signature() {
+        let code = r#"&ИзменениеИКонтроль("ЗаполнитьТовары")
+Процедура Расш1_ЗаполнитьТовары(Параметр, Отказ)
+    Вызов(Параметр);
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedParameters, expect![[r#""#]]);
+    }
+
+    #[test]
+    fn event_subscription_handler_keeps_its_declared_signature() {
+        assert_event_subscription_handler_keeps_its_signature("CommonModule.Сервер.Обработчик");
+    }
+
+    #[test]
+    fn event_subscription_handler_module_name_ignores_cyrillic_case() {
+        assert_event_subscription_handler_keeps_its_signature("CommonModule.сервер.Обработчик");
+    }
+
+    fn assert_event_subscription_handler_keeps_its_signature(handler: &str) {
+        use crate::test_utils::check_cfe_at_with_unreadable;
+        use test_fixture::CfeFixtureBuilder;
+
+        let mut builder = CfeFixtureBuilder::new("");
+        builder
+            .add_extension("Расширение", "")
+            .add_extension_module(
+                "Расширение",
+                "Сервер",
+                "Процедура Обработчик(Источник, Отказ, Замещение) Экспорт\n    Если Отказ Тогда\n        Возврат;\n    КонецЕсли;\nКонецПроцедуры",
+            );
+        let fixture = builder.build();
+        let subscriptions = fixture.extensions()[0].root().join("EventSubscriptions");
+        std::fs::create_dir_all(&subscriptions).expect("create EventSubscriptions directory");
+        std::fs::write(
+            subscriptions.join("Подписка.xml"),
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<EventSubscription uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"><Properties>
+<Name>Подписка</Name><Source>Document.Документ1</Source><Event>BeforeWrite</Event>
+<Handler>{handler}</Handler>
+</Properties></EventSubscription></MetaDataObject>"#
+            ),
+        )
+        .expect("write event subscription fixture");
+
+        let code = "Процедура Обработчик(Источник, Отказ, Замещение) Экспорт\n    Если Отказ Тогда\n        Возврат;\n    КонецЕсли;\nКонецПроцедуры";
+        let diagnostics = check_cfe_at_with_unreadable(
+            "CommonModules/Сервер/Ext/Module.bsl",
+            code,
+            fixture,
+            &[],
+            super::check,
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert!(unused.is_empty(), "event subscription signature is fixed by metadata: {unused:?}");
     }
 
     #[test]

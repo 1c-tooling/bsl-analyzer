@@ -1121,12 +1121,13 @@ pub fn check_cfe_at_with_unreadable(
     unreadable: &[&str],
     run: impl FnOnce(&crate::DiagnosticsContext<'_>) -> Vec<Diagnostic>,
 ) -> Vec<Diagnostic> {
-    check_cfe_at_with_unreadable_config(
+    check_cfe_at_with_unreadable_config_and_setup(
         caller_relative,
         source,
         fixture,
         unreadable,
         crate::DiagnosticsConfig::all_enabled(),
+        |_| {},
         run,
     )
 }
@@ -1139,12 +1140,33 @@ fn check_cfe_at_with_unreadable_config(
     config: crate::DiagnosticsConfig,
     run: impl FnOnce(&crate::DiagnosticsContext<'_>) -> Vec<Diagnostic>,
 ) -> Vec<Diagnostic> {
+    check_cfe_at_with_unreadable_config_and_setup(
+        caller_relative,
+        source,
+        fixture,
+        unreadable,
+        config,
+        |_| {},
+        run,
+    )
+}
+
+pub(crate) fn check_cfe_at_with_unreadable_config_and_setup(
+    caller_relative: &str,
+    source: &str,
+    fixture: test_fixture::CfeFixture,
+    unreadable: &[&str],
+    config: crate::DiagnosticsConfig,
+    setup: impl FnOnce(&test_fixture::CfeFixture),
+    run: impl FnOnce(&crate::DiagnosticsContext<'_>) -> Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
     use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
     use ide_db::metadata::intern_configuration_path;
     use ide_db::RootDatabaseImpl;
     use vfs::{FileId, FileSet, VfsPath};
 
     materialize_cfe_loader_compat(&fixture);
+    setup(&fixture);
 
     let mut db = RootDatabaseImpl::new();
     db.set_all_config_paths(fixture.config_paths());

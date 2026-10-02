@@ -391,7 +391,8 @@ JSON-экранирование, модель, dimensions и provider routing. �
 
 ## Совместимость indexing
 
-Текущий machine contract — `3.1`: успешные ответы поиска и graph lifecycle/loading
+Текущий machine contract — `3.2`: live metadata object использует schema `2` с полнотой и усечением;
+успешные ответы поиска и graph lifecycle/loading
 несут структурированный `indexing`, ответы поиска — необязательный `semantic_failure`.
 Search hits/not-ready имеют schema `7` для `search_code` и `6` для docs-действий,
 search status — `3`, graph descriptor — `35`; list_platform остаётся `1`.

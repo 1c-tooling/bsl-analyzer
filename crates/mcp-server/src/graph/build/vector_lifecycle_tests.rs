@@ -197,7 +197,10 @@ fn vector_lifecycle_read_error_preserves_rows_and_vectors() {
     let (mut engine, rows) = seed(dir.path());
     let before = engine.store().load_all_embeddings(2).unwrap();
     let generation = engine.store().embedding_generation().unwrap();
-    std::fs::remove_file(dir.path().join("Module.bsl")).unwrap();
+    let module = dir.path().join("Module.bsl");
+    std::fs::remove_file(&module).unwrap();
+    std::fs::create_dir(&module).unwrap();
+    assert!(std::fs::read(&module).is_err(), "the path resolves but is not a readable file");
     let records = capture(|| emit(&mut engine, dir.path(), &rows));
     let decision = records.iter().find(|r| r["kind"] == "decision").unwrap();
     assert_eq!(decision["reason"], "read_error");

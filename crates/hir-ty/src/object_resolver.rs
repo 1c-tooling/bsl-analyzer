@@ -250,7 +250,8 @@ impl ObjectResolver for ConfigsObjectResolver<'_> {
         for cfg in self.0 {
             if let Some(found) = cfg.configuration.find_metadata_object(mdo_type, name) {
                 match &mut merged {
-                    Some(base) => base.apply_extension_overlay(found),
+                    Some(base) if found.adopts(base) => base.apply_extension_overlay(found),
+                    Some(base) => *base = found.clone(),
                     None => merged = Some(found.clone()),
                 }
             }

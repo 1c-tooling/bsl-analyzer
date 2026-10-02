@@ -307,6 +307,12 @@ pub enum AnnotationKind {
 }
 
 impl AnnotationKind {
+    /// Extension method interception (`&Перед`, `&После`, `&Вместо`,
+    /// `&ИзменениеИКонтроль`): the method's signature is fixed by the intercepted one.
+    pub fn is_interception(self) -> bool {
+        matches!(self, Self::Before | Self::After | Self::Instead | Self::ChangeAndValidate)
+    }
+
     /// The canonical wire spelling of a compilation directive.
     ///
     /// Each directive has a localized and an English form (`&НаКлиенте` / `&AtClient`), so

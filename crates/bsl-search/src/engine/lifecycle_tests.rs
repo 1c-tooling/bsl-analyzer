@@ -43,6 +43,35 @@ fn capture_level(level: tracing::level_filters::LevelFilter, f: impl FnOnce()) -
     Arc::try_unwrap(records).unwrap().into_inner().unwrap()
 }
 
+/// Read one complete JSON HTTP request using its declared Content-Length. Returning
+/// the body before all its bytes have been consumed can make a server-side close reset
+/// the connection on Windows, hiding the intended HTTP status from the client.
+fn read_request_body(stream: &mut std::net::TcpStream) -> Value {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 2048];
+    loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0, "client closed before sending the complete HTTP request");
+        bytes.extend_from_slice(&buffer[..read]);
+
+        let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+        let headers = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .expect("HTTP request has Content-Length")
+            .trim()
+            .parse::<usize>()
+            .expect("Content-Length is an integer");
+        let body_start = split + 4;
+        if bytes.len() >= body_start + length {
+            return serde_json::from_slice(&bytes[body_start..body_start + length])
+                .expect("request body is JSON");
+        }
+    }
+}
+
 /// Finite local fake: returns exactly the requests the test expects, with no model/provider.
 fn server(
     requests: usize,
@@ -54,26 +83,7 @@ fn server(
         let mut submitted = Vec::new();
         for stream in listener.incoming().take(requests) {
             let mut stream = stream.unwrap();
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 2048];
-            let body = loop {
-                let read = stream.read(&mut buffer).unwrap();
-                assert_ne!(read, 0);
-                bytes.extend_from_slice(&buffer[..read]);
-                let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
-                let headers = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
-                let length = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .unwrap()
-                    .trim()
-                    .parse::<usize>()
-                    .unwrap();
-                if bytes.len() >= split + 4 + length {
-                    break serde_json::from_slice::<Value>(&bytes[split + 4..]).unwrap();
-                }
-            };
+            let body = read_request_body(&mut stream);
             observe();
             let inputs = body["input"].as_array().unwrap();
             submitted.extend(inputs.iter().map(|text| text.as_str().unwrap().to_owned()));
@@ -964,9 +974,8 @@ fn vector_lifecycle_full_index_that_skipped_a_rejected_file_is_failed() {
     let address = listener.local_addr().unwrap();
     let refusals = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
-        let mut buffer = [0; 4096];
-        let _ = stream.read(&mut buffer);
+        let request = read_request_body(&mut stream);
+        assert!(request["input"].as_array().is_some_and(|input| !input.is_empty()));
         let body = r#"{"error":"rejected"}"#;
         write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     });

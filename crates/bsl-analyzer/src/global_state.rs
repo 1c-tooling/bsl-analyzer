@@ -1718,10 +1718,18 @@ mod vfs_race_tests {
         );
         assert_eq!(per_kind.event(), "BeforeWrite");
         assert!(
-            db.resolve_event_subscription_for_file(file_id, "ТолькоРасширение").is_none(),
-            "extension-only event subscriptions stay invisible until merged whole-config supports them"
+            db.resolve_event_subscription_for_file(file_id, "ТолькоРасширение").is_some(),
+            "an extension file sees subscriptions declared by its own extension"
         );
-        assert_eq!(db.event_subscription_names(file_id), vec!["ПередЗаписью".to_string()]);
+        assert_eq!(
+            db.main_event_subscription_names_for_file(file_id),
+            vec!["ПередЗаписью".to_string()],
+            "the separate main-only accessor must keep its old scope"
+        );
+        assert_eq!(
+            db.event_subscription_names(file_id),
+            vec!["ПередЗаписью".to_string(), "ТолькоРасширение".to_string()]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

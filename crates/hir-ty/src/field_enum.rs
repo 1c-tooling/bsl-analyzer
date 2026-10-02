@@ -553,7 +553,10 @@ fn enumerate_filter_fields(
         return Vec::new();
     };
 
-    let standard_keys = standard_filter_keys(parent, register.periodicity());
+    let mut standard_keys = standard_filter_keys(parent, register.periodicity()).to_vec();
+    if register.is_recorder_subordinate() && !standard_keys.contains(&"Регистратор") {
+        standard_keys.push("Регистратор");
+    }
     let mut out = Vec::with_capacity(register.dimensions().len() + standard_keys.len());
     let mut seen: std::collections::HashSet<Name> =
         std::collections::HashSet::with_capacity(out.capacity() * 2);
@@ -1616,6 +1619,32 @@ mod tests {
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
 
         assert_eq!(names, vec!["Регистратор", "Активность", "Период"]);
+    }
+
+    #[test]
+    fn enumerate_filter_fields_adds_recorder_only_for_recorder_subordinate_info_register() {
+        for (name, recorder_subordinate, expected) in
+            [("Подчиненный", true, true), ("Независимый", false, false)]
+        {
+            let register = bsl_metadata::Register::builder()
+                .name(name)
+                .mdo_type(MdoType::InformationRegister)
+                .recorder_subordinate(recorder_subordinate)
+                .build();
+            let mut config = Configuration::new("Test");
+            config.add_register(register);
+            let configs = wrap(config);
+            let receiver = metadata_ref(
+                MetadataKind::RegisterFilter { parent: MdoType::InformationRegister },
+                name,
+            );
+            let fields = enumerate_fields(&configs, &receiver);
+            assert_eq!(
+                fields.iter().any(|field| field.name.as_str() == "Регистратор"),
+                expected,
+                "register filter recorder availability for {name}",
+            );
+        }
     }
 
     #[test]

@@ -1004,6 +1004,16 @@ impl RootDatabaseImpl {
         }
     }
 
+    /// Event subscriptions do not overlay another object's metadata: declarations
+    /// in the base and every visible extension remain independently active. Keep
+    /// the base first so a duplicate name retains the established base-first lookup.
+    fn visible_event_subscription_listings(
+        main_listing: Option<metadata::MetadataListingInput>,
+        chain_listings: &[Option<metadata::MetadataListingInput>],
+    ) -> Vec<metadata::MetadataListingInput> {
+        main_listing.into_iter().chain(chain_listings.iter().flatten().copied()).collect()
+    }
+
     /// Names collected from several listings, deduplicated the way
     /// [`Self::subsystem_names_for_file`] does it: one chain can declare the same
     /// object in a dependency and in the extension that borrows it, and a list shown
@@ -1050,15 +1060,18 @@ impl RootDatabaseImpl {
         };
         // Forward overlay composition: the base result first, then each chain
         // root's overlay in dependency order, the file's own extension last.
-        let mut hits = std::iter::once(resolve_in(main_listing))
+        let hits = std::iter::once(resolve_in(main_listing))
             .chain(chain_listings.into_iter().map(resolve_in))
             .flatten();
-        let first = hits.next()?;
         let mut merged: Option<bsl_metadata::MetadataObject> = None;
         for overlay in hits {
-            merged.get_or_insert_with(|| (*first).clone()).apply_extension_overlay(&overlay);
+            match &mut merged {
+                Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
+                Some(base) => *base = (*overlay).clone(),
+                None => merged = Some((*overlay).clone()),
+            }
         }
-        Some(merged.map(Arc::new).unwrap_or(first))
+        merged.map(Arc::new)
     }
 
     /// The register counterpart of [`resolve_metadata_object_for_file`]: resolve a
@@ -1196,11 +1209,18 @@ impl RootDatabaseImpl {
             let resolve_in = |listing: Option<metadata::MetadataListingInput>| {
                 listing.and_then(|l| metadata::resolve_common_module(self, l, name.to_string()))
             };
-            return chain_listings
-                .into_iter()
-                .rev()
-                .find_map(resolve_in)
-                .or_else(|| resolve_in(main_listing));
+            let mut merged: Option<bsl_metadata::CommonModule> = None;
+            for overlay in std::iter::once(resolve_in(main_listing))
+                .chain(chain_listings.into_iter().map(resolve_in))
+                .flatten()
+            {
+                match &mut merged {
+                    Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
+                    Some(base) => *base = (*overlay).clone(),
+                    None => merged = Some((*overlay).clone()),
+                }
+            }
+            return merged.map(Arc::new);
         }
 
         let find_in = |root: &std::path::Path| -> Option<Arc<bsl_metadata::CommonModule>> {
@@ -1218,12 +1238,17 @@ impl RootDatabaseImpl {
             return find_in(&config_root);
         };
 
-        roots
-            .chain
-            .iter()
-            .rev()
-            .find_map(|(_, p)| find_in(p))
-            .or_else(|| roots.main.as_ref().and_then(|p| find_in(p)))
+        let mut merged: Option<bsl_metadata::CommonModule> = None;
+        for path in roots.main.iter().chain(roots.chain.iter().map(|(_, path)| path)) {
+            if let Some(found) = find_in(path) {
+                match &mut merged {
+                    Some(base) if found.adopts(base) => base.apply_extension_overlay(&found),
+                    Some(base) => *base = (*found).clone(),
+                    None => merged = Some((*found).clone()),
+                }
+            }
+        }
+        merged.map(Arc::new)
     }
 
     pub fn resolve_http_service_for_file(
@@ -1371,17 +1396,18 @@ impl RootDatabaseImpl {
             self.metadata_listings_for_file(file_id)?;
 
         if !bootstrapped {
-            use hir::ConfigsDatabase;
             return self
-                .merged_visible_configuration(file_id)?
-                .find_event_subscription(name)
-                .cloned()
+                .get_all_configurations(file_id)
+                .into_iter()
+                .find_map(|(_, config)| config.find_event_subscription(name).cloned())
                 .map(Arc::new);
         }
 
-        Self::substrate_listings(main_listing, &chain_listings).into_iter().find_map(|listing| {
-            metadata::resolve_event_subscription(self, listing, name.to_string())
-        })
+        Self::visible_event_subscription_listings(main_listing, &chain_listings)
+            .into_iter()
+            .find_map(|listing| {
+                metadata::resolve_event_subscription(self, listing, name.to_string())
+            })
     }
 
     pub fn event_subscription_names_for_file(&self, file_id: FileId) -> Vec<String> {
@@ -1392,30 +1418,57 @@ impl RootDatabaseImpl {
         };
 
         if !bootstrapped {
-            use hir::ConfigsDatabase;
-            return self
-                .merged_visible_configuration(file_id)
-                .map(|config| {
+            return Self::dedup_names(self.get_all_configurations(file_id).into_iter().flat_map(
+                |(_, config)| {
                     config
                         .event_subscriptions()
                         .iter()
                         .map(|subscription| subscription.name().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .collect::<Vec<_>>()
+                },
+            ));
         }
 
         Self::dedup_names(
-            Self::substrate_listings(main_listing, &chain_listings).into_iter().flat_map(
-                |listing| {
+            Self::visible_event_subscription_listings(main_listing, &chain_listings)
+                .into_iter()
+                .flat_map(|listing| {
                     listing
                         .event_subscriptions(self)
                         .iter()
                         .map(|entry| entry.name.clone())
                         .collect::<Vec<_>>()
-                },
-            ),
+                }),
         )
+    }
+
+    /// EventSubscription names declared by the main configuration only. Kept
+    /// separate from the visible enumeration because older diagnostics explicitly
+    /// inspect main-owned declarations while UnusedParameters needs the full chain.
+    pub fn main_event_subscription_names_for_file(&self, file_id: FileId) -> Vec<String> {
+        let Some((main_listing, _, bootstrapped)) = self.metadata_listings_for_file(file_id) else {
+            return Vec::new();
+        };
+
+        if bootstrapped {
+            return main_listing
+                .map(|listing| {
+                    listing
+                        .event_subscriptions(self)
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+
+        self.get_all_configurations(file_id)
+            .into_iter()
+            .find(|(name, _)| name.is_none())
+            .map(|(_, config)| {
+                config.event_subscriptions().iter().map(|entry| entry.name().to_string()).collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn enumerate_event_subscriptions_for_file(
@@ -1889,7 +1942,8 @@ impl RootDatabaseImpl {
             {
                 match &mut acc {
                     None => acc = Some((*found).clone()),
-                    Some(base) => base.apply_extension_overlay(&found),
+                    Some(base) if found.adopts(base) => base.apply_extension_overlay(&found),
+                    Some(base) => *base = (*found).clone(),
                 }
             }
         }
@@ -3292,6 +3346,10 @@ impl RootDatabase for RootDatabaseImpl {
         module_file_id: FileId,
     ) -> Option<Arc<bsl_metadata::CommonModule>> {
         RootDatabaseImpl::common_module_for_file_id(self, module_file_id)
+    }
+
+    fn main_event_subscription_names_for_file(&self, file_id: FileId) -> Vec<String> {
+        RootDatabaseImpl::main_event_subscription_names_for_file(self, file_id)
     }
 
     fn http_service_for_file_id(

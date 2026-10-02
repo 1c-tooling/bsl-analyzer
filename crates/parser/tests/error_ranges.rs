@@ -246,3 +246,34 @@ fn an_error_points_where_the_norm_says() {
         breaches.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
     );
 }
+
+#[test]
+fn constructor_member_access_and_closer_typos_point_at_the_offending_token() {
+    let constructor_access =
+        "Функция Тест()\n    Возврат Новый Файл(\"a\").ПолноеИмя;\nКонецФункции";
+    let parse = parser::parse(constructor_access);
+    let dot = constructor_access.find(".ПолноеИмя").unwrap();
+    let error = parse.errors().first().expect("constructor member access is invalid");
+    assert_eq!(parse.errors().len(), 1, "unexpected recovery cascade: {:?}", parse.errors());
+    assert_eq!(usize::from(error.range().start()), dot);
+    assert_eq!(usize::from(error.range().end()), dot + 1);
+
+    let method_access = "Процедура Тест()\n    Если Новый Файл(\"a\").Существует() Тогда\n    КонецЕсли;\nКонецПроцедуры";
+    let parse = parser::parse(method_access);
+    let dot = method_access.find(".Существует").unwrap();
+    let error = parse.errors().first().expect("constructor method access is invalid");
+    assert_eq!(parse.errors().len(), 1, "unexpected recovery cascade: {:?}", parse.errors());
+    assert_eq!(usize::from(error.range().start()), dot);
+    assert_eq!(usize::from(error.range().end()), dot + 1);
+
+    let typo = "Процедура Тест()\n    Если Истина Тогда\n    КонецЕслли;\nКонецПроцедуры";
+    let parse = parser::parse(typo);
+    let typo_start = typo.find("КонецЕслли").unwrap();
+    let error = parse.errors().first().expect("misspelled block closer is invalid");
+    assert_eq!(parse.errors().len(), 1, "typo must not trigger a missing-closer cascade");
+    assert_eq!(
+        &typo[usize::from(error.range().start())..usize::from(error.range().end())],
+        "КонецЕслли"
+    );
+    assert_eq!(usize::from(error.range().start()), typo_start);
+}
