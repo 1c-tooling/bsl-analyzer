@@ -12,6 +12,7 @@ use vfs::{FileId, Vfs};
 
 use crate::call_hierarchy_index_state::CallHierarchyIndexState;
 use crate::global_state::{CallHierarchyWaitPolicy, Task};
+use crate::lsp::to_proto::ClientTags;
 use crate::lsp::PositionEncoding;
 use crate::mem_docs::FrozenMemDocs;
 
@@ -88,6 +89,10 @@ pub struct LatencyRequestContext {
     /// standard behind a rule may be attached as a property rather than only as the
     /// message suffix every client can render.
     pub supports_code_description: bool,
+    /// Tags the client is willing to receive in `Diagnostic.tags`
+    /// (`publishDiagnostics.tagSupport`), negotiated at `initialize`; `None`-like
+    /// `ClientTags::NONE` means the property is not published at all.
+    pub supports_diagnostic_tags: ClientTags,
     /// Whether the client advertised support for `InsertTextMode::ADJUST_INDENTATION`,
     /// so the completion handler may ask it to indent snippet continuation lines
     /// to the cursor column.

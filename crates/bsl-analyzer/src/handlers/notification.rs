@@ -84,6 +84,7 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     let code_descriptions = crate::lsp::to_proto::CodeDescriptions::from_client_support(
         state.supports_code_description,
     );
+    let client_tags = state.supports_diagnostic_tags;
     let uri = uri.clone();
     let queued_at = Instant::now();
     tracing::info!(%uri, generation, vfs_done = state.vfs_done, "diagnostics scheduled");
@@ -117,6 +118,7 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
                 &ide_diagnostics,
                 position_encoding,
                 code_descriptions,
+                client_tags,
             )
         }));
         let compute_ms = started_at.elapsed().as_millis() as u64;

@@ -1430,6 +1430,7 @@ fn build_latency_ctx(env: &mut BenchEnv) -> LatencyRequestContext {
         diagnostics_config: state.diagnostics_config.clone(),
         position_encoding: state.position_encoding,
         supports_code_description: state.supports_code_description,
+        supports_diagnostic_tags: state.supports_diagnostic_tags,
         supports_insert_text_mode_adjust_indentation: state
             .supports_insert_text_mode_adjust_indentation,
         supports_workspace_edit_document_changes: state.supports_workspace_edit_document_changes,
