@@ -10,7 +10,11 @@ pub struct EmbedderConfig {
     pub dim: Option<usize>,
     pub api_key: Option<String>,
     pub provider: Option<String>,
+    pub query_prefix: String,
+    pub document_prefix: String,
     pub max_request_bytes: usize,
+    /// Exact, already-loaded tokenizer policy shared by clones for one embedding pass.
+    pub token_policy: Option<crate::TokenPolicy>,
 }
 
 impl Default for EmbedderConfig {
@@ -21,7 +25,10 @@ impl Default for EmbedderConfig {
             dim: Some(1024),
             api_key: None,
             provider: None,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
             max_request_bytes: Self::DEFAULT_MAX_REQUEST_BYTES,
+            token_policy: None,
         }
     }
 }
@@ -93,6 +100,7 @@ impl BatchFailure {
 
 pub struct Embedder {
     config: EmbedderConfig,
+    storage_identity: String,
     /// Resilient agent for the unattended batch indexing pass: a long global timeout, paired
     /// with [`Self::MAX_RETRIES`] in [`Self::embed_batch`].
     agent: ureq::Agent,
@@ -114,6 +122,7 @@ impl Embedder {
     const INTERACTIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
     pub fn new(config: EmbedderConfig) -> Self {
+        let storage_identity = storage_identity(&config);
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(120)))
             .build()
@@ -122,7 +131,7 @@ impl Embedder {
             .timeout_global(Some(Self::INTERACTIVE_TIMEOUT))
             .build()
             .new_agent();
-        Self { config, agent, interactive_agent }
+        Self { config, storage_identity, agent, interactive_agent }
     }
 
     pub fn dim(&self) -> usize {
@@ -133,10 +142,59 @@ impl Embedder {
         &self.config.model
     }
 
+    pub fn model_id(&self) -> &str {
+        self.storage_identity()
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.dim()
+    }
+
     /// A clone of this embedder's configuration, so a caller can rebuild a standalone embedder
     /// (e.g. the off-lock overlay warmup) without reaching into private fields.
     pub fn config(&self) -> EmbedderConfig {
         self.config.clone()
+    }
+
+    /// Identity of the vectors produced by this input profile. Empty prefixes retain the
+    /// historical model key; dimensions remain a separate part of the storage contract.
+    pub fn storage_identity(&self) -> &str {
+        &self.storage_identity
+    }
+
+    /// Stable SQLite/Postgres layout claim for token-bound indexing, when enabled.
+    pub fn token_layout_claim(&self) -> Option<&str> {
+        self.config.token_policy.as_ref().map(|_| self.storage_identity())
+    }
+
+    /// Tokenizer policy frozen into this embedder, if token-bound inputs are enabled.
+    pub fn token_policy(&self) -> Option<&crate::TokenPolicy> {
+        self.config.token_policy.as_ref()
+    }
+
+    /// Prefix used by document preparation. `check_singleton_input` accepts text after this
+    /// prefix has already been applied.
+    pub fn document_prefix(&self) -> &str {
+        &self.config.document_prefix
+    }
+
+    /// Check an already-prefixed final input against both the token bound and the exact
+    /// singleton request serialization limit.
+    pub fn check_singleton_input(&self, final_input: &str) -> Result<(), SearchError> {
+        self.config.validate()?;
+        self.check_tokens(final_input)?;
+        let item = serde_json::to_vec(final_input)
+            .map_err(|_| failure(EmbeddingFailureCode::EmbeddingFailed))?
+            .len();
+        let singleton = self
+            .serialize_request(&[])?
+            .len()
+            .checked_add(item)
+            .ok_or_else(|| failure(EmbeddingFailureCode::EmbeddingInputTooLarge))?;
+        if singleton > self.config.max_request_bytes {
+            return Err(self.size_failure(singleton, true));
+        }
+        Ok(())
     }
 
     const MAX_RETRIES: u32 = 10;
@@ -151,11 +209,17 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        let prepared = texts
+            .iter()
+            .map(|text| format!("{}{}", self.config.document_prefix, text))
+            .collect::<Vec<_>>();
+        let prepared: Vec<_> = prepared.iter().map(String::as_str).collect();
         let envelope = self.serialize_request(&[])?.len();
         let mut ranges = Vec::new();
         let mut start = 0;
         let mut bytes = envelope;
-        for (i, text) in texts.iter().enumerate() {
+        for (i, text) in prepared.iter().enumerate() {
+            self.check_tokens(text)?;
             let item = serde_json::to_vec(text)
                 .map_err(|_| failure(EmbeddingFailureCode::EmbeddingFailed))?
                 .len();
@@ -176,7 +240,7 @@ impl Embedder {
                 bytes = next.expect("checked above");
             }
         }
-        ranges.push(start..texts.len());
+        ranges.push(start..prepared.len());
         Ok(ranges)
     }
 
@@ -229,15 +293,35 @@ impl Embedder {
     }
 
     fn prepare_request(&self, texts: &[&str]) -> Result<Vec<u8>, SearchError> {
+        self.prepare_request_with_prefix(texts, &self.config.document_prefix)
+    }
+
+    fn prepare_request_with_prefix(
+        &self,
+        texts: &[&str],
+        prefix: &str,
+    ) -> Result<Vec<u8>, SearchError> {
         self.config.validate()?;
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let body = self.serialize_request(texts)?;
+        let prepared = texts.iter().map(|text| format!("{prefix}{text}")).collect::<Vec<_>>();
+        let prepared: Vec<_> = prepared.iter().map(String::as_str).collect();
+        for text in &prepared {
+            self.check_tokens(text)?;
+        }
+        let body = self.serialize_request(&prepared)?;
         if body.len() > self.config.max_request_bytes {
             return Err(self.size_failure(body.len(), texts.len() == 1));
         }
         Ok(body)
+    }
+
+    fn check_tokens(&self, input: &str) -> Result<(), SearchError> {
+        if let Some(policy) = &self.config.token_policy {
+            policy.check(input)?;
+        }
+        Ok(())
     }
 
     fn size_failure(&self, request_bytes: usize, singleton: bool) -> SearchError {
@@ -306,6 +390,7 @@ impl Embedder {
                 d.index != index
                     || d.embedding.len() != self.dim()
                     || d.embedding.iter().any(|v| !v.is_finite())
+                    || d.embedding.iter().all(|v| *v == 0.0)
             })
         {
             // A parsed answer of the wrong shape — count, order, dimension or non-finite
@@ -324,8 +409,11 @@ impl Embedder {
     /// service must surface an error in seconds rather than retry for minutes and block every
     /// concurrent search. A transient failure is the caller's to retry as a whole search.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, SearchError> {
-        let mut results = self.embed_batch_interactive(&[text])?;
-        results.pop().ok_or_else(|| failure(EmbeddingFailureCode::EmbeddingInvalidResponse))
+        let body = self.prepare_request_with_prefix(&[text], &self.config.query_prefix)?;
+        self.send_request(&self.interactive_agent, &body, 1)
+            .map_err(BatchFailure::into_error)?
+            .pop()
+            .ok_or_else(|| failure(EmbeddingFailureCode::EmbeddingInvalidResponse))
     }
 
     /// Embed a batch fail-fast on the interactive agent. For the workspace-overlay refresh, which
@@ -392,7 +480,11 @@ fn transport_failure(error: ureq::Error, reading_response: bool) -> SearchError 
 
 impl EmbeddingGenerator for Embedder {
     fn model_id(&self) -> &str {
-        self.model()
+        self.storage_identity()
+    }
+
+    fn token_layout_claim(&self) -> Option<&str> {
+        self.token_layout_claim()
     }
 
     fn dimension(&self) -> usize {
@@ -410,6 +502,51 @@ impl EmbeddingGenerator for Embedder {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, SearchError> {
         Self::embed_batch(self, texts)
     }
+}
+
+fn storage_identity(config: &EmbedderConfig) -> String {
+    if config.token_policy.is_none()
+        && config.query_prefix.is_empty()
+        && config.document_prefix.is_empty()
+    {
+        return config.model.clone();
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut fields = vec![
+        b"bsl-search-input-profile-v1".to_vec(),
+        config.model.as_bytes().to_vec(),
+        config.query_prefix.as_bytes().to_vec(),
+        config.document_prefix.as_bytes().to_vec(),
+        b"semantic-document-v1".to_vec(),
+    ];
+    if let Some(policy) = &config.token_policy {
+        let envelope = identity_envelope(config);
+        fields.extend([
+            policy.tokenizer_sha256().as_bytes().to_vec(),
+            policy.max_tokens().to_string().into_bytes(),
+            policy.segmentation_version().as_bytes().to_vec(),
+            config.max_request_bytes.to_string().into_bytes(),
+            blake3::hash(&envelope).to_hex().as_bytes().to_vec(),
+        ]);
+    }
+    for field in fields {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(&field);
+    }
+    format!("profile-v1:{}", hasher.finalize().to_hex())
+}
+
+fn identity_envelope(config: &EmbedderConfig) -> Vec<u8> {
+    let provider_only = config.provider.as_deref().map(|provider| [provider]);
+    let provider =
+        provider_only.as_ref().map(|only| ProviderRouting { only, allow_fallbacks: false });
+    serde_json::to_vec(&EmbeddingRequest {
+        model: &config.model,
+        input: &[],
+        dimensions: config.dim,
+        provider,
+    })
+    .unwrap_or_default()
 }
 
 #[derive(Serialize)]
@@ -457,6 +594,67 @@ mod tests {
         let embedder = Embedder::new(EmbedderConfig { max_request_bytes: 0, ..Default::default() });
         assert_eq!(embedder.embed("input").unwrap_err().to_string(), "embedding_invalid_config");
         assert!(embedder.embed_batch_interactive(&[]).is_err());
+    }
+
+    #[test]
+    fn token_budget_guards_batch_planning_transport_and_query_inputs() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        let artifact = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"document":1,"query":2,"extra":3,"hello":4},"unk_token":"[UNK]"}}"#;
+        std::fs::write(&path, artifact).unwrap();
+        let hash =
+            Sha256::digest(artifact).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let policy = crate::TokenPolicy::load(&path, &hash, 2).unwrap();
+        let config = EmbedderConfig {
+            document_prefix: "document ".to_owned(),
+            query_prefix: "query extra ".to_owned(),
+            token_policy: Some(policy),
+            ..Default::default()
+        };
+        let embedder = Embedder::new(config.clone());
+
+        assert_eq!(embedder.batch_ranges(&["hello"], 8).unwrap(), vec![0..1]);
+        let too_large = embedder.batch_ranges(&["hello unknown"], 8).unwrap_err();
+        assert_eq!(
+            too_large.embedding_failure().unwrap().code,
+            EmbeddingFailureCode::EmbeddingInputTooLarge
+        );
+
+        let identity = embedder.storage_identity().to_owned();
+        let other_limit = Embedder::new(EmbedderConfig {
+            token_policy: Some(crate::TokenPolicy::load(&path, &hash, 3).unwrap()),
+            ..config.clone()
+        });
+        assert_ne!(other_limit.storage_identity(), identity);
+        let other_byte_ceiling = Embedder::new(EmbedderConfig {
+            max_request_bytes: config.max_request_bytes + 1,
+            ..config.clone()
+        });
+        assert_ne!(other_byte_ceiling.storage_identity(), identity);
+        let other_envelope = Embedder::new(EmbedderConfig {
+            provider: Some("alternate".to_owned()),
+            ..config.clone()
+        });
+        assert_ne!(other_envelope.storage_identity(), identity);
+
+        let copy = dir.path().join("same-tokenizer.json");
+        std::fs::copy(&path, &copy).unwrap();
+        let same_policy_other_path = Embedder::new(EmbedderConfig {
+            token_policy: Some(crate::TokenPolicy::load(&copy, &hash, 2).unwrap()),
+            ..config
+        });
+        assert_eq!(same_policy_other_path.storage_identity(), identity);
+        let too_large = embedder.embed_batch_interactive(&["hello unknown"]).unwrap_err();
+        assert_eq!(
+            too_large.embedding_failure().unwrap().code,
+            EmbeddingFailureCode::EmbeddingInputTooLarge
+        );
+        let too_large = embedder.embed("hello").unwrap_err();
+        assert_eq!(
+            too_large.embedding_failure().unwrap().code,
+            EmbeddingFailureCode::EmbeddingInputTooLarge
+        );
     }
 
     fn classify(code: u16) -> BatchFailure {

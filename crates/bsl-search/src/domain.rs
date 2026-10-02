@@ -156,6 +156,18 @@ impl DocumentPath {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceSpan {
+    pub parent_symbol: String,
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub parent_byte_start: u32,
+    pub parent_byte_end: u32,
+    /// One-based ordinal of this part in the parent source span.
+    pub part_index: u32,
+    pub part_count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedDocument {
     pub collection: String,
@@ -176,6 +188,7 @@ pub struct IndexedDocument {
     /// collection, plain re-index). Folding it into the embedded text (and thus the
     /// content hash that keys re-embedding) is the whole point of GE.
     pub graph_context: Option<String>,
+    pub source_span: Option<SourceSpan>,
 }
 
 impl IndexedDocument {
@@ -194,6 +207,7 @@ impl IndexedDocument {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexicalHit {
+    pub source_span: Option<SourceSpan>,
     pub collection: String,
     pub root_id: String,
     pub path: String,
@@ -207,6 +221,7 @@ pub struct LexicalHit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticHit {
+    pub source_span: Option<SourceSpan>,
     pub collection: String,
     pub root_id: String,
     pub path: String,

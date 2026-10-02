@@ -57,7 +57,10 @@ fn main() {
             dim: Some(dim),
             api_key: api_key.clone(),
             provider: std::env::var("EMBEDDING_PROVIDER").ok(),
+            query_prefix: String::new(),
+            document_prefix: String::new(),
             max_request_bytes,
+            token_policy: None,
         },
         execution: bsl_search::EmbeddingExecutionPolicy {
             batch_size,

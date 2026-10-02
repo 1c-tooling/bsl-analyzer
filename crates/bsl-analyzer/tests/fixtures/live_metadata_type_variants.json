@@ -1,7 +1,9 @@
 {
   "_fixture": {
     "version": "1",
-    "producer_contract": "typeVariants-v1",
+    "producer_contract": "typeVariants-tabularAttributes-v1",
+    "producer_http_version": "1.2.0",
+    "producer_extension_version": "1.1.0",
     "legacy_consumer_release": "v0.2.70",
     "legacy_consumer_commit": "d7e50c494995ee8dee742a6236b16134d2a42e87",
     "legacy_onec_client_source_sha256": "2d3afd71024f10162c97666a895852784121d8270a117e0212a717efee9905b2"
@@ -11,6 +13,13 @@
     "full_name": "Справочник.Товары",
     "synonym": "Товары",
     "futureField": {"ignored": true},
+    "ТабличныеЧасти": [
+      {"name":"Rows","synonym":"Rows","attributes":[
+        {"name":"SamePresentation","synonym":"SamePresentation","type":"Объект, Объект","typeVariants":[{"technicalName":"СправочникСсылка.А","presentation":"Объект"},{"technicalName":"СправочникСсылка.Б","presentation":"Объект"}]},
+        {"name":"Unsupported","synonym":"Unsupported","type":"ДвоичныеДанные","typeVariants":[{"technicalName":null,"presentation":"ДвоичныеДанные"}]}
+      ]},
+      {"name":"EmptyRows","synonym":"EmptyRows","attributes":[]}
+    ],
     "Реквизиты": [
       {"name":"Primitive","synonym":"Primitive","type":"Строка","typeVariants":[{"technicalName":"Строка","presentation":"Строка"}]},
       {"name":"Platform","synonym":"Platform","type":"УникальныйИдентификатор","typeVariants":[{"technicalName":"УникальныйИдентификатор","presentation":"УникальныйИдентификатор"}]},
@@ -27,6 +36,13 @@
     "full_name": "Catalog.Products",
     "synonym": "Products",
     "futureField": {"ignored": true},
+    "ТабличныеЧасти": [
+      {"name":"Rows","synonym":"Rows","attributes":[
+        {"name":"SamePresentation","synonym":"SamePresentation","type":"Object, Object","typeVariants":[{"technicalName":"СправочникСсылка.А","presentation":"Object"},{"technicalName":"СправочникСсылка.Б","presentation":"Object"}]},
+        {"name":"Unsupported","synonym":"Unsupported","type":"BinaryData","typeVariants":[{"technicalName":null,"presentation":"BinaryData"}]}
+      ]},
+      {"name":"EmptyRows","synonym":"EmptyRows","attributes":[]}
+    ],
     "Реквизиты": [
       {"name":"Primitive","synonym":"Primitive","type":"String","typeVariants":[{"technicalName":"Строка","presentation":"String"}]},
       {"name":"Platform","synonym":"Platform","type":"UUID","typeVariants":[{"technicalName":"УникальныйИдентификатор","presentation":"UUID"}]},

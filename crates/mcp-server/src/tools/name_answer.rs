@@ -96,7 +96,9 @@ fn candidate_value(
     candidate: &ide::NameCandidate,
 ) -> Value {
     let mut address = Map::new();
-    if let Some(symbol) = &candidate.symbol {
+    if let Some(symbol) =
+        candidate.symbol.as_deref().filter(|name| ide::is_well_formed_symbol(name))
+    {
         address.insert("symbol".into(), json!(symbol));
     }
     if let Some(id) = &candidate.graph_id {
@@ -213,6 +215,45 @@ mod tests {
         assert!(body["revision"].is_null(), "{body}");
         assert!(body["topology_fingerprint"].is_null(), "{body}");
         assert!(body["stale"].is_null(), "{body}");
+    }
+
+    #[test]
+    fn platform_candidate_with_spaces_has_only_an_accepted_symbol_address() {
+        let db = ide::RootDatabaseImpl::new();
+        let candidate = ide::NameCandidate::new(
+            "Расширение элементов управления, расположенных на панели.УстановитьПривязку",
+            ide::NameCategory::PlatformMember,
+            ide::NameMatchTier::Exact,
+            ide::ProviderId::Platform,
+        )
+        .with_symbol("Расширение элементов управления, расположенных на панели.УстановитьПривязку");
+        let mut candidate = candidate;
+        candidate.platform_ref = Some(ide::PlatformRef {
+            name: "УстановитьПривязку".to_string(),
+            type_name: Some("Расширение элементов управления, расположенных на панели".to_string()),
+        });
+
+        let value = candidate_value(&db, None, &candidate);
+        assert!(value["address"].get("symbol").is_none(), "{value}");
+        assert_eq!(value["address"]["syntax_help"]["name"], "УстановитьПривязку");
+        assert_eq!(
+            value["address"]["syntax_help"]["type_name"],
+            "Расширение элементов управления, расположенных на панели"
+        );
+        let help = crate::tools::platform::bsl_syntax_help(
+            value["address"]["syntax_help"]["name"].as_str().unwrap(),
+            value["address"]["syntax_help"]["type_name"].as_str(),
+            6_000,
+        )
+        .unwrap();
+        let help = help.structured_content.as_ref().unwrap();
+        assert_eq!(help["kind"], "method", "syntax_help returned no method card: {help}");
+        assert!(
+            help["matches"].as_array().is_some_and(|matches| {
+                matches.iter().any(|item| item["name"] == "УстановитьПривязку")
+            }),
+            "syntax_help did not resolve the published address: {help}"
+        );
     }
 
     /// Four closed vocabularies leave this crate on the wire, and their only

@@ -88,9 +88,12 @@ impl SharedEmbeddingPublisher {
         S: EmbeddingStore,
         E: EmbeddingGenerator + Clone + Send + 'static,
     {
-        embedder.batch_ranges(&[], self.policy.batch_size())?;
+        preflight_publish_inputs(embedder, documents, self.policy.batch_size())?;
         let dimension = embedder.dimension();
         let model_id = embedder.model_id().to_owned();
+        if let Some(claim) = embedder.token_layout_claim() {
+            store.ensure_token_layout_claim(crate::token_policy::SEGMENTATION_VERSION, claim)?;
+        }
         store.ensure_embedding_identity(&model_id, dimension)?;
         if documents.is_empty() {
             if let Some(on_progress) = progress {
@@ -312,6 +315,20 @@ impl BaselinePublisher {
         S: SnapshotPublisher + EmbeddingStore,
         E: EmbeddingGenerator + Clone + Send + 'static,
     {
+        if let Some(embedder) = embedder {
+            // Snapshot publication mutates lexical rows and invalidates semantic completion;
+            // refuse a foreign profile before making either change.
+            preflight_publish_inputs(
+                embedder,
+                documents,
+                self.shared_embeddings.policy.batch_size(),
+            )?;
+            if let Some(claim) = embedder.token_layout_claim() {
+                store
+                    .ensure_token_layout_claim(crate::token_policy::SEGMENTATION_VERSION, claim)?;
+            }
+            store.ensure_embedding_identity(embedder.model_id(), embedder.dimension())?;
+        }
         let snapshot_stats = store.publish_snapshot(snapshot, metadata, documents)?;
         let embeddings = match embedder {
             Some(embedder) => Some(self.shared_embeddings.publish(
@@ -326,9 +343,115 @@ impl BaselinePublisher {
     }
 }
 
+/// Check the complete publication input before an opt-in store can pin a layout or write any
+/// snapshot/vector rows. Part coverage here is metadata coverage; the parser-side preparer owns
+/// the stronger invariant that body bytes concatenate to the source parent interval.
+pub(crate) fn preflight_publish_inputs<E: EmbeddingGenerator>(
+    embedder: &E,
+    documents: &[IndexedDocument],
+    batch_size: usize,
+) -> Result<(), SearchError> {
+    let claim = embedder.token_layout_claim();
+    validate_source_span_layout(documents, claim.is_some())?;
+    let unique_inputs = documents
+        .iter()
+        .map(semantic_text_for_indexed_document)
+        .collect::<std::collections::BTreeSet<_>>();
+    let texts = unique_inputs.iter().map(String::as_str).collect::<Vec<_>>();
+    // This validates every final, prefixed input even when its vector is already cached.
+    embedder.batch_ranges(&texts, batch_size.max(1))?;
+    Ok(())
+}
+
+pub(crate) fn validate_source_span_layout(
+    documents: &[IndexedDocument],
+    layout_enabled: bool,
+) -> Result<(), SearchError> {
+    use crate::domain::SourceSpan;
+
+    type ParentKey = (String, String, String, String, String, u32, u32);
+    let invalid =
+        |detail: &str| SearchError::ExternalBaseline(format!("source_span_invalid: {detail}"));
+    let mut groups = BTreeMap::<ParentKey, Vec<&SourceSpan>>::new();
+    for document in documents {
+        match (&document.source_span, layout_enabled, document.collection.as_str()) {
+            (Some(_), false, _) => {
+                return Err(invalid("source span requires a token layout claim"));
+            }
+            (None, true, "code") => return Err(invalid("code document is missing source span")),
+            (Some(span), true, _) => {
+                let is_header = document.kind == "header";
+                if span.parent_symbol.is_empty() != is_header {
+                    return Err(invalid("empty parent symbol is only valid for module headers"));
+                }
+                if span.parent_byte_start >= span.parent_byte_end
+                    || span.byte_start >= span.byte_end
+                    || span.byte_start < span.parent_byte_start
+                    || span.byte_end > span.parent_byte_end
+                    || document.text.len() != (span.byte_end - span.byte_start) as usize
+                    || span.part_count == 0
+                    || span.part_index == 0
+                    || span.part_index > span.part_count
+                {
+                    return Err(invalid("part bounds or ordinal are invalid"));
+                }
+                let split_symbol = if is_header {
+                    format!("Header (часть {})", span.part_index)
+                } else {
+                    format!("{} (часть {})", span.parent_symbol, span.part_index)
+                };
+                let unsplit_symbol = is_header && span.part_count == 1 && span.part_index == 1;
+                let name_matches = if unsplit_symbol {
+                    document.symbol_name.is_empty() || document.symbol_name == split_symbol
+                } else if span.part_count == 1 && span.part_index == 1 {
+                    document.symbol_name == span.parent_symbol
+                        || document.symbol_name == split_symbol
+                } else {
+                    document.symbol_name == split_symbol
+                };
+                if !name_matches {
+                    return Err(invalid(
+                        "document symbol does not match parent symbol and part ordinal",
+                    ));
+                }
+                groups
+                    .entry((
+                        document.collection.clone(),
+                        document.root_id.clone(),
+                        document.path.clone(),
+                        document.kind.clone(),
+                        span.parent_symbol.clone(),
+                        span.parent_byte_start,
+                        span.parent_byte_end,
+                    ))
+                    .or_default()
+                    .push(span);
+            }
+            (None, _, _) => {}
+        }
+    }
+
+    for parts in groups.values_mut() {
+        parts.sort_by_key(|span| span.part_index);
+        let expected_count = parts[0].part_count;
+        if parts.len() != expected_count as usize
+            || parts.iter().enumerate().any(|(index, span)| {
+                span.part_count != expected_count || span.part_index != index as u32 + 1
+            })
+            || parts.first().is_none_or(|span| span.byte_start != span.parent_byte_start)
+            || parts.last().is_none_or(|span| span.byte_end != span.parent_byte_end)
+            || parts.windows(2).any(|pair| pair[0].byte_end != pair[1].byte_start)
+        {
+            return Err(invalid("parts do not provide ordered, complete parent coverage"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BaselinePublisher, EmbeddingExecutionPolicy, SharedEmbeddingPublisher};
+    use crate::domain::SourceSpan;
     use crate::domain::{
         CorpusId, IndexedDocument, Snapshot, SnapshotPublishMetadata, SnapshotPublishStats,
     };
@@ -426,6 +549,41 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RejectingTokenBoundEmbedder;
+
+    impl EmbeddingGenerator for RejectingTokenBoundEmbedder {
+        fn model_id(&self) -> &str {
+            "frozen-model"
+        }
+
+        fn token_layout_claim(&self) -> Option<&str> {
+            Some("frozen-layout")
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn batch_ranges(
+            &self,
+            texts: &[&str],
+            _max_items: usize,
+        ) -> Result<Vec<std::ops::Range<usize>>, SearchError> {
+            if !texts.is_empty() {
+                return Err(crate::EmbeddingFailure::new(
+                    crate::EmbeddingFailureCode::EmbeddingInputTooLarge,
+                )
+                .into());
+            }
+            Ok(Vec::new())
+        }
+
+        fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, SearchError> {
+            unreachable!("preflight rejects before embedding")
+        }
+    }
+
     #[test]
     fn shared_embedding_publisher_reuses_existing_and_batches_missing() {
         let store = FakeEmbeddingStore::default();
@@ -495,6 +653,17 @@ mod tests {
         }
     }
 
+    impl SnapshotPublisher for RejectingIdentityStore {
+        fn publish_snapshot(
+            &self,
+            snapshot: &Snapshot,
+            metadata: &SnapshotPublishMetadata,
+            documents: &[IndexedDocument],
+        ) -> Result<SnapshotPublishStats, SearchError> {
+            self.inner.publish_snapshot(snapshot, metadata, documents)
+        }
+    }
+
     #[test]
     fn shared_embedding_publisher_propagates_identity_mismatch() {
         let store = RejectingIdentityStore::default();
@@ -503,6 +672,28 @@ mod tests {
         let result = publisher.publish(&store, &FakeEmbedder::default(), &documents, None);
         assert!(matches!(result, Err(SearchError::ExternalBaseline(message)) if message == "boom"));
         assert!(store.inner.stored_batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn baseline_publisher_rejects_identity_before_snapshot_publication() {
+        let store = RejectingIdentityStore::default();
+        let documents = vec![indexed_document("path/1.bsl", "one")];
+        let embedder = FakeEmbedder::default();
+        let publisher = BaselinePublisher::new(EmbeddingExecutionPolicy::default());
+
+        let result = publisher.publish(
+            &store,
+            &Snapshot::new("workspace-code:test@1", CorpusId::WorkspaceCode),
+            &SnapshotPublishMetadata::default(),
+            &documents,
+            Some(&embedder),
+            None,
+        );
+
+        assert!(matches!(result, Err(SearchError::ExternalBaseline(message)) if message == "boom"));
+        assert_eq!(*store.inner.publish_calls.lock().unwrap(), 0);
+        assert!(store.inner.stored_batches.lock().unwrap().is_empty());
+        assert!(embedder.calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -542,7 +733,147 @@ mod tests {
             text: text.to_owned(),
             content_hash: format!("hash:{path}:{text}"),
             graph_context: None,
+            source_span: None,
         }
+    }
+
+    #[test]
+    fn token_layout_preflight_requires_complete_ordered_code_parts() {
+        let mut first = indexed_document("M.bsl", "12345");
+        first.symbol_name = "M (часть 1)".to_owned();
+        first.source_span = Some(SourceSpan {
+            parent_symbol: "M".to_owned(),
+            byte_start: 10,
+            byte_end: 15,
+            parent_byte_start: 10,
+            parent_byte_end: 20,
+            part_index: 1,
+            part_count: 2,
+        });
+        let mut second = indexed_document("M.bsl", "67890");
+        second.symbol_name = "M (часть 2)".to_owned();
+        second.source_span = Some(SourceSpan {
+            parent_symbol: "M".to_owned(),
+            byte_start: 15,
+            byte_end: 20,
+            parent_byte_start: 10,
+            parent_byte_end: 20,
+            part_index: 2,
+            part_count: 2,
+        });
+        assert!(super::validate_source_span_layout(&[first.clone(), second.clone()], true).is_ok());
+
+        let mut gap = second.clone();
+        gap.source_span.as_mut().unwrap().byte_start = 16;
+        assert!(super::validate_source_span_layout(&[first.clone(), gap], true).is_err());
+
+        let mut wrong_body = second.clone();
+        wrong_body.text.push('!');
+        assert!(super::validate_source_span_layout(&[first.clone(), wrong_body], true).is_err());
+
+        let mut duplicate = second.clone();
+        duplicate.source_span.as_mut().unwrap().part_index = 1;
+        assert!(super::validate_source_span_layout(&[first.clone(), duplicate], true).is_err());
+
+        let mut incomplete = second;
+        incomplete.source_span = None;
+        assert!(super::validate_source_span_layout(&[first.clone(), incomplete], true).is_err());
+        assert!(super::validate_source_span_layout(&[first], false).is_err());
+
+        let mut mismatched_parent = indexed_document("Other.bsl", "body");
+        mismatched_parent.symbol_name = "B".to_owned();
+        mismatched_parent.source_span = Some(SourceSpan {
+            parent_symbol: "A".to_owned(),
+            byte_start: 0,
+            byte_end: 4,
+            parent_byte_start: 0,
+            parent_byte_end: 4,
+            part_index: 1,
+            part_count: 1,
+        });
+        assert!(super::validate_source_span_layout(&[mismatched_parent], true).is_err());
+
+        let mut ordinal_part_1 = indexed_document("Other.bsl", "abcd");
+        ordinal_part_1.symbol_name = "A (часть 1)".to_owned();
+        ordinal_part_1.source_span = Some(SourceSpan {
+            parent_symbol: "A".to_owned(),
+            byte_start: 0,
+            byte_end: 4,
+            parent_byte_start: 0,
+            parent_byte_end: 8,
+            part_index: 1,
+            part_count: 2,
+        });
+        let mut mismatched_ordinal = indexed_document("Other.bsl", "efgh");
+        mismatched_ordinal.symbol_name = "A (часть 1)".to_owned();
+        mismatched_ordinal.source_span = Some(SourceSpan {
+            parent_symbol: "A".to_owned(),
+            byte_start: 0,
+            byte_end: 4,
+            parent_byte_start: 0,
+            parent_byte_end: 8,
+            part_index: 2,
+            part_count: 2,
+        });
+        assert!(super::validate_source_span_layout(&[ordinal_part_1, mismatched_ordinal], true)
+            .is_err());
+
+        let mut header = indexed_document("Header.bsl", "head");
+        header.kind = "header".to_owned();
+        header.symbol_name.clear();
+        header.source_span = Some(SourceSpan {
+            parent_symbol: String::new(),
+            byte_start: 0,
+            byte_end: 4,
+            parent_byte_start: 0,
+            parent_byte_end: 4,
+            part_index: 1,
+            part_count: 1,
+        });
+        assert!(super::validate_source_span_layout(&[header.clone()], true).is_ok());
+        header.symbol_name = "Header (часть 1)".to_owned();
+        header.source_span.as_mut().unwrap().parent_byte_end = 8;
+        header.source_span.as_mut().unwrap().part_count = 2;
+        let mut header_part_2 = header.clone();
+        header_part_2.text = "tail".to_owned();
+        header_part_2.symbol_name = "Header (часть 2)".to_owned();
+        let part_2 = header_part_2.source_span.as_mut().unwrap();
+        part_2.byte_start = 4;
+        part_2.byte_end = 8;
+        part_2.part_index = 2;
+        assert!(super::validate_source_span_layout(&[header, header_part_2], true).is_ok());
+    }
+
+    #[test]
+    fn token_budget_rejection_precedes_layout_claim_and_snapshot_writes() {
+        let store = FakeEmbeddingStore::default();
+        let mut document = indexed_document("M.bsl", "body");
+        document.symbol_name = "M".to_owned();
+        document.source_span = Some(SourceSpan {
+            parent_symbol: "M".to_owned(),
+            byte_start: 0,
+            byte_end: 4,
+            parent_byte_start: 0,
+            parent_byte_end: 4,
+            part_index: 1,
+            part_count: 1,
+        });
+        let result = BaselinePublisher::new(EmbeddingExecutionPolicy::default()).publish(
+            &store,
+            &Snapshot::new("snapshot-token-bound", CorpusId::WorkspaceCode),
+            &SnapshotPublishMetadata::default(),
+            &[document],
+            Some(&RejectingTokenBoundEmbedder),
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SearchError::Embedding(failure))
+                if failure.code == crate::EmbeddingFailureCode::EmbeddingInputTooLarge
+        ));
+        assert_eq!(*store.publish_calls.lock().unwrap(), 0);
+        assert!(store.stored_batches.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -520,6 +520,8 @@ fn load_common_modules_parallel(dir: &Path) -> Vec<crate::common_module::CommonM
                 module = crate::common_module::CommonModule::builder()
                     .uuid(*module.uuid())
                     .name(module.name())
+                    .object_belonging(module.object_belonging())
+                    .extended_configuration_object(module.extends_uuid().copied())
                     .uri(Some(uri))
                     .server(module.is_server())
                     .global(module.is_global())
@@ -535,6 +537,8 @@ fn load_common_modules_parallel(dir: &Path) -> Vec<crate::common_module::CommonM
                 module = crate::common_module::CommonModule::builder()
                     .uuid(*module.uuid())
                     .name(module.name())
+                    .object_belonging(module.object_belonging())
+                    .extended_configuration_object(module.extends_uuid().copied())
                     .uri(None::<String>)
                     .server(module.is_server())
                     .global(module.is_global())
@@ -3216,11 +3220,7 @@ mod case_parity_tests {
         assert!(catalog.is_some(), "каталог с соседним Товар.XML обнаружен");
         let expected = probed_spelling(&root, "EXT/PREDEFINED.XML", "Ext/Predefined.xml");
         assert!(
-            catalog
-                .unwrap()
-                .predefined
-                .as_deref()
-                .is_some_and(|p| p.to_string_lossy().ends_with(expected)),
+            catalog.unwrap().predefined.as_deref().is_some_and(|p| p.ends_with(expected)),
             "predefined найден через пробу"
         );
     }

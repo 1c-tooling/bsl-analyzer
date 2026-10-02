@@ -51,6 +51,7 @@ pub(crate) const BODY_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::SpaceAtStartComment,
     DiagnosticCode::UsingServiceTag,
     DiagnosticCode::DuplicateStringLiteral,
+    DiagnosticCode::GlobalContextMethodConflict,
 ];
 
 pub fn body_diagnostics(ctx: &BodyContext) -> Vec<Diagnostic<LocalRange>> {
@@ -95,6 +96,7 @@ pub fn body_diagnostics(ctx: &BodyContext) -> Vec<Diagnostic<LocalRange>> {
         handlers::space_at_start_comment::check_body(ctx, &mut acc);
         handlers::using_service_tag::check_body(ctx, &mut acc);
         handlers::duplicate_string_literal::check_body(ctx, &mut acc);
+        handlers::global_context_method_conflict::check_body(ctx, &mut acc);
     }
     acc
 }

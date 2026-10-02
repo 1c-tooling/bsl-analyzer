@@ -2,7 +2,6 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::utils::platform_event_handlers as peh;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
-use hir::AnnotationKind;
 use ide_db::TextRange;
 use rustc_hash::FxHashSet;
 use stdx::case::CaseExt;
@@ -235,15 +234,7 @@ fn check_method_unused(
 }
 
 fn has_extension_annotation(annotations: &[hir::Annotation]) -> bool {
-    annotations.iter().any(|ann| {
-        matches!(
-            ann.kind,
-            AnnotationKind::Before
-                | AnnotationKind::After
-                | AnnotationKind::Instead
-                | AnnotationKind::ChangeAndValidate
-        )
-    })
+    annotations.iter().any(|ann| ann.kind.is_interception())
 }
 
 fn is_attachable_method(name_lower: &str, prefixes: &[String]) -> bool {
@@ -536,6 +527,43 @@ mod tests {
         let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
 
         assert_eq!(messages, vec!["Неиспользуемый локальный метод \"НикемНеВызывается\""]);
+    }
+
+    #[test]
+    fn test_report_compose_result_gated_by_external_object_kind() {
+        use crate::test_utils::{
+            check_metadata_diagnostic_with_config, make_non_common_module_metadata,
+        };
+
+        let code = r#"Процедура ПриКомпоновкеРезультата(ДокументРезультат, ДанныеРасшифровки, СтандартнаяОбработка)
+    ДокументРезультат.Очистить();
+КонецПроцедуры"#;
+
+        let flagged_for = |mdo_type| {
+            let mut config = DiagnosticsConfig::default();
+            let mut params = serde_json::Map::new();
+            params.insert("checkObjectModule".to_string(), serde_json::Value::Bool(true));
+            config
+                .parameters
+                .insert(DiagnosticCode::UnusedLocalMethod, serde_json::Value::Object(params));
+
+            let mut metadata =
+                make_non_common_module_metadata(bsl_metadata::ModuleType::ObjectModule);
+            metadata.mdo =
+                Some(std::sync::Arc::new(bsl_metadata::MetadataObject::new(mdo_type, "Внешний")));
+            check_metadata_diagnostic_with_config(metadata, code, config, |_meta, ctx| {
+                super::check(ctx)
+            })
+            .into_iter()
+            .map(|d| d.message)
+            .collect::<Vec<_>>()
+        };
+
+        assert!(flagged_for(bsl_metadata::MdoType::ExternalReport).is_empty());
+        assert_eq!(
+            flagged_for(bsl_metadata::MdoType::ExternalDataProcessor),
+            vec!["Неиспользуемый локальный метод \"ПриКомпоновкеРезультата\"".to_string()]
+        );
     }
 
     #[test]

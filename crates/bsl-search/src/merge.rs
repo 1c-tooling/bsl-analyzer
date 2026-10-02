@@ -11,6 +11,7 @@ pub enum HitSource {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergedHit {
+    pub source_span: Option<crate::SourceSpan>,
     pub collection: String,
     pub root_id: String,
     pub path: String,
@@ -98,6 +99,7 @@ pub fn merge_lexical(
         .iter()
         .filter(|h| !context.hidden_paths.contains(&(h.collection.clone(), hit_key(*h))))
         .map(|h| MergedHit {
+            source_span: h.source_span.clone(),
             collection: h.collection.clone(),
             root_id: h.root_id.clone(),
             path: h.path.clone(),
@@ -111,6 +113,7 @@ pub fn merge_lexical(
         });
 
     let overlay_iter = overlay_hits.iter().map(|h| MergedHit {
+        source_span: h.source_span.clone(),
         collection: h.collection.clone(),
         root_id: h.root_id.clone(),
         path: h.path.clone(),
@@ -136,6 +139,7 @@ pub fn merge_semantic(
         .iter()
         .filter(|h| !context.hidden_paths.contains(&(h.collection.clone(), hit_key(*h))))
         .map(|h| MergedHit {
+            source_span: h.source_span.clone(),
             collection: h.collection.clone(),
             root_id: h.root_id.clone(),
             path: h.path.clone(),
@@ -149,6 +153,7 @@ pub fn merge_semantic(
         });
 
     let overlay_iter = overlay_hits.iter().map(|h| MergedHit {
+        source_span: h.source_span.clone(),
         collection: h.collection.clone(),
         root_id: h.root_id.clone(),
         path: h.path.clone(),
@@ -211,6 +216,7 @@ mod tests {
 
     fn lexical(collection: &str, path: &str, symbol: &str, rank: f32) -> LexicalHit {
         LexicalHit {
+            source_span: None,
             collection: collection.into(),
             root_id: crate::CONFIGURATION_ROOT_ID.to_owned(),
             path: path.into(),
@@ -225,6 +231,7 @@ mod tests {
 
     fn semantic(collection: &str, path: &str, symbol: &str, score: f32) -> SemanticHit {
         SemanticHit {
+            source_span: None,
             collection: collection.into(),
             root_id: crate::CONFIGURATION_ROOT_ID.to_owned(),
             path: path.into(),

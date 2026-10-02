@@ -206,7 +206,7 @@ pub fn search_docs(
         }
         (
             engine.embedder_clone(),
-            engine.embedding_model().map(str::to_owned),
+            engine.embedding_storage_identity().map(str::to_owned),
             engine.embedding_dimension(),
         )
     };

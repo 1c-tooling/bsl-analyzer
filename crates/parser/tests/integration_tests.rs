@@ -498,6 +498,14 @@ fn test_bare_raise_before_block_end() {
 }
 
 #[test]
+fn property_access_after_constructor_requires_a_temporary() {
+    assert_clean_parse(
+        "Процедура Тест()\n    Файл = Новый Файл(\"a\");\n    Имя = Файл.ПолноеИмя;\n    Есть = Файл.Существует();\nКонецПроцедуры",
+        "member access through a temporary constructed value is valid",
+    );
+}
+
+#[test]
 fn test_adjacent_string_literals() {
     let input = r#"Процедура Тест()
     Данные.Вставить("Ключ" "");

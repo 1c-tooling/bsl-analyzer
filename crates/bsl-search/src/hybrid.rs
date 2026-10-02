@@ -230,6 +230,7 @@ mod tests {
 
     fn lexical(path: &str, symbol: &str) -> SearchHit {
         SearchHit {
+            source_span: None,
             collection: "code".to_owned(),
             root_id: crate::CONFIGURATION_ROOT_ID.to_owned(),
             file_path: path.to_owned(),
@@ -248,6 +249,32 @@ mod tests {
 
     fn keys(hits: &[FusedHit]) -> Vec<&str> {
         hits.iter().map(|h| h.hit.symbol_name.as_str()).collect()
+    }
+
+    #[test]
+    fn same_line_token_parts_remain_distinct_after_fusion() {
+        let parts: Vec<_> = (1..=2)
+            .map(|ordinal| {
+                let mut hit = lexical("a.bsl", &format!("Тест (часть {ordinal})"));
+                hit.line_end = hit.line_start + 1;
+                hit.source_span = Some(crate::SourceSpan {
+                    parent_symbol: "Тест".into(),
+                    byte_start: (ordinal - 1) * 16,
+                    byte_end: ordinal * 16,
+                    parent_byte_start: 0,
+                    parent_byte_end: 32,
+                    part_index: ordinal,
+                    part_count: 2,
+                });
+                hit
+            })
+            .collect();
+        let fused = fuse_smart(&parts, &parts, "поиск по тексту", 10);
+        assert_eq!(fused.len(), 2);
+        for (part, result) in parts.iter().zip(&fused) {
+            assert_eq!(result.modality, Modality::Both);
+            assert_eq!(result.hit.source_span, part.source_span);
+        }
     }
 
     #[test]

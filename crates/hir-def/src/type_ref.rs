@@ -103,6 +103,7 @@ impl TypeRef {
             AttributeType::PlatformNamed(name) => {
                 TypeRef::Name(QualifiedName::from_segments([Name::new(name)]))
             }
+            AttributeType::UnknownNamed(_) => TypeRef::Unknown,
             AttributeType::Unknown => TypeRef::Unknown,
         }
     }

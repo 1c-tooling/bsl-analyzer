@@ -1,7 +1,9 @@
 use crate::error::{MetadataError, Result};
 use crate::metadata_object::{MdoType, MetadataObject};
 
-use super::helpers::{child_text, find_child, find_mdo_element, parse_uuid, parse_xml};
+use super::helpers::{
+    child_text, find_child, find_mdo_element, parse_extension_ownership, parse_uuid, parse_xml,
+};
 use super::type_parser::parse_type_xml;
 
 pub fn parse_constant_xml(xml: &str) -> Result<MetadataObject> {
@@ -27,6 +29,12 @@ pub fn parse_constant_xml(xml: &str) -> Result<MetadataObject> {
                 "ignored malformed Constant root UUID"
             ),
         }
+    }
+
+    let (belonging, extends) = parse_extension_ownership(props);
+    mdo_obj.set_object_belonging(belonging);
+    if let Some(uuid) = extends {
+        mdo_obj.set_extends_uuid(uuid);
     }
 
     if let Some(type_node) = find_child(props, "Type") {
@@ -135,6 +143,26 @@ mod tests {
         assert_eq!(
             mdo.uuid().map(|u| u.to_string()),
             Some("9893e2d6-f3f8-4d73-bb06-19bf26d216ab".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_extension_ownership() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Constant uuid="22222222-2222-2222-2222-222222222222">
+        <Properties>
+            <ObjectBelonging>Adopted</ObjectBelonging>
+            <Name>X</Name>
+            <ExtendedConfigurationObject>11111111-1111-1111-1111-111111111111</ExtendedConfigurationObject>
+        </Properties>
+    </Constant>
+</MetaDataObject>"#;
+        let mdo = parse_constant_xml(xml).expect("constant parses");
+        assert_eq!(mdo.object_belonging(), crate::ObjectBelonging::Adopted);
+        assert_eq!(
+            mdo.extends_uuid().map(|u| u.to_string()),
+            Some("11111111-1111-1111-1111-111111111111".to_string())
         );
     }
 }

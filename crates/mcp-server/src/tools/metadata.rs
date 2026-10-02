@@ -12,6 +12,7 @@ pub async fn get_live_metadata_tree(
     meta_type: &str,
     name_mask: Option<String>,
     limit: u32,
+    max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let selected =
         state.onec_connection(connection).map_err(|e| McpError::invalid_params(e, None))?;
@@ -24,17 +25,7 @@ pub async fn get_live_metadata_tree(
         })
         .await
         .map_err(live_metadata_error)?;
-    Ok(crate::tools::response::structured(serde_json::json!({
-        "source": "infobase",
-        "connection": connection,
-        "items": result.items.into_iter().map(|item| serde_json::json!({
-            "name": item.name,
-            "full_name": item.full_name,
-            "synonym": item.synonym,
-        })).collect::<Vec<_>>(),
-        "returned": result.returned,
-        "truncated": result.truncated,
-    })))
+    live_metadata_tree_response(connection, result, max_output_tokens)
 }
 
 pub async fn get_live_metadata_object(
@@ -42,6 +33,7 @@ pub async fn get_live_metadata_object(
     connection: Option<&str>,
     meta_type: &str,
     name: &str,
+    max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let selected =
         state.onec_connection(connection).map_err(|e| McpError::invalid_params(e, None))?;
@@ -53,23 +45,183 @@ pub async fn get_live_metadata_object(
         })
         .await
         .map_err(live_metadata_error)?;
-    Ok(live_metadata_object_response(connection, value))
+    live_metadata_object_response(connection, value, max_output_tokens)
 }
 
 fn live_metadata_error(error: onec_client::Error) -> McpError {
     McpError::internal_error(format!("Ошибка чтения метаданных 1С: {error}"), None)
 }
 
+// ponytail: each rejected candidate costs one full serialization, up to one pass per returned
+// metadata item (O(n²) bytes in the largest case). Keep the simple exact check while a single
+// metadata object stays comfortably small; if real producer objects make this slow, account for
+// removed array suffixes incrementally and serialize only the final envelope.
 fn live_metadata_object_response(
     connection: Option<&str>,
     object: onec_client::MetadataStructureResult,
-) -> CallToolResult {
-    crate::tools::response::structured(serde_json::json!({
-        "schema_version": "1",
-        "source": "infobase",
-        "connection": connection,
-        "object": object,
-    }))
+    max_output_tokens: usize,
+) -> Result<CallToolResult, McpError> {
+    let mut object = serde_json::to_value(object).map_err(|error| {
+        McpError::internal_error(format!("Ошибка сериализации метаданных 1С: {error}"), None)
+    })?;
+    let mut truncated = false;
+    let ceiling = max_output_tokens.saturating_mul(4);
+
+    loop {
+        let completeness = live_object_completeness(&object, truncated);
+        let result = crate::tools::response::structured(serde_json::json!({
+            "schema_version": "2",
+            "source": "infobase",
+            "connection": connection,
+            "object": object.clone(),
+            "completeness": completeness,
+            "truncated": truncated,
+        }));
+        if live_result_payload_bytes(&result) <= ceiling {
+            return Ok(result);
+        }
+
+        let mut removed = false;
+        for field in ["Ресурсы", "Измерения", "ТабличныеЧасти", "Реквизиты", "СтандартныеРеквизиты"]
+        {
+            if object
+                .get_mut(field)
+                .and_then(serde_json::Value::as_array_mut)
+                .is_some_and(|items| items.pop().is_some())
+            {
+                removed = true;
+                truncated = true;
+                break;
+            }
+        }
+        if !removed {
+            return Err(metadata_budget_error(live_result_payload_bytes(&result)));
+        }
+    }
+}
+
+fn live_metadata_tree_response(
+    connection: Option<&str>,
+    result: onec_client::MetadataListResult,
+    max_output_tokens: usize,
+) -> Result<CallToolResult, McpError> {
+    let mut items: Vec<_> = result
+        .items
+        .into_iter()
+        .map(|item| {
+            serde_json::json!({ "name": item.name, "full_name": item.full_name, "synonym": item.synonym })
+        })
+        .collect();
+    let mut truncated = result.truncated;
+    let ceiling = max_output_tokens.saturating_mul(4);
+
+    loop {
+        let response = crate::tools::response::structured(serde_json::json!({
+            "schema_version": "2",
+            "source": "infobase",
+            "connection": connection,
+            "items": items.clone(),
+            "returned": items.len(),
+            "truncated": truncated,
+        }));
+        if live_result_payload_bytes(&response) <= ceiling {
+            return Ok(response);
+        }
+        if items.pop().is_none() {
+            return Err(metadata_budget_error(live_result_payload_bytes(&response)));
+        }
+        truncated = true;
+    }
+}
+
+fn live_result_payload_bytes(result: &CallToolResult) -> usize {
+    crate::tools::response::serialized_bytes(&result.content)
+        + result
+            .structured_content
+            .as_ref()
+            .map(crate::tools::response::serialized_bytes)
+            .unwrap_or_default()
+}
+
+fn metadata_budget_error(minimum_bytes: usize) -> McpError {
+    McpError::invalid_params(
+        "max_output_tokens is too small for the metadata response",
+        Some(serde_json::json!({
+            "reason": "budget_too_small",
+            "minimum_output_tokens": minimum_bytes.saturating_add(3) / 4,
+        })),
+    )
+}
+
+fn live_object_completeness(object: &serde_json::Value, truncated: bool) -> serde_json::Value {
+    let mut reasons = Vec::new();
+    for field in ["СтандартныеРеквизиты", "Реквизиты", "Измерения", "Ресурсы"]
+    {
+        if let Some(items) = object.get(field).and_then(serde_json::Value::as_array) {
+            for (index, item) in items.iter().enumerate() {
+                let path = pointer_child(&pointer_child("", field), &index.to_string());
+                push_unresolved_type_reasons(item, &path, &mut reasons);
+            }
+        }
+    }
+    if let Some(sections) = object.get("ТабличныеЧасти").and_then(serde_json::Value::as_array)
+    {
+        for (section_index, section) in sections.iter().enumerate() {
+            let section_path =
+                pointer_child(&pointer_child("", "ТабличныеЧасти"), &section_index.to_string());
+            match section.get("attributes") {
+                Some(serde_json::Value::Null) | None => reasons.push(serde_json::json!({
+                    "code": "legacy_tabular_attributes",
+                    "path": pointer_child(&section_path, "attributes"),
+                })),
+                Some(serde_json::Value::Array(attributes)) => {
+                    for (attribute_index, attribute) in attributes.iter().enumerate() {
+                        push_unresolved_type_reasons(
+                            attribute,
+                            &pointer_child(
+                                &pointer_child(&section_path, "attributes"),
+                                &attribute_index.to_string(),
+                            ),
+                            &mut reasons,
+                        );
+                    }
+                }
+                _ => unreachable!("tabular attributes are normalized to an array or null"),
+            }
+        }
+    }
+    if truncated {
+        reasons.push(serde_json::json!({ "code": "output_budget", "path": "" }));
+    }
+    serde_json::json!({
+        "status": if reasons.is_empty() { "complete" } else { "partial" },
+        "reasons": reasons,
+    })
+}
+
+fn pointer_child(parent: &str, segment: &str) -> String {
+    let escaped = segment.replace('~', "~0").replace('/', "~1");
+    format!("{parent}/{escaped}")
+}
+
+fn push_unresolved_type_reasons(
+    item: &serde_json::Value,
+    path: &str,
+    reasons: &mut Vec<serde_json::Value>,
+) {
+    if let Some(variants) = item.get("type_variants").and_then(serde_json::Value::as_array) {
+        for (index, variant) in variants.iter().enumerate() {
+            if variant.get("resolution").and_then(serde_json::Value::as_str) == Some("unresolved") {
+                reasons.push(serde_json::json!({
+                    "code": "unresolved_type",
+                    "path": pointer_child(
+                        &pointer_child(&pointer_child(path, "type_variants"), &index.to_string()),
+                        "technical_name",
+                    ),
+                }));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,18 +775,26 @@ fn format_metadata_object_structure(
     obj: &bsl_metadata::MetadataObject,
     mdo_type: MdoType,
 ) -> String {
-    let mut out = format!("# {}.{}\n\n", mdo_type.russian_name(), obj.name);
+    let mut out = format!("# {}.{}\n\n", mdo_type.russian_name(), escape_markdown(&obj.name));
+    let unresolved = metadata_object_type_reasons(obj);
 
     if let Some(ref name_en) = obj.name_en {
-        let _ = writeln!(out, "Английское имя: {name_en}\n");
+        let _ = writeln!(out, "Английское имя: {}\n", escape_markdown(name_en));
     }
+
+    append_type_completeness(&mut out, &unresolved);
 
     if !obj.attributes.is_empty() {
         let _ = writeln!(out, "## Реквизиты ({})\n", obj.attributes.len());
         let _ = writeln!(out, "| Имя | Тип |");
         let _ = writeln!(out, "|-----|-----|");
         for attr in &obj.attributes {
-            let _ = writeln!(out, "| {} | {} |", attr.name, attr.attr_type);
+            let _ = writeln!(
+                out,
+                "| {} | {} |",
+                escape_markdown(&attr.name),
+                format_source_type(&attr.attr_type)
+            );
         }
         out.push('\n');
     }
@@ -642,12 +802,17 @@ fn format_metadata_object_structure(
     if !obj.tabular_sections.is_empty() {
         let _ = writeln!(out, "## Табличные части ({})\n", obj.tabular_sections.len());
         for ts in &obj.tabular_sections {
-            let _ = writeln!(out, "### {}\n", ts.name());
+            let _ = writeln!(out, "### {}\n", escape_markdown(ts.name()));
             if !ts.attributes().is_empty() {
                 let _ = writeln!(out, "| Имя | Тип |");
                 let _ = writeln!(out, "|-----|-----|");
                 for attr in ts.attributes() {
-                    let _ = writeln!(out, "| {} | {} |", attr.name(), attr.attr_type());
+                    let _ = writeln!(
+                        out,
+                        "| {} | {} |",
+                        escape_markdown(attr.name()),
+                        format_source_type(attr.attr_type())
+                    );
                 }
                 out.push('\n');
             }
@@ -658,9 +823,14 @@ fn format_metadata_object_structure(
         let _ = writeln!(out, "## Значения перечисления ({})\n", obj.enum_values.len());
         for val in &obj.enum_values {
             if let Some(ref name_en) = val.name_en {
-                let _ = writeln!(out, "- {} ({name_en})", val.name);
+                let _ = writeln!(
+                    out,
+                    "- {} ({})",
+                    escape_markdown(&val.name),
+                    escape_markdown(name_en)
+                );
             } else {
-                let _ = writeln!(out, "- {}", val.name);
+                let _ = writeln!(out, "- {}", escape_markdown(&val.name));
             }
         }
         out.push('\n');
@@ -669,26 +839,127 @@ fn format_metadata_object_structure(
     if !obj.predefined_items.is_empty() {
         let _ = writeln!(out, "## Предопределённые элементы ({})\n", obj.predefined_items.len());
         for item in &obj.predefined_items {
-            let _ = writeln!(out, "- {}", item.name);
+            let _ = writeln!(out, "- {}", escape_markdown(&item.name));
         }
     }
 
     out
 }
 
+fn metadata_object_type_reasons(obj: &bsl_metadata::MetadataObject) -> Vec<(String, &'static str)> {
+    let mut reasons = Vec::new();
+    for attr in &obj.attributes {
+        collect_type_reasons(&attr.attr_type, &format!("Реквизиты.{}", attr.name), &mut reasons);
+    }
+    for section in &obj.tabular_sections {
+        for attr in section.attributes() {
+            collect_type_reasons(
+                attr.attr_type(),
+                &format!("ТабличныеЧасти.{}.Реквизиты.{}", section.name(), attr.name()),
+                &mut reasons,
+            );
+        }
+    }
+    reasons
+}
+
+fn collect_type_reasons(
+    ty: &bsl_metadata::AttributeType,
+    path: &str,
+    reasons: &mut Vec<(String, &'static str)>,
+) {
+    use bsl_metadata::AttributeType;
+    match ty {
+        AttributeType::Unknown => reasons.push((path.to_string(), "technical_name_unavailable")),
+        AttributeType::UnknownNamed(_) => {
+            reasons.push((path.to_string(), "unknown_technical_name"))
+        }
+        AttributeType::Composite { types } => {
+            for ty in types {
+                collect_type_reasons(ty, path, reasons);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn append_type_completeness(out: &mut String, reasons: &[(String, &'static str)]) {
+    if reasons.is_empty() {
+        out.push_str("Полнота типов: complete\n\n");
+    } else {
+        out.push_str("Полнота типов: partial\n");
+        for (path, reason) in reasons {
+            let _ = writeln!(out, "- {}: {reason}", escape_markdown(path));
+        }
+        out.push('\n');
+    }
+}
+
+fn escape_markdown(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '<' | '>') {
+            escaped.push('\\');
+        }
+        match ch {
+            '\n' | '\r' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn format_source_type(ty: &bsl_metadata::AttributeType) -> String {
+    use bsl_metadata::AttributeType;
+
+    match ty {
+        AttributeType::Composite { types } => {
+            types.iter().map(format_source_type).collect::<Vec<_>>().join("; ")
+        }
+        AttributeType::UnknownNamed(presentation) => {
+            format!("Не разрешён: {} (technical_name_unavailable)", escape_markdown(presentation))
+        }
+        AttributeType::Unknown => {
+            "Не разрешён: неизвестный вариант (technical_name_unavailable)".to_string()
+        }
+        other => escape_markdown(&other.to_string()),
+    }
+}
+
 fn format_register_structure(reg: &bsl_metadata::Register) -> String {
-    let mut out = format!("# {}.{}\n\n", reg.mdo_type().russian_name(), reg.name());
+    let mut out =
+        format!("# {}.{}\n\n", reg.mdo_type().russian_name(), escape_markdown(reg.name()));
+    let mut reasons = Vec::new();
+    for dim in reg.dimensions() {
+        collect_type_reasons(
+            &register_type(dim.attr_type(), dim.type_str()),
+            &format!("Измерения.{}", dim.name()),
+            &mut reasons,
+        );
+    }
+    for res in reg.resources() {
+        collect_type_reasons(
+            &register_type(res.attr_type(), res.type_str()),
+            &format!("Ресурсы.{}", res.name()),
+            &mut reasons,
+        );
+    }
+    for attr in reg.attributes() {
+        collect_type_reasons(
+            &register_type(attr.attr_type(), attr.type_str()),
+            &format!("Реквизиты.{}", attr.name()),
+            &mut reasons,
+        );
+    }
+    append_type_completeness(&mut out, &reasons);
 
     if !reg.dimensions().is_empty() {
         let _ = writeln!(out, "## Измерения ({})\n", reg.dimensions().len());
         let _ = writeln!(out, "| Имя | Тип |");
         let _ = writeln!(out, "|-----|-----|");
         for dim in reg.dimensions() {
-            let type_str = dim
-                .attr_type()
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| dim.type_str().to_string());
-            let _ = writeln!(out, "| {} | {type_str} |", dim.name());
+            let type_str = format_source_type(&register_type(dim.attr_type(), dim.type_str()));
+            let _ = writeln!(out, "| {} | {} |", escape_markdown(dim.name()), type_str);
         }
         out.push('\n');
     }
@@ -698,11 +969,8 @@ fn format_register_structure(reg: &bsl_metadata::Register) -> String {
         let _ = writeln!(out, "| Имя | Тип |");
         let _ = writeln!(out, "|-----|-----|");
         for res in reg.resources() {
-            let type_str = res
-                .attr_type()
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| res.type_str().to_string());
-            let _ = writeln!(out, "| {} | {type_str} |", res.name());
+            let type_str = format_source_type(&register_type(res.attr_type(), res.type_str()));
+            let _ = writeln!(out, "| {} | {} |", escape_markdown(res.name()), type_str);
         }
         out.push('\n');
     }
@@ -712,11 +980,8 @@ fn format_register_structure(reg: &bsl_metadata::Register) -> String {
         let _ = writeln!(out, "| Имя | Тип |");
         let _ = writeln!(out, "|-----|-----|");
         for attr in reg.attributes() {
-            let type_str = attr
-                .attr_type()
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| attr.type_str().to_string());
-            let _ = writeln!(out, "| {} | {type_str} |", attr.name());
+            let type_str = format_source_type(&register_type(attr.attr_type(), attr.type_str()));
+            let _ = writeln!(out, "| {} | {} |", escape_markdown(attr.name()), type_str);
         }
         out.push('\n');
     }
@@ -729,6 +994,19 @@ fn format_register_structure(reg: &bsl_metadata::Register) -> String {
     }
 
     out
+}
+
+fn register_type(
+    parsed: Option<&bsl_metadata::AttributeType>,
+    source: &str,
+) -> bsl_metadata::AttributeType {
+    parsed.cloned().unwrap_or_else(|| {
+        if source.is_empty() {
+            bsl_metadata::AttributeType::Unknown
+        } else {
+            bsl_metadata::AttributeType::UnknownNamed(source.to_string())
+        }
+    })
 }
 
 pub fn get_configuration_info(
@@ -1152,6 +1430,152 @@ mod tests {
         result.content[0].as_text().expect("expected text content").text.as_str()
     }
 
+    #[test]
+    fn source_metadata_renders_each_union_variant_and_marks_unresolved_types() {
+        fn config_with_union(type_entries: &str) -> bsl_metadata::Configuration {
+            let dir = tempfile::tempdir().expect("source fixture tempdir");
+            std::fs::create_dir_all(dir.path().join("Catalogs")).expect("Catalogs directory");
+            std::fs::write(
+                dir.path().join("Configuration.xml"),
+                "<Configuration><Name>ТестоваяКонфигурация</Name></Configuration>",
+            )
+            .expect("Configuration.xml");
+
+            let catalog = |name: &str, uuid: &str, children: &str| {
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.10">
+  <Catalog uuid="{uuid}">
+    <Properties><Name>{name}</Name><Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Общее представление</v8:content></v8:item></Synonym></Properties>
+    <ChildObjects>{children}</ChildObjects>
+  </Catalog>
+</MetaDataObject>"#
+                )
+            };
+            for (name, uuid) in [
+                ("А", "00000000-0000-0000-0000-000000000001"),
+                ("Б", "00000000-0000-0000-0000-000000000002"),
+            ] {
+                let xml = catalog(name, uuid, "");
+                std::fs::write(dir.path().join("Catalogs").join(format!("{name}.xml")), xml)
+                    .expect("write target catalog");
+            }
+            let attribute = format!(
+                r#"<Attribute uuid="00000000-0000-0000-0000-000000000004"><Properties><Name>Вариант</Name><Synonym/><Type>{type_entries}</Type></Properties></Attribute>"#
+            );
+            let xml =
+                catalog("ТестовыйКаталог", "00000000-0000-0000-0000-000000000003", &attribute);
+            std::fs::write(dir.path().join("Catalogs/ТестовыйКаталог.xml"), xml)
+                .expect("write catalog with union");
+            bsl_metadata::load_from_directory(dir.path()).expect("load source fixture")
+        }
+
+        let complete_config = config_with_union(
+            "<v8:Type>cfg:CatalogRef.А</v8:Type><v8:Type>cfg:CatalogRef.Б</v8:Type>",
+        );
+        let complete =
+            get_object_structure(&complete_config, "Справочник", "ТестовыйКаталог").unwrap();
+        let complete = extract_text(&complete);
+        assert!(complete.contains("| Вариант | Справочник.А; Справочник.Б |"), "{complete}");
+        assert!(complete.contains("Полнота типов: complete"), "{complete}");
+
+        let partial_config = config_with_union(
+            "<v8:Type>cfg:CatalogRef.А</v8:Type><v8:Type>d5p1:FutureType</v8:Type>",
+        );
+        let partial =
+            get_object_structure(&partial_config, "Справочник", "ТестовыйКаталог").unwrap();
+        let partial = extract_text(&partial);
+        assert!(
+            partial.contains("| Вариант | Справочник.А; Не разрешён: d5p1:FutureType (technical_name_unavailable) |"),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("Полнота типов: partial\n- Реквизиты.Вариант: unknown_technical_name"),
+            "{partial}"
+        );
+    }
+
+    #[test]
+    fn source_type_completeness_uses_qualified_paths_for_sections_and_registers() {
+        use bsl_metadata::{
+            metadata_object::MdoType,
+            register::{Register, RegisterResource},
+            tabular_section::{TabularSection, TabularSectionAttribute},
+            AttributeType, Configuration, MetadataObject,
+        };
+
+        let mut config = Configuration::new("Тест");
+        let mut object = MetadataObject::new(MdoType::Catalog, "Справочник");
+        for (uuid, section_name) in [
+            ("00000000-0000-0000-0000-000000000001", "Товары"),
+            ("00000000-0000-0000-0000-000000000002", "Услуги"),
+        ] {
+            let mut section = TabularSection::new(uuid.parse().unwrap(), section_name);
+            section.set_attributes(vec![TabularSectionAttribute::new(
+                uuid.parse().unwrap(),
+                "Сумма|Итого",
+                AttributeType::Unknown,
+            )]);
+            object.add_tabular_section(section);
+        }
+        config.add_metadata_object(object);
+
+        let mut unknown_resource = RegisterResource::new(
+            "00000000-0000-0000-0000-000000000004".parse().unwrap(),
+            "Будущий|Ресурс",
+        );
+        unknown_resource.set_attr_type(AttributeType::UnknownNamed("future|type".into()));
+        let mut known_resource = RegisterResource::new(
+            "00000000-0000-0000-0000-000000000005".parse().unwrap(),
+            "Количество",
+        );
+        known_resource.set_attr_type(AttributeType::String { length: Some(20) });
+        config.add_register(
+            Register::builder()
+                .name("Продажи")
+                .mdo_type(MdoType::InformationRegister)
+                .add_resource(known_resource)
+                .add_resource(unknown_resource)
+                .build(),
+        );
+
+        let object_text = get_object_structure(&config, "Справочник", "Справочник").unwrap();
+        let object_text = extract_text(&object_text);
+        assert!(object_text.contains("Полнота типов: partial\n- ТабличныеЧасти.Товары.Реквизиты.Сумма\\|Итого: technical_name_unavailable\n- ТабличныеЧасти.Услуги.Реквизиты.Сумма\\|Итого: technical_name_unavailable"), "{object_text}");
+        assert!(
+            object_text.find("Полнота типов").unwrap()
+                < object_text.find("## Табличные части").unwrap(),
+            "{object_text}"
+        );
+        assert!(
+            object_text.contains(
+                "| Сумма\\|Итого | Не разрешён: неизвестный вариант (technical_name_unavailable) |"
+            ),
+            "{object_text}"
+        );
+
+        let register_text = get_object_structure(&config, "РегистрСведений", "Продажи").unwrap();
+        let register_text = extract_text(&register_text);
+        assert!(
+            register_text.contains(
+                "Полнота типов: partial\n- Ресурсы.Будущий\\|Ресурс: unknown_technical_name"
+            ),
+            "{register_text}"
+        );
+        assert!(
+            register_text.find("Полнота типов").unwrap()
+                < register_text.find("## Ресурсы").unwrap(),
+            "{register_text}"
+        );
+        assert!(
+            register_text.contains(
+                "| Будущий\\|Ресурс | Не разрешён: future\\|type (technical_name_unavailable) |"
+            ),
+            "{register_text}"
+        );
+        assert!(register_text.contains("| Количество | Строка(20) |"), "{register_text}");
+    }
+
     /// Every listing a cancelled `metadata` call can enter stops at its first item
     /// instead of enumerating the configuration for a response nobody will read.
     ///
@@ -1251,10 +1675,10 @@ mod tests {
         .unwrap();
         let object: onec_client::MetadataStructureResult =
             serde_json::from_value(fixture["ru"].clone()).unwrap();
-        let result = live_metadata_object_response(Some("test"), object);
+        let result = live_metadata_object_response(Some("test"), object, 6_000).unwrap();
         let body = result.structured_content.unwrap();
 
-        assert_eq!(body["schema_version"], "1");
+        assert_eq!(body["schema_version"], "2");
         assert_eq!(body["source"], "infobase");
         assert_eq!(body["connection"], "test");
         assert!(body["object"].get("futureField").is_none());
@@ -1269,6 +1693,207 @@ mod tests {
             attribute("FutureUnknown")["type_variants"][0]["reason"],
             "unknown_technical_name"
         );
+        let sections = body["object"]["ТабличныеЧасти"].as_array().unwrap();
+        let rows = sections.iter().find(|item| item["name"] == "Rows").unwrap();
+        assert_eq!(rows["attributes"][0]["type_variants"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            sections.iter().find(|item| item["name"] == "EmptyRows").unwrap()["attributes"],
+            serde_json::json!([])
+        );
+        assert_eq!(body["completeness"]["status"], "partial");
+        let reasons = body["completeness"]["reasons"].as_array().unwrap();
+        assert!(reasons.iter().any(|reason| {
+            reason["code"] == "unresolved_type"
+                && reason["path"] == "/ТабличныеЧасти/0/attributes/1/type_variants/0/technical_name"
+        }));
+        for reason in reasons {
+            let path = reason["path"].as_str().expect("reason path is a JSON Pointer");
+            if path.is_empty() {
+                continue;
+            }
+            assert!(body["object"].pointer(path).is_some(), "unresolved {path} in {body}");
+        }
+
+        let legacy: onec_client::MetadataStructureResult = serde_json::from_str(include_str!(
+            "../../../bsl-analyzer/tests/fixtures/live_metadata_legacy.json"
+        ))
+        .unwrap();
+        let legacy = live_metadata_object_response(Some("test"), legacy, 6_000).unwrap();
+        let legacy = legacy.structured_content.unwrap();
+        assert_eq!(legacy["object"]["ТабличныеЧасти"][0]["attributes"], serde_json::Value::Null);
+        assert_eq!(legacy["completeness"]["status"], "partial");
+        let legacy_reason = legacy["completeness"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|reason| reason["code"] == "legacy_tabular_attributes")
+            .expect("legacy attributes reason");
+        assert_eq!(legacy_reason["code"], "legacy_tabular_attributes");
+        assert_eq!(legacy_reason["path"], "/ТабличныеЧасти/0/attributes");
+        assert!(legacy["object"].pointer(legacy_reason["path"].as_str().unwrap()).is_some());
+
+        let escaping = serde_json::json!({ "a~/b": true });
+        let escaped_pointer = pointer_child("", "a~/b");
+        assert_eq!(escaped_pointer, "/a~0~1b");
+        assert_eq!(escaping.pointer(&escaped_pointer), Some(&serde_json::Value::Bool(true)));
+
+        let mut large = object_from_fixture();
+        large.attributes = (0..100)
+            .map(|index| onec_client::MetadataStructureItem {
+                name: format!("Attribute{index}"),
+                synonym: String::new(),
+                type_name: Some("Строка".to_string()),
+                type_variants: vec![onec_client::MetadataTypeVariant {
+                    technical_name: Some("Строка".to_string()),
+                    presentation: "Строка".to_string(),
+                    resolution: "source",
+                    reason: None,
+                }],
+            })
+            .collect();
+        let fitted = live_metadata_object_response(Some("test"), large, 700).unwrap();
+        assert!(live_result_payload_bytes(&fitted) <= 700 * 4);
+        let fitted_body = fitted.structured_content.as_ref().unwrap();
+        assert_eq!(fitted_body["truncated"], true);
+        assert_eq!(fitted_body["completeness"]["status"], "partial");
+        assert!(fitted_body["completeness"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| { reason["code"] == "output_budget" && reason["path"] == "" }));
+        for reason in fitted_body["completeness"]["reasons"].as_array().unwrap() {
+            if reason["code"] == "output_budget" {
+                assert_eq!(reason["path"], "");
+            } else {
+                assert!(
+                    fitted_body["object"].pointer(reason["path"].as_str().unwrap()).is_some(),
+                    "unresolved path after budget truncation: {reason} in {fitted_body}"
+                );
+            }
+        }
+
+        let error =
+            live_metadata_object_response(Some("test"), object_from_fixture(), 0).unwrap_err();
+        assert_eq!(error.code.0, -32602);
+        assert_eq!(error.data.as_ref().unwrap()["reason"], "budget_too_small");
+        let minimum = error.data.unwrap()["minimum_output_tokens"].as_u64().unwrap() as usize;
+        assert!(minimum > 0);
+        assert!(live_metadata_object_response(Some("test"), object_from_fixture(), minimum).is_ok());
+    }
+
+    fn object_from_fixture() -> onec_client::MetadataStructureResult {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bsl-analyzer/tests/fixtures/live_metadata_type_variants.json"
+        ))
+        .unwrap();
+        serde_json::from_value(fixture["ru"].clone()).unwrap()
+    }
+
+    #[test]
+    fn live_tree_budget_keeps_whole_items_and_recounts_service_truncation() {
+        let result = onec_client::MetadataListResult {
+            items: (0..100)
+                .map(|index| onec_client::MetadataListItem {
+                    name: format!("Имя{index}"),
+                    full_name: format!("Справочник.Имя{index}"),
+                    synonym: "Значение".repeat(20),
+                })
+                .collect(),
+            returned: 777,
+            truncated: true,
+        };
+        let fitted = live_metadata_tree_response(Some("test"), result, 700).unwrap();
+        assert!(live_result_payload_bytes(&fitted) <= 700 * 4);
+        let body = fitted.structured_content.as_ref().unwrap();
+        assert_eq!(body["schema_version"], "2");
+        assert_eq!(body["returned"], body["items"].as_array().unwrap().len());
+        assert_eq!(body["truncated"], true);
+        let error = live_metadata_tree_response(
+            Some("test"),
+            onec_client::MetadataListResult { items: Vec::new(), returned: 0, truncated: false },
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.code.0, -32602);
+        assert_eq!(error.data.as_ref().unwrap()["reason"], "budget_too_small");
+        let minimum = error.data.unwrap()["minimum_output_tokens"].as_u64().unwrap() as usize;
+        assert!(minimum > 0);
+        let minimum_response = live_metadata_tree_response(
+            Some("test"),
+            onec_client::MetadataListResult { items: Vec::new(), returned: 0, truncated: false },
+            minimum,
+        )
+        .unwrap();
+        assert_eq!(minimum_response.structured_content.unwrap()["schema_version"], "2");
+    }
+
+    #[test]
+    fn live_object_budget_never_splits_union_or_tabular_section() {
+        let mut union = object_from_fixture();
+        union.standard_attributes.clear();
+        union.attributes.clear();
+        union.dimensions.clear();
+        union.resources.clear();
+        union.tabular_sections.clear();
+        union.attributes.push(onec_client::MetadataStructureItem {
+            name: "БольшойСоставнойТип".into(),
+            synonym: String::new(),
+            type_name: Some("Составной".into()),
+            type_variants: vec![
+                onec_client::MetadataTypeVariant {
+                    technical_name: Some("СправочникСсылка.А".into()),
+                    presentation: "А".repeat(2_000),
+                    resolution: "source",
+                    reason: None,
+                },
+                onec_client::MetadataTypeVariant {
+                    technical_name: Some("СправочникСсылка.Б".into()),
+                    presentation: "Б".repeat(2_000),
+                    resolution: "source",
+                    reason: None,
+                },
+            ],
+        });
+        let fitted_union = live_metadata_object_response(Some("test"), union, 700).unwrap();
+        assert!(live_result_payload_bytes(&fitted_union) <= 700 * 4);
+        let union_body = fitted_union.structured_content.as_ref().unwrap();
+        assert!(union_body["object"]["Реквизиты"].as_array().unwrap().is_empty());
+        assert!(union_body["truncated"].as_bool().unwrap());
+        assert_eq!(
+            union_body["completeness"]["reasons"].as_array().unwrap().last().unwrap()["path"],
+            ""
+        );
+
+        let mut section = object_from_fixture();
+        section.standard_attributes.clear();
+        section.attributes.clear();
+        section.dimensions.clear();
+        section.resources.clear();
+        section.tabular_sections = vec![onec_client::MetadataTabularSection {
+            name: "ОченьБольшаяТабличнаяЧасть".into(),
+            synonym: String::new(),
+            attributes: Some(vec![onec_client::MetadataStructureItem {
+                name: "ОченьБольшойРеквизит".into(),
+                synonym: String::new(),
+                type_name: Some("Строка".into()),
+                type_variants: vec![onec_client::MetadataTypeVariant {
+                    technical_name: Some("Строка".into()),
+                    presentation: "Строка".repeat(2_000),
+                    resolution: "source",
+                    reason: None,
+                }],
+            }]),
+        }];
+        let fitted_section = live_metadata_object_response(Some("test"), section, 700).unwrap();
+        assert!(live_result_payload_bytes(&fitted_section) <= 700 * 4);
+        let section_body = fitted_section.structured_content.as_ref().unwrap();
+        assert!(section_body["object"]["ТабличныеЧасти"].as_array().unwrap().is_empty());
+        assert!(section_body["truncated"].as_bool().unwrap());
+        assert!(section_body["completeness"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reason| reason["code"] == "output_budget" && reason["path"] == ""));
     }
 
     #[test]

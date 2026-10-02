@@ -120,10 +120,22 @@ impl IndexProgress {
         // Formatting/process identity lookup occurs outside the bounded record lock.
         let prefix =
             blake3::hash(crate::lifecycle::process_id().as_bytes()).to_hex()[..32].to_owned();
-        let generation = sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .ok()
-            .map(|n| n + 1);
+        // Keep the checked update compatible with Rust 1.91; try_update needs 1.95.
+        let mut current = sequence.load(Ordering::Relaxed);
+        let generation = loop {
+            let Some(next) = current.checked_add(1) else {
+                break None;
+            };
+            match sequence.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break Some(next),
+                Err(observed) => current = observed,
+            }
+        };
         let pass_id = generation.map(|n| format!("{prefix}:{n}"));
         let mut record = self.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(generation) = generation {
@@ -354,6 +366,27 @@ mod indexing_pass_lifecycle {
         let terminal = progress.snapshot().unwrap();
         assert_eq!(terminal.state, IndexPassState::Ready);
         assert_eq!(terminal.pass_id, sample.pass_id);
+    }
+    #[test]
+    fn concurrent_pass_ids_are_unique_until_exhaustion() {
+        let sequence = Arc::new(AtomicU64::new(u64::MAX - 4));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let sequence = Arc::clone(&sequence);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let progress = IndexProgress::new();
+                    barrier.wait();
+                    let _pass = progress.begin_pass_with_counter(&sequence);
+                    progress.snapshot().unwrap().pass_id
+                })
+            })
+            .collect();
+        let ids: std::collections::HashSet<_> =
+            workers.into_iter().filter_map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
     }
     #[test]
     fn contention_overflow_and_reset_are_fail_closed() {

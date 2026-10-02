@@ -81,6 +81,22 @@ impl TabularSection {
         self.use_mode = use_mode;
     }
 
+    pub fn apply_extension_overlay(&mut self, overlay: &TabularSection) {
+        if overlay.name_en.is_some() {
+            self.name_en = overlay.name_en.clone();
+        }
+        if overlay.synonym.is_some() {
+            self.synonym = overlay.synonym.clone();
+        }
+        if overlay.use_mode.is_some() {
+            self.use_mode = overlay.use_mode.clone();
+        }
+        for attr in &overlay.attributes {
+            self.attributes.retain(|existing| !existing.name.eq_ignore_ascii_case(&attr.name));
+            self.attributes.push(attr.clone());
+        }
+    }
+
     /// Heap bytes owned by this tabular section: its name strings plus the
     /// backing attribute vec and each attribute's own owned payload.
     pub fn estimated_heap_size(&self) -> usize {

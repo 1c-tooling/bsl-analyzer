@@ -729,6 +729,7 @@ fn static_type_variants(
         AttributeType::PlatformNamed(name) if !name.is_empty() => Some(name.clone()),
         AttributeType::AnyObjectRef { .. }
         | AttributeType::PlatformNamed(_)
+        | AttributeType::UnknownNamed(_)
         | AttributeType::Unknown
         | AttributeType::Composite { .. } => None,
     };

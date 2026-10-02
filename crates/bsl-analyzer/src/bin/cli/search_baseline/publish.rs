@@ -127,6 +127,10 @@ pub(super) fn run(args: SearchBaselinePublishArgs) -> Result<(), Box<dyn Error +
         &resolved_pg.url,
         project.config.search.baseline.postgres.schema.as_deref(),
     )?;
+    let adapter = match embedder.as_ref().and_then(Embedder::token_layout_claim) {
+        Some(claim) => adapter.with_token_layout_claim(bsl_search::SEGMENTATION_VERSION, claim)?,
+        None => adapter,
+    };
     let schema_label = project
         .config
         .search
@@ -400,6 +404,7 @@ mod tests {
             text: "Процедура Общий()".to_owned(),
             content_hash: "hash-1".to_owned(),
             graph_context: None,
+            source_span: None,
         };
         let in_extension =
             bsl_search::IndexedDocument { root_id: "src/cfe/Расш".to_owned(), ..chunk.clone() };

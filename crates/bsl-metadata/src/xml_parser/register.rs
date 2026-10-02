@@ -44,6 +44,8 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
     let object_name = child_text(props, "Name").unwrap_or("").to_string();
     let periodicity_str =
         child_text(props, "InformationRegisterPeriodicity").map(|s| s.to_string());
+    let recorder_subordinate = mdo_type == MdoType::InformationRegister
+        && child_text(props, "WriteMode") == Some("RecorderSubordinate");
     let enable_totals_slice_first = child_bool(props, "EnableTotalsSliceFirst");
     let enable_totals_slice_last = child_bool(props, "EnableTotalsSliceLast");
     let register_type_str = child_text(props, "RegisterType").map(|s| s.to_string());
@@ -94,6 +96,7 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
         .resources(resources)
         .attributes(attributes)
         .periodicity(periodicity)
+        .recorder_subordinate(recorder_subordinate)
         .register_type(register_type)
         .enable_totals_slice_first(enable_totals_slice_first)
         .enable_totals_slice_last(enable_totals_slice_last)

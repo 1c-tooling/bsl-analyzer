@@ -58,6 +58,37 @@ fn stage_workspace() -> TempDir {
     dir
 }
 
+fn stage_workspace_with_metadata_union() -> TempDir {
+    let dir = stage_workspace();
+    let catalogs = dir.path().join("Catalogs");
+    std::fs::create_dir_all(&catalogs).expect("mkdir catalogs");
+    let descriptor = |name: &str, uuid: &str, children: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.10">
+  <Catalog uuid="{uuid}">
+    <Properties><Name>{name}</Name><Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Общее представление</v8:content></v8:item></Synonym></Properties>
+    <ChildObjects>{children}</ChildObjects>
+  </Catalog>
+</MetaDataObject>"#
+        )
+    };
+    for (name, uuid) in [
+        ("А", "00000000-0000-0000-0000-000000000011"),
+        ("Б", "00000000-0000-0000-0000-000000000012"),
+    ] {
+        std::fs::write(catalogs.join(format!("{name}.xml")), descriptor(name, uuid, ""))
+            .expect("write target catalog");
+    }
+    let attribute = r#"<Attribute uuid="00000000-0000-0000-0000-000000000014"><Properties><Name>СоставнойТип</Name><Synonym/><Type><v8:Type>cfg:CatalogRef.А</v8:Type><v8:Type>cfg:CatalogRef.Б</v8:Type></Type></Properties></Attribute>"#;
+    std::fs::write(
+        catalogs.join("Товары.xml"),
+        descriptor("Товары", "00000000-0000-0000-0000-000000000013", attribute),
+    )
+    .expect("write sample catalog");
+    dir
+}
+
 async fn workspace_client(root: &Path) -> Client {
     let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
     workspace_client_with_state(state).await
@@ -99,6 +130,70 @@ impl RejectingLiveService {
 }
 
 impl Drop for RejectingLiveService {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct RespondingLiveService {
+    url: String,
+    task: JoinHandle<()>,
+}
+
+impl RespondingLiveService {
+    async fn start() -> Self {
+        async fn structure(Json(_request): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "name": "Товары",
+                "full_name": "Справочник.Товары",
+                "synonym": "Товары",
+                "Реквизиты": [{
+                    "name": "Составной",
+                    "synonym": "Составной",
+                    "type": "Объект, Объект",
+                    "typeVariants": [
+                        {"technicalName":"СправочникСсылка.А","presentation":"Объект"},
+                        {"technicalName":"СправочникСсылка.Б","presentation":"Объект"}
+                    ]
+                }],
+                "ТабличныеЧасти": [
+                    {"name":"Строки","synonym":"Строки","attributes":[
+                        {"name":"Ссылка","synonym":"Ссылка","type":"Объект, Объект","typeVariants":[
+                            {"technicalName":"СправочникСсылка.А","presentation":"Объект"},
+                            {"technicalName":null,"presentation":"НеизвестныйТип"}
+                        ]}
+                    ]},
+                    {"name":"Пустая","synonym":"Пустая","attributes":[]}
+                ]
+            }))
+        }
+
+        async fn list(Json(_request): Json<Value>) -> Json<Value> {
+            let items: Vec<Value> = (0..100)
+                .map(|index| {
+                    json!({
+                        "name": format!("Имя{index}"),
+                        "full_name": format!("Справочник.Имя{index}"),
+                        "synonym": "Наименование".repeat(10),
+                    })
+                })
+                .collect();
+            Json(json!({"items": items, "returned": 100, "truncated": false}))
+        }
+
+        let app = Router::new()
+            .route("/metadata-structure", post(structure))
+            .route("/metadata-list", post(list));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind live fixture");
+        let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve live fixture");
+        });
+        Self { url, task }
+    }
+}
+
+impl Drop for RespondingLiveService {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -199,6 +294,38 @@ async fn source_and_auto_without_connection_keep_form_on_the_source_path() {
     assert!(live.requests.lock().expect("request log").is_empty(), "source paths touched live 1C");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn documented_source_object_example_returns_the_parsed_union_over_mcp() {
+    let ws = stage_workspace_with_metadata_union();
+    let client = workspace_client(ws.path()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    loop {
+        let result = call(
+            &client,
+            &[
+                ("action", json!("object")),
+                ("mode", json!("source")),
+                ("object_type", json!("Справочник")),
+                ("object_name", json!("Товары")),
+            ],
+        )
+        .await;
+        let text = text_of(&result);
+        if text.starts_with("Метаданные загружаются") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the workspace resident never became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        assert!(text.contains("| СоставнойТип | Справочник.А; Справочник.Б |"), "{text}");
+        assert!(text.contains("Полнота типов: complete"), "{text}");
+        break;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn infobase_and_auto_with_connection_pass_object_type_through_once() {
     let ws = stage_workspace();
@@ -234,6 +361,75 @@ async fn infobase_and_auto_with_connection_pass_object_type_through_once() {
         ],
         "plural and invalid singular forms must each reach the live service unchanged, once",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_metadata_object_and_tree_obey_the_combined_output_budget() {
+    let ws = stage_workspace();
+    let live = RespondingLiveService::start().await;
+    let mut state = SharedState::workspace(ws.path().to_path_buf()).expect("valid workspace");
+    state.add_onec_connection(
+        "live".into(),
+        OnecConnection::new(onec_client::Client::new(&live.url, "", ""), false),
+    );
+    let client = workspace_client_with_state(state).await;
+
+    let object = call(
+        &client,
+        &[
+            ("action", json!("object")),
+            ("mode", json!("infobase")),
+            ("connection", json!("live")),
+            ("object_type", json!("Справочники")),
+            ("object_name", json!("Товары")),
+            ("max_output_tokens", json!(700)),
+        ],
+    )
+    .await;
+    let body = object.structured_content.as_ref().expect("live object structuredContent");
+    assert_eq!(body["schema_version"], "2");
+    assert_eq!(body["completeness"]["status"], "partial");
+    assert_eq!(body["object"]["ТабличныеЧасти"][1]["attributes"], json!([]));
+    let result_bytes = serde_json::to_vec(&object.content).unwrap().len()
+        + serde_json::to_vec(body).unwrap().len();
+    assert!(result_bytes <= 700 * 4, "{result_bytes} bytes");
+
+    let tiny_arguments: Map<String, Value> = [
+        ("action", json!("object")),
+        ("mode", json!("infobase")),
+        ("connection", json!("live")),
+        ("object_type", json!("Справочники")),
+        ("object_name", json!("Товары")),
+        ("max_output_tokens", json!(1)),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect();
+    let tiny = client
+        .call_tool(CallToolRequestParams::new("metadata").with_arguments(tiny_arguments))
+        .await;
+    assert!(tiny.is_err(), "a minimum envelope too large for the budget must be rejected");
+
+    let tree = call(
+        &client,
+        &[
+            ("action", json!("tree")),
+            ("mode", json!("infobase")),
+            ("connection", json!("live")),
+            ("meta_type", json!("Справочники")),
+            ("max_items", json!(100)),
+            ("max_output_tokens", json!(700)),
+        ],
+    )
+    .await;
+    let body = tree.structured_content.as_ref().expect("live tree structuredContent");
+    assert!(!tree.is_error.unwrap_or(false));
+    assert!(body["items"].as_array().unwrap().len() < 100);
+    assert_eq!(body["returned"], body["items"].as_array().unwrap().len());
+    assert_eq!(body["truncated"], true);
+    let result_bytes =
+        serde_json::to_vec(&tree.content).unwrap().len() + serde_json::to_vec(body).unwrap().len();
+    assert!(result_bytes <= 700 * 4, "{result_bytes} bytes");
 }
 
 /// A call issued while the resident builds answers with the retry envelope, and one issued

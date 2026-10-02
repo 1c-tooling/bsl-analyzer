@@ -8,6 +8,7 @@ pub struct LocalStoreBaselineAdapter<'a> {
     corpus: CorpusId,
     collection: &'static str,
     snapshot_id: &'static str,
+    token_layout_claim: Option<String>,
 }
 
 impl<'a> LocalStoreBaselineAdapter<'a> {
@@ -17,6 +18,7 @@ impl<'a> LocalStoreBaselineAdapter<'a> {
             corpus: CorpusId::WorkspaceCode,
             collection: "code",
             snapshot_id: "local-workspace-baseline",
+            token_layout_claim: None,
         }
     }
 
@@ -26,7 +28,13 @@ impl<'a> LocalStoreBaselineAdapter<'a> {
             corpus: CorpusId::Reference,
             collection: "platform",
             snapshot_id: "local-reference-baseline",
+            token_layout_claim: None,
         }
+    }
+
+    pub fn with_token_layout_claim(mut self, claim: Option<&str>) -> Self {
+        self.token_layout_claim = claim.map(str::to_owned);
+        self
     }
 }
 
@@ -56,7 +64,10 @@ impl SnapshotContentStore for LocalStoreBaselineAdapter<'_> {
         if snapshot.corpus != self.corpus || snapshot.id.0 != self.snapshot_id {
             return Ok(Vec::new());
         }
-        self.store.load_indexed_documents(Some(self.collection))
+        self.store.load_indexed_documents_with_token_layout_claim(
+            Some(self.collection),
+            self.token_layout_claim.as_deref(),
+        )
     }
 }
 
@@ -135,6 +146,7 @@ mod tests {
                 text: "новый текст".to_owned(),
                 content_hash: "changed".to_owned(),
                 graph_context: None,
+                source_span: None,
             }],
         );
 

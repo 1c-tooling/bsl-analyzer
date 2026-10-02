@@ -1,3 +1,4 @@
+use crate::enums::ObjectBelonging;
 use crate::error::{MetadataError, Result};
 use crate::metadata_object::{MdoType, StandardAttributeKind};
 use crate::register::RegisterAttribute;
@@ -28,6 +29,27 @@ pub(crate) fn find_child<'a>(
 
 pub(crate) fn child_text<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<&'a str> {
     find_child(node, tag).and_then(|n| n.text())
+}
+
+/// Reads whether an object is adopted from the base configuration and which base
+/// object it extends. A malformed base reference is dropped rather than failing the
+/// object, so the object still loads, only without being merged into its base.
+pub(crate) fn parse_extension_ownership(
+    props: roxmltree::Node<'_, '_>,
+) -> (ObjectBelonging, Option<Uuid>) {
+    let belonging = match child_text(props, "ObjectBelonging") {
+        Some("Adopted") => ObjectBelonging::Adopted,
+        Some("Own") => ObjectBelonging::Own,
+        _ => ObjectBelonging::Unknown,
+    };
+    let extends = child_text(props, "ExtendedConfigurationObject").and_then(|raw| {
+        Uuid::parse_str(raw)
+            .inspect_err(|err| {
+                tracing::warn!(uuid_raw = %raw, %err, "ignored malformed ExtendedConfigurationObject");
+            })
+            .ok()
+    });
+    (belonging, extends)
 }
 
 pub(crate) fn child_bool(node: roxmltree::Node<'_, '_>, tag: &str) -> bool {

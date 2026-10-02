@@ -70,7 +70,11 @@ impl PayloadServer {
                 };
                 let (status, response) = reply(index, &body);
                 // A response-limit/timeout test deliberately closes the peer early.
-                let _ = write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
             }
         });
         Self { url, requests, stop, thread: Some(thread) }
@@ -154,6 +158,84 @@ fn payload_transport_serialized_ranges_and_exact_boundary() {
 }
 
 #[test]
+fn payload_roles_apply_literal_prefixes_once_and_keep_legacy_bytes() {
+    let server = PayloadServer::new(success);
+    let mut config = server.config(4096);
+    config.query_prefix = "search_query: ".into();
+    config.document_prefix = "search_document: \"\\\n".into();
+    let embedder = Embedder::new(config.clone());
+    let original_query = "search_query: Найти";
+
+    embedder.embed(original_query).unwrap();
+    embedder.embed_batch(&["module\\\n"]).unwrap();
+    embedder.embed_batch_interactive(&["module\\\n"]).unwrap();
+
+    let inputs = server
+        .requests()
+        .iter()
+        .map(|body| serde_json::from_slice::<Value>(body).unwrap()["input"][0].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(inputs[0], format!("{}{}", config.query_prefix, original_query));
+    assert_eq!(inputs[1], format!("{}module\\\n", config.document_prefix));
+    assert_eq!(inputs[2], inputs[1]);
+
+    let mut legacy = server.config(4096);
+    let raw = "raw\\\n\"";
+    let expected = Embedder::new(legacy.clone()).serialize_request(&[raw]).unwrap();
+    Embedder::new(legacy.clone()).embed(raw).unwrap();
+    assert_eq!(server.requests()[3], expected);
+    assert_eq!(Embedder::new(legacy.clone()).storage_identity(), "fixture");
+    assert_eq!(Embedder::new(legacy.clone()).model(), "fixture");
+    assert_eq!(Embedder::new(legacy.clone()).dimension(), 3);
+
+    let legacy_identity = Embedder::new(legacy.clone()).storage_identity().to_owned();
+    legacy.dim = Some(9);
+    let different_dimension = Embedder::new(legacy.clone());
+    assert_eq!(different_dimension.storage_identity(), legacy_identity);
+    assert_eq!(different_dimension.dimension(), 9);
+
+    legacy.dim = Some(3);
+    legacy.model = "other-wire-alias".into();
+    let other_alias = Embedder::new(legacy.clone());
+    assert_eq!(other_alias.model(), "other-wire-alias");
+    assert_ne!(other_alias.storage_identity(), legacy_identity);
+
+    legacy.query_prefix = "query:".into();
+    let query_embedder = Embedder::new(legacy.clone());
+    let query_profile = query_embedder.storage_identity().to_owned();
+    legacy.query_prefix.clear();
+    legacy.document_prefix = "document:".into();
+    let document_embedder = Embedder::new(legacy);
+    let document_profile = document_embedder.storage_identity().to_owned();
+    assert_ne!(query_profile, document_profile);
+    assert!(query_profile.starts_with("profile-v1:"));
+}
+
+#[test]
+fn payload_document_prefix_is_counted_in_exact_serialized_payload_limit() {
+    let server = PayloadServer::new(success);
+    let mut config = server.config(4096);
+    config.document_prefix = "документ:\"\\".into();
+    let embedder = Embedder::new(config.clone());
+    let texts = ["один", "два"];
+    let exact = embedder.serialize_request(&["документ:\"\\один", "документ:\"\\два"]).unwrap();
+    config.max_request_bytes = exact.len();
+    let embedder = Embedder::new(config.clone());
+    assert_eq!(embedder.batch_ranges(&texts, 10).unwrap(), vec![0..2]);
+    embedder.embed_batch(&texts).unwrap();
+    assert_eq!(server.requests()[0], exact);
+
+    config.max_request_bytes -= 1;
+    let embedder = Embedder::new(config);
+    assert_eq!(embedder.batch_ranges(&texts, 10).unwrap(), vec![0..1, 1..2]);
+    assert_eq!(
+        embedder.embed_batch(&texts).unwrap_err().embedding_failure().unwrap().code,
+        EmbeddingFailureCode::EmbeddingRequestTooLarge
+    );
+    assert_eq!(server.requests().len(), 1, "oversized serialized payload is refused locally");
+}
+
+#[test]
 fn payload_transport_singleton_empty_and_optional_envelope() {
     let server = PayloadServer::new(success);
     for (dim, provider) in [(None, None), (Some(3), Some("route".to_owned()))] {
@@ -183,6 +265,8 @@ fn payload_transport_alignment_and_safe_errors() {
     let responses = [
         "я".repeat(250),
         json!({"data":[{"index":0,"embedding":[1,2,3]},{"index":0,"embedding":[4,5,6]}]})
+            .to_string(),
+        json!({"data":[{"index":0,"embedding":[0,0,0]},{"index":1,"embedding":[4,5,6]}]})
             .to_string(),
         json!({"data":[{"index":0,"embedding":[1,2,3]},{"index":2,"embedding":[4,5,6]}]})
             .to_string(),

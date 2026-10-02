@@ -78,7 +78,8 @@ pub trait AnalysisProvider {
         for visible in self.visible_configurations(file_id) {
             if let Some(found) = visible.config.configuration.find_metadata_object(mdo_type, name) {
                 match &mut merged {
-                    Some(base) => base.apply_extension_overlay(found),
+                    Some(base) if found.adopts(base) => base.apply_extension_overlay(found),
+                    Some(base) => *base = found.clone(),
                     None => merged = Some(found.clone()),
                 }
             }
@@ -95,10 +96,17 @@ pub trait AnalysisProvider {
         file_id: FileId,
         name: &str,
     ) -> Option<Arc<bsl_metadata::CommonModule>> {
-        self.visible_configurations(file_id)
-            .into_iter()
-            .find_map(|visible| visible.config.configuration.find_common_module(name).cloned())
-            .map(Arc::new)
+        let mut merged: Option<bsl_metadata::CommonModule> = None;
+        for visible in self.visible_configurations(file_id) {
+            if let Some(found) = visible.config.configuration.find_common_module(name) {
+                match &mut merged {
+                    Some(base) if found.adopts(base) => base.apply_extension_overlay(found),
+                    Some(base) => *base = found.clone(),
+                    None => merged = Some(found.clone()),
+                }
+            }
+        }
+        merged.map(Arc::new)
     }
 
     /// The event subscription `name` visible to `file_id`. The default scans the
@@ -145,6 +153,28 @@ pub trait AnalysisProvider {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Every EventSubscription visible through the file's configuration chain.
+    /// Unlike `main_event_subscriptions`, this includes declarations owned by the
+    /// current extension and its dependencies.
+    fn visible_event_subscriptions(
+        &self,
+        file_id: FileId,
+    ) -> Vec<Arc<bsl_metadata::EventSubscription>> {
+        self.visible_configurations(file_id)
+            .into_iter()
+            .flat_map(|visible| {
+                visible
+                    .config
+                    .configuration
+                    .event_subscriptions()
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Main-configuration Role enumeration for diagnostics that scan declared

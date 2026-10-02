@@ -20,6 +20,7 @@ mod publish;
 mod resolved_view_search;
 mod resolver;
 mod store;
+mod token_policy;
 mod vector_persist;
 mod workspace_overlay;
 mod workspace_roots;
@@ -35,12 +36,13 @@ pub fn content_blake3(bytes: &[u8]) -> Vec<u8> {
 }
 pub use context::file_path_to_module_path;
 pub use document::{
-    semantic_key_for_indexed_document, semantic_text_for_indexed_document, Document,
+    prepare_file_documents, semantic_key_for_indexed_document, semantic_text_for_indexed_document,
+    Document,
 };
 pub use domain::{
     BaselineRef, BaselineSourceConfig, CorpusId, DocumentPath, ExternalBaselineBackend,
     ExternalBaselineConfig, FileOverlay, IndexedDocument, LexicalHit, OverlayChange, SearchOverlay,
-    SemanticHit, Snapshot, SnapshotId, SnapshotPublishMetadata, SnapshotPublishStats,
+    SemanticHit, Snapshot, SnapshotId, SnapshotPublishMetadata, SnapshotPublishStats, SourceSpan,
 };
 pub use embedder::{Embedder, EmbedderConfig};
 pub use engine::{
@@ -86,6 +88,7 @@ pub use publish::{
 pub use resolved_view_search::lexical_hits as lexical_hits_for_resolved_view;
 pub use resolver::{InMemoryResolvedViewResolver, ResolvedView};
 pub use store::{BaselineManifestRecord, ChunkInfo, Store, TextSearchResult};
+pub use token_policy::{TokenPolicy, SEGMENTATION_VERSION};
 pub use workspace_overlay::{
     BaselineHashMode, PublicationBaseline, PublishOutcome, RefreshPlan, WorkspaceOverlayStats,
 };

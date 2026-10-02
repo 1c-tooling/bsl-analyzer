@@ -183,9 +183,9 @@ pub use graph_db::{
 };
 pub use graph_query::{GraphDb, GraphDbContextProvider};
 pub use http::{serve_http, wildcard_allowed_hosts, MAX_HTTP_REQUEST_BODY_BYTES};
-pub use state::WorkspaceInitError;
 use state::WorkspaceSearchMode;
-pub use state::{OnecConnection, SharedState};
+pub use state::{resolve_embedding_token_profile_values, WorkspaceInitError};
+pub use state::{EmbeddingPrefixes, EmbeddingTokenProfile, OnecConnection, SharedState};
 pub use tools::platform::{
     build_reference_documents, reference_documents_fingerprint, REFERENCE_DOCUMENT_SCHEMA_VERSION,
 };
@@ -291,8 +291,8 @@ struct MetadataParams {
     object_name: Option<String>,
     /// `form`: managed-form name (optional; omit for the object's default form).
     form_name: Option<String>,
-    /// `tree` (filtered listing): output budget in tokens (~4 chars each); an over-budget
-    /// listing is truncated at a line boundary with a continuation note (default 6000).
+    /// `tree`/`object` in infobase mode: output budget in tokens (~4 UTF-8 bytes each)
+    /// for `content` and `structuredContent` together (default 6000).
     max_output_tokens: Option<usize>,
     /// Named live 1C connection for `mode=infobase` (optional).
     connection: Option<String>,
@@ -1216,6 +1216,7 @@ impl McpServer {
                         &meta_type,
                         p.name_mask,
                         p.max_items.unwrap_or(100),
+                        p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
                     )
                     .await
                 }
@@ -1227,6 +1228,7 @@ impl McpServer {
                         p.connection.as_deref(),
                         &object_type,
                         &object_name,
+                        p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
                     )
                     .await
                 }
@@ -3216,7 +3218,7 @@ mod surface_guards {
         assert_eq!(version_of_hits(&workspace, code), "#/$defs/SearchCodeSchemaVersion");
         assert_eq!(version_of_hits(&workspace, docs), "#/$defs/SearchSchemaVersion");
         assert_eq!(version_of_hits(&reference, code), "#/$defs/SearchSchemaVersion");
-        assert_eq!(workspace["$defs"]["SearchCodeSchemaVersion"]["enum"], serde_json::json!(["7"]));
+        assert_eq!(workspace["$defs"]["SearchCodeSchemaVersion"]["enum"], serde_json::json!(["8"]));
         assert_eq!(reference["$defs"]["SearchSchemaVersion"]["enum"], serde_json::json!(["6"]));
     }
 
@@ -4576,8 +4578,8 @@ mod tool_descriptions {
               - filter: `tree`: case-insensitive substring to narrow the returned tree (optional).
               - form_name: `form`: managed-form name (optional; omit for the object's default form).
               - max_items: `tree` in infobase mode: maximum returned objects (default 100, max 1000).
-              - max_output_tokens: `tree` (filtered listing): output budget in tokens (~4 chars each); an over-budget
-            listing is truncated at a line boundary with a continuation note (default 6000).
+              - max_output_tokens: `tree`/`object` in infobase mode: output budget in tokens (~4 UTF-8 bytes each)
+            for `content` and `structuredContent` together (default 6000).
               - meta_type: `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
               - mode: auto | source | infobase (default auto).
               - name_mask: `tree` in infobase mode: case-insensitive object name/synonym substring.
