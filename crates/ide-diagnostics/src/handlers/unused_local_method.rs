@@ -2,7 +2,6 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::utils::platform_event_handlers as peh;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
-use hir::AnnotationKind;
 use ide_db::TextRange;
 use rustc_hash::FxHashSet;
 use stdx::case::CaseExt;
@@ -235,15 +234,7 @@ fn check_method_unused(
 }
 
 fn has_extension_annotation(annotations: &[hir::Annotation]) -> bool {
-    annotations.iter().any(|ann| {
-        matches!(
-            ann.kind,
-            AnnotationKind::Before
-                | AnnotationKind::After
-                | AnnotationKind::Instead
-                | AnnotationKind::ChangeAndValidate
-        )
-    })
+    annotations.iter().any(|ann| ann.kind.is_interception())
 }
 
 fn is_attachable_method(name_lower: &str, prefixes: &[String]) -> bool {

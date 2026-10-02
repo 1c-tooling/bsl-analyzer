@@ -1,7 +1,6 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
-use hir::AnnotationKind;
 use stdx::case::CaseExt;
 use syntax::ast::{AstNode, FunctionDef, PreRegionDir, ProcedureDef};
 
@@ -58,12 +57,7 @@ fn check_for_module_type(
     let methods = item_tree.methods().collect::<Vec<_>>();
     if !methods.is_empty()
         && methods.iter().all(|method| {
-            method.annotations().iter().any(|annotation| {
-                matches!(
-                    annotation.kind,
-                    AnnotationKind::Before | AnnotationKind::After | AnnotationKind::Instead
-                )
-            })
+            method.annotations().iter().any(|annotation| annotation.kind.is_interception())
         })
     {
         return Vec::new();
@@ -169,6 +163,16 @@ mod tests {
 "#;
         let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn change_and_validate_only_module_does_not_need_an_exported_api() {
+        let code = r#"&ИзменениеИКонтроль("ОбработкаЗаполнения")
+Процедура Перехват()
+КонецПроцедуры
+"#;
+        let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]

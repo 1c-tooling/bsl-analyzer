@@ -5,7 +5,6 @@ use crate::utils::platform_event_handlers::{
 };
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 use bsl_metadata::traits::MdObject;
-use hir::AnnotationKind;
 use hir::{Expr, ModItem};
 use ide_db::TextRange;
 use rustc_hash::FxHashSet;
@@ -70,11 +69,9 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     for subscription in ctx.visible_event_subscriptions() {
         if let Some(handler) = subscription.parse_handler() {
-            if metadata
-                .common_module
-                .as_ref()
-                .is_some_and(|module| handler.module_name.eq_ignore_ascii_case(module.name()))
-                && !handler.method_name.is_empty()
+            if metadata.common_module.as_ref().is_some_and(|module| {
+                handler.module_name.fold_lower() == module.name().fold_lower()
+            }) && !handler.method_name.is_empty()
             {
                 fixed_signature_handlers.insert(handler.method_name.fold_lower());
             }
@@ -110,12 +107,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     for (local_id, _) in module_bodies.iter_bodies() {
         if item_tree.method(local_id).is_some_and(|method| {
-            method.annotations().iter().any(|annotation| {
-                matches!(
-                    annotation.kind,
-                    AnnotationKind::Before | AnnotationKind::After | AnnotationKind::Instead
-                )
-            })
+            method.annotations().iter().any(|annotation| annotation.kind.is_interception())
         }) {
             if let Some(name) = get_method_name(&item_tree, local_id) {
                 fixed_signature_handlers.insert(name.fold_lower());
@@ -759,7 +751,27 @@ EndProcedure
     }
 
     #[test]
+    fn change_and_validate_interception_keeps_the_original_signature() {
+        let code = r#"&ИзменениеИКонтроль("ЗаполнитьТовары")
+Процедура Расш1_ЗаполнитьТовары(Параметр, Отказ)
+    Вызов(Параметр);
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedParameters, expect![[r#""#]]);
+    }
+
+    #[test]
     fn event_subscription_handler_keeps_its_declared_signature() {
+        assert_event_subscription_handler_keeps_its_signature("CommonModule.Сервер.Обработчик");
+    }
+
+    #[test]
+    fn event_subscription_handler_module_name_ignores_cyrillic_case() {
+        assert_event_subscription_handler_keeps_its_signature("CommonModule.сервер.Обработчик");
+    }
+
+    fn assert_event_subscription_handler_keeps_its_signature(handler: &str) {
         use crate::test_utils::check_cfe_at_with_unreadable;
         use test_fixture::CfeFixtureBuilder;
 
@@ -776,11 +788,13 @@ EndProcedure
         std::fs::create_dir_all(&subscriptions).expect("create EventSubscriptions directory");
         std::fs::write(
             subscriptions.join("Подписка.xml"),
-            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
 <EventSubscription uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"><Properties>
 <Name>Подписка</Name><Source>Document.Документ1</Source><Event>BeforeWrite</Event>
-<Handler>CommonModule.Сервер.Обработчик</Handler>
-</Properties></EventSubscription></MetaDataObject>"#,
+<Handler>{handler}</Handler>
+</Properties></EventSubscription></MetaDataObject>"#
+            ),
         )
         .expect("write event subscription fixture");
 
