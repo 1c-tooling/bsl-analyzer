@@ -161,6 +161,7 @@ impl RequestDispatcher<'_> {
             diagnostics_config: self.global_state.diagnostics_config().clone(),
             position_encoding: self.global_state.position_encoding,
             supports_code_description: self.global_state.supports_code_description,
+            supports_diagnostic_tags: self.global_state.supports_diagnostic_tags,
             supports_insert_text_mode_adjust_indentation: self
                 .global_state
                 .supports_insert_text_mode_adjust_indentation,
@@ -642,6 +643,7 @@ mod tests {
             diagnostics_config: state.diagnostics_config().clone(),
             position_encoding: state.position_encoding,
             supports_code_description: state.supports_code_description,
+            supports_diagnostic_tags: state.supports_diagnostic_tags,
             supports_insert_text_mode_adjust_indentation: state
                 .supports_insert_text_mode_adjust_indentation,
             supports_workspace_edit_document_changes: state

@@ -1471,6 +1471,7 @@ pub fn handle_document_diagnostic(
         &ide_diagnostics,
         ctx.position_encoding,
         crate::lsp::to_proto::CodeDescriptions::from_client_support(ctx.supports_code_description),
+        ctx.supports_diagnostic_tags,
     );
 
     Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
@@ -1738,6 +1739,7 @@ fn workspace_report_item(
             crate::lsp::to_proto::CodeDescriptions::from_client_support(
                 ctx.supports_code_description,
             ),
+            ctx.supports_diagnostic_tags,
         );
         (result_id, Some(lsp))
     }));
@@ -2399,6 +2401,7 @@ mod tests {
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
             supports_code_description: state.supports_code_description,
+            supports_diagnostic_tags: state.supports_diagnostic_tags,
             diagnostics_baseline: std::sync::Arc::clone(&state.diagnostics_baseline),
             diagnostics_config: state.diagnostics_config.clone(),
             position_encoding: state.position_encoding,
@@ -2428,6 +2431,7 @@ mod tests {
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
             supports_code_description: state.supports_code_description,
+            supports_diagnostic_tags: state.supports_diagnostic_tags,
             diagnostics_baseline: std::sync::Arc::clone(&state.diagnostics_baseline),
             diagnostics_config: state.diagnostics_config.clone(),
             position_encoding: state.position_encoding,

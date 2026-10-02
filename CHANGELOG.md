@@ -231,6 +231,9 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
 - `UnusedParameters`/`UnusedLocalMethod`: в модуле объекта внешнего отчёта (ERF)
   `ПриКомпоновкеРезультата`/`OnComposeResult` — платформенное событие, поэтому
   его параметры и метод больше не считаются неиспользуемыми (github#101).
+- LSP: `Diagnostic.tags` отправляются с учётом `publishDiagnostics.tagSupport` —
+  массив фильтруется по объявленному клиентом `valueSet`, а без `tagSupport`
+  свойство не отправляется вовсе (github#95).
 
 ### Changed
 

@@ -204,6 +204,7 @@ fn build_batch_plan(state: &mut GlobalState) -> Option<WorkspaceBatchPlan> {
         workspace_root: state.workspace_root.clone(),
         position_encoding: state.position_encoding,
         supports_code_description: state.supports_code_description,
+        supports_diagnostic_tags: state.supports_diagnostic_tags,
         chunk_size,
         pool,
         next_chunk: 0,
@@ -230,6 +231,7 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
         file_paths,
         position_encoding,
         supports_code_description,
+        supports_diagnostic_tags,
         pool,
         chunk,
     ) = {
@@ -246,6 +248,7 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
             plan.file_paths.clone(),
             plan.position_encoding,
             plan.supports_code_description,
+            plan.supports_diagnostic_tags,
             plan.pool.clone(),
             chunk,
         )
@@ -272,6 +275,7 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
                     crate::lsp::to_proto::CodeDescriptions::from_client_support(
                         supports_code_description,
                     ),
+                    supports_diagnostic_tags,
                 ),
                 pool.as_deref(),
             )
@@ -342,10 +346,15 @@ fn compute_chunk(
     config: &DiagnosticsConfigInput,
     baseline: (&ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot, Option<&Path>),
     file_paths: &FrozenFilePaths,
-    // Согласованное с клиентом представление: кодировка позиций и то, принимает
-    // ли он `codeDescription`. Пара, а не два параметра, — обе величины приходят
-    // из одного рукопожатия и всегда передаются вместе.
-    projection: (PositionEncoding, crate::lsp::to_proto::CodeDescriptions),
+    // Согласованное с клиентом представление: кодировка позиций, приём
+    // `codeDescription` и множество принимаемых `Diagnostic.tags`. Тройка, а не
+    // отдельные параметры, — все величины приходят из одного рукопожатия и всегда
+    // передаются вместе.
+    projection: (
+        PositionEncoding,
+        crate::lsp::to_proto::CodeDescriptions,
+        crate::lsp::to_proto::ClientTags,
+    ),
     pool: Option<&rayon::ThreadPool>,
 ) -> Vec<WorkspaceBatchItem> {
     // Diagnostics — the heavy per-file work — run in parallel on the bounded pool when one
@@ -383,6 +392,7 @@ fn compute_chunk(
                     &diagnostics,
                     projection.0,
                     projection.1,
+                    projection.2,
                 );
                 (result_id, diagnostics)
             }));

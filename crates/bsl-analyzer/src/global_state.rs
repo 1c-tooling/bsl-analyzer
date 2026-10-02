@@ -18,6 +18,7 @@ use vfs::{loader, Vfs};
 
 use crate::analysis_host::AnalysisHost;
 use crate::call_hierarchy_index_state::CallHierarchyIndexState;
+use crate::lsp::to_proto::ClientTags;
 use crate::lsp::{PositionEncoding, Progress};
 use crate::mem_docs::MemDocs;
 use crate::task_pool;
@@ -185,6 +186,9 @@ pub struct WorkspaceBatchPlan {
     pub workspace_root: Option<PathBuf>,
     pub position_encoding: PositionEncoding,
     pub supports_code_description: bool,
+    /// Tags the client accepts (`tagSupport`), captured with the same handshake as
+    /// `supports_code_description`; the batch projects through the same rules.
+    pub supports_diagnostic_tags: ClientTags,
     pub chunk_size: usize,
     /// Bounded rayon pool (≈ `ncpu/2`) the chunk computes on, so the batch never saturates
     /// the cores interactive requests need. `None` if pool creation failed — the sweep
@@ -293,6 +297,10 @@ pub struct GlobalState {
     /// `Diagnostic.codeDescription`, so the standard's link may be attached as a
     /// property instead of travelling only inside the message.
     pub supports_code_description: bool,
+    /// Negotiated at `initialize`: which `Diagnostic.tags` the client accepts
+    /// (`publishDiagnostics.tagSupport`). `ClientTags::NONE` means the property is
+    /// not published at all.
+    pub supports_diagnostic_tags: ClientTags,
     /// Negotiated at `initialize`: whether the client honors versioned
     /// `WorkspaceEdit.documentChanges`. When it does, rename edits carry the open
     /// document's version so the client rejects them if the buffer moved on after
@@ -481,6 +489,7 @@ impl GlobalState {
             position_encoding: PositionEncoding::default(),
             supports_insert_text_mode_adjust_indentation: false,
             supports_code_description: false,
+            supports_diagnostic_tags: ClientTags::NONE,
             supports_workspace_edit_document_changes: false,
             pull_diagnostics_active: false,
             supports_workspace_diagnostic_refresh: false,
