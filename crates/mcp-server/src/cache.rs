@@ -108,6 +108,12 @@ impl WorkspaceCacheLayout {
         self.root.join("bsl-graph.pending.db")
     }
 
+    /// The file whose exclusive lock a builder holds while it prepares or installs the
+    /// replacement: a superseded owner's build can outlive its hold on the graph itself.
+    pub(crate) fn graph_candidate_lock_path(&self) -> PathBuf {
+        self.root.join("bsl-graph.replacement.lock")
+    }
+
     /// The file whose exclusive lock a process holds for as long as it may open the published
     /// graph. Never removed or renamed while in use.
     pub(crate) fn graph_access_lock_path(&self) -> PathBuf {

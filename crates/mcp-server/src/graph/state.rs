@@ -2713,6 +2713,15 @@ impl GraphState {
             self.ensure_loading();
             return FusedStartup::Standalone;
         }
+        // Every read below is read-only and cannot roll back a journal an interrupted patch
+        // left: unrecovered, the cached graph looks unreadable and the publication it carries
+        // looks absent. A journal that will not recover is the loader's to report.
+        if let Some(path) = self.graph_db_path() {
+            if super::snapshot::recover_hot_journal(&path).is_err() {
+                self.ensure_loading();
+                return FusedStartup::Standalone;
+            }
+        }
         if !self.try_begin_external_build() {
             // A concurrent path (e.g. a graph tool call) already owns the build; index
             // the search engine the normal way against whatever graph it produces.

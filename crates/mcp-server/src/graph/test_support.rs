@@ -8,6 +8,11 @@ use super::build::GRAPH_BUILD_BATCH;
 use super::state::lock_recover;
 use super::{GraphState, GraphStatus};
 
+/// Leave the graph's file unusable, as a failed replacement does, until a rebuild replaces it.
+pub(crate) fn mark_graph_unusable(graph: &GraphState, reason: &str) {
+    graph.store.mark_unusable(reason.to_owned());
+}
+
 pub(super) fn write(root: &Path, rel: &str, text: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();

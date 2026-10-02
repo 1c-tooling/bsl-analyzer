@@ -2004,6 +2004,11 @@ impl McpServer {
             };
         }
 
+        // Asked first: whatever else is wrong with the graph here, a superseded process answers
+        // only that its owner changed.
+        if superseded {
+            return Err(graph_refusal("owner_changed", crate::graph::SUPERSEDED_GRAPH_ERROR));
+        }
         if let Some(reason) = graph.unavailable_reason() {
             return Err(graph_refusal("graph_unavailable", reason));
         }
@@ -2028,9 +2033,6 @@ impl McpServer {
             }
         }
         match graph.status() {
-            _ if superseded => {
-                return Err(graph_refusal("owner_changed", crate::graph::SUPERSEDED_GRAPH_ERROR))
-            }
             GraphStatus::Disabled => {
                 return Err(McpError::invalid_params(
                     "graph is only available in the workspace profile",
@@ -4385,6 +4387,40 @@ mod graph_supersession_contract {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn references_misses_immediately_when_preopened_handles_are_busy() {
         assert_busy_graph_handler_returns_immediately(BusyGraphHandler::References).await;
+    }
+
+    /// A superseded process answers that its owner changed, whatever else is wrong with its
+    /// graph: the client is told to open a new session rather than that the graph is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_superseded_process_with_an_unusable_graph_says_its_owner_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        let graph = state.graph().clone();
+        graph.ensure_first_build();
+        crate::graph::test_support::wait_ready(&graph);
+        crate::graph::test_support::mark_graph_unusable(
+            &graph,
+            "graph unavailable: the file in place could not be opened; it is rebuilt",
+        );
+        let server = McpServer::new(McpProfile::Workspace, state);
+        let newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        assert!(graph.is_superseded());
+
+        let error = server
+            .graph(params("overview", None), tokio_util::sync::CancellationToken::new())
+            .await
+            .expect_err("a superseded process serves no graph");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["reason"].as_str()),
+            Some("owner_changed"),
+            "{error:?}"
+        );
+        newer.release();
+        server.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

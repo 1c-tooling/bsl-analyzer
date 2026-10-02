@@ -177,20 +177,20 @@ async fn superseded_backend_lifecycle() {
         assert!(tokio::time::Instant::now() < deadline, "backend never observed takeover");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    newer.shutdown();
-
+    // A superseded backend leaves with its client still connected: the session is closed for
+    // it rather than waited for.
+    tokio::time::timeout(Duration::from_secs(10), backend)
+        .await
+        .expect("superseded backend leaves without waiting for its session")
+        .expect("backend task joined")
+        .expect("backend exits cleanly");
     let mut schema = serde_json::Map::new();
     schema.insert("action".to_owned(), serde_json::Value::String("schema".to_owned()));
     client
         .call_tool(CallToolRequestParams::new("graph").with_arguments(schema))
         .await
-        .expect("owner release still cannot sever the active session");
-    client.cancel().await.ok();
-    tokio::time::timeout(Duration::from_secs(6), backend)
-        .await
-        .expect("terminal backend exits before its ten-second idle TTL")
-        .expect("backend task joined")
-        .expect("backend exits cleanly");
+        .expect_err("the backend closed the session it left");
+    newer.shutdown();
 
     let transient_src = TempDir::new().unwrap();
     let transient_root = transient_src.path().to_path_buf();

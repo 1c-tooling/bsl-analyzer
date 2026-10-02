@@ -9,18 +9,16 @@
 //! contexts: convergent, but wasteful, and each publish flickers the generation the other's
 //! clients see.
 //!
-//! The lease makes that ownership explicit and single. Every daemon claims it at startup under
-//! a file lock, taking a generation one above whatever it found, so the newest process owns the
-//! workspace and the ones it superseded stop writing derived caches — the right way round,
-//! since a client whose config or binary just changed is served by the newest daemon while the
-//! older ones drain. Ownership by claim order is enough: a daemon that outlives a config edit
-//! rebuilds against the live configuration like any other, so the generations do not disagree
-//! about what the workspace *is*, only about who writes it down.
+//! The lease makes that ownership explicit and single. A daemon claims it at startup under a
+//! file lock when the directory is free, its owner stopped reporting, or its owner is an older
+//! program: a newer version takes the workspace over, and the one it superseded stops writing
+//! derived caches. A live owner of the same version, or of a version this program cannot
+//! compare, keeps the workspace; the second daemon does not open the graph and says which
+//! process holds the directory, until that owner stops reporting.
 //!
-//! Losing the lease is not a failure. A superseded daemon keeps serving everything it already
-//! holds — its resident host, its published graph snapshot, its search index — and simply
-//! stops producing new derived state. Once its last session leaves it exits immediately
-//! instead of idling out, because a warm backend that may not write is worth little.
+//! A superseded daemon finishes the graph reads in flight, lets the graph file go, frees its
+//! endpoint and exits, whether or not clients are still connected: they get `owner_changed`
+//! and open a new session.
 //!
 //! What the lease deliberately does NOT gate is the search index's lexical side: chunks and
 //! FTS text. Both generations derive those from the same files, SQLite serializes the writes

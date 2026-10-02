@@ -274,13 +274,15 @@ impl GraphState {
         // Nothing below opens the graph file before this process holds its access lock. The
         // wait has no deadline: the previous owner lets go once its reads are done.
         if !self.acquire_graph_access(true) {
-            self.record_load_failure(
-                is_reload,
+            let failure = if self.lease_is_terminal() {
+                lost_workspace_failure(self)
+            } else {
                 LoadFailure::new(
                     LoadFailureReason::TransientRefusal,
                     "this process does not hold the graph file's access lock",
-                ),
-            );
+                )
+            };
+            self.record_load_failure(is_reload, failure);
             return;
         }
         // An interrupted writer's journal is finished by the new holder of the file before any
@@ -1212,13 +1214,15 @@ fn build_and_publish_scanned_inner(
             .map_err(|error| LoadFailure::new(LoadFailureReason::Superseded, error.to_string()))?;
         publication_base(&out_path)?
     };
-    let candidate = graph.cache().expect("workspace graph has cache layout").graph_candidate_path();
+    let cache = graph.cache().expect("workspace graph has cache layout");
+    let candidate = cache.graph_candidate_path();
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(LoadFailure::operation)?;
     }
+    let _candidate_lock = hold_candidate(graph, &cache.graph_candidate_lock_path())?;
     // A fused build streams the search chunks from its own parse pass, so only a build that
     // streams nothing may take a candidate prepared earlier instead of building.
-    let reusable = match inspect_candidate(&candidate, base.as_deref(), fp_pre) {
+    let reusable = match inspect_candidate(&candidate, base.as_deref(), fp_pre, pre.clean()) {
         CandidateState::Blocked(reason) => {
             tracing::error!(path = %candidate.display(), "{reason}");
             return Err(LoadFailure::new(LoadFailureReason::OperationError, reason));
@@ -1265,8 +1269,8 @@ fn build_and_publish_scanned_inner(
                      on, and the prepared replacement is installed again without rebuilding it"
                 );
                 if graph.stop.sleep(delay) || graph.lease_is_terminal() {
-                    return Err(LoadFailure::new(
-                        LoadFailureReason::TransientRefusal,
+                    return Err(left_before_installation(
+                        graph,
                         "the prepared graph replacement was not installed before this daemon left",
                     ));
                 }
@@ -1308,6 +1312,48 @@ fn build_and_publish_scanned_inner(
     })
 }
 
+/// Take the replacement for this build, waiting while another builder holds it. The access lock
+/// does not cover it: a superseded owner lets the graph go once its reads return, while its
+/// build may still be writing the replacement by path.
+fn hold_candidate(
+    graph: &GraphState,
+    lock_path: &Path,
+) -> Result<crate::workspace_lease::ExclusiveFileLock, LoadFailure> {
+    let mut warned = false;
+    loop {
+        if let Some(lock) = crate::workspace_lease::ExclusiveFileLock::try_acquire(lock_path)
+            .map_err(LoadFailure::operation)?
+        {
+            return Ok(lock);
+        }
+        if !warned {
+            warned = true;
+            tracing::info!(
+                path = %lock_path.display(),
+                "another builder still holds the graph replacement; waiting for it to let go"
+            );
+        }
+        if graph.stop.sleep(CANDIDATE_RETRY) || graph.lease_is_terminal() {
+            return Err(left_before_installation(
+                graph,
+                "the graph replacement was still held by another builder when this daemon left",
+            ));
+        }
+    }
+}
+
+/// Why a build gave up waiting: the workspace is lost for good, or the daemon is stopping.
+fn left_before_installation(graph: &GraphState, stopping: &str) -> LoadFailure {
+    if graph.lease_is_terminal() {
+        lost_workspace_failure(graph)
+    } else {
+        LoadFailure::new(LoadFailureReason::TransientRefusal, stopping)
+    }
+}
+
+/// How often a build waiting for the replacement another builder holds tries again.
+const CANDIDATE_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The module count a full publication covers, whether it was built now or earlier.
 struct GraphBuildModules {
     modules: usize,
@@ -1330,6 +1376,18 @@ const INSTALL_RETRY_LAST: std::time::Duration = std::time::Duration::from_secs(3
 struct CandidateMarker {
     format: u32,
     base: Option<String>,
+    /// Set once the replacement is stamped, checked and synced; its rows alone look finished
+    /// long before that.
+    #[serde(default)]
+    complete: bool,
+}
+
+fn write_candidate_marker(candidate: &Path, marker: &CandidateMarker) -> Result<(), LoadFailure> {
+    std::fs::write(
+        candidate_marker_path(candidate),
+        serde_json::to_string(marker).map_err(LoadFailure::operation)?,
+    )
+    .map_err(LoadFailure::operation)
 }
 
 fn candidate_marker_path(candidate: &Path) -> PathBuf {
@@ -1356,6 +1414,7 @@ fn inspect_candidate(
     candidate: &Path,
     base: Option<&str>,
     fp_now: crate::graph_db::GraphFp,
+    clean_now: bool,
 ) -> CandidateState {
     if !candidate.exists() {
         return CandidateState::Absent;
@@ -1382,7 +1441,12 @@ fn inspect_candidate(
             candidate.display()
         ));
     }
-    if marker.format != crate::graph_db::SCHEMA_VERSION || marker.base.as_deref() != base {
+    // An equal fingerprint over a walk that could not read everything proves nothing.
+    if marker.format != crate::graph_db::SCHEMA_VERSION
+        || marker.base.as_deref() != base
+        || !marker.complete
+        || !clean_now
+    {
         return CandidateState::Stale;
     }
     match GraphDb::open(candidate).and_then(|db| {
@@ -1413,13 +1477,12 @@ fn build_candidate(
     base: Option<&str>,
     fp_pre: crate::graph_db::GraphFp,
 ) -> Result<(usize, bool), LoadFailure> {
-    let marker =
-        CandidateMarker { format: crate::graph_db::SCHEMA_VERSION, base: base.map(str::to_owned) };
-    std::fs::write(
-        candidate_marker_path(candidate),
-        serde_json::to_string(&marker).map_err(LoadFailure::operation)?,
-    )
-    .map_err(LoadFailure::operation)?;
+    let mut marker = CandidateMarker {
+        format: crate::graph_db::SCHEMA_VERSION,
+        base: base.map(str::to_owned),
+        complete: false,
+    };
+    write_candidate_marker(candidate, &marker)?;
     let built_at = chrono::Utc::now().to_rfc3339();
     let meta = crate::graph_db::GraphMeta {
         revision: generation,
@@ -1496,6 +1559,8 @@ fn build_candidate(
     let file =
         std::fs::OpenOptions::new().write(true).open(candidate).map_err(LoadFailure::operation)?;
     file.sync_all().map_err(LoadFailure::operation)?;
+    marker.complete = true;
+    write_candidate_marker(candidate, &marker)?;
     crate::graph_db::record_candidate(file.metadata().map_err(LoadFailure::operation)?.len());
     Ok((summary.modules, force_stale))
 }
@@ -2491,12 +2556,84 @@ mod tests {
         let root = dir.path();
         sample_workspace(root);
         let format = crate::graph_db::SCHEMA_VERSION;
-        leave_a_candidate(root, Some(&format!(r#"{{"format":{format},"base":null}}"#)));
+        leave_a_candidate(
+            root,
+            Some(&format!(r#"{{"format":{format},"base":null,"complete":true}}"#)),
+        );
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
         wait_ready(&graph);
         assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0, "nothing was built");
         assert_eq!(graph.read(|snapshot| snapshot.generation()), Ok(7), "the one left is served");
+    }
+
+    /// A replacement another builder still holds — a superseded owner whose build outlived its
+    /// hold on the graph — is not touched until that builder lets it go.
+    #[test]
+    fn a_replacement_held_by_another_builder_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let candidate = graph_db_path(root).with_file_name("bsl-graph.pending.db");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        let held = crate::workspace_lease::ExclusiveFileLock::try_acquire(
+            &candidate.with_file_name("bsl-graph.replacement.lock"),
+        )
+        .unwrap()
+        .expect("nobody else holds the replacement");
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0, "nothing was built");
+        assert!(!candidate.exists(), "the held replacement is left alone");
+        drop(held);
+        wait_ready(&graph);
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1);
+    }
+
+    /// A replacement whose build stopped before it was checked and synced is built again,
+    /// however finished its rows look.
+    #[test]
+    fn an_unfinished_replacement_is_rebuilt_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let format = crate::graph_db::SCHEMA_VERSION;
+        leave_a_candidate(root, Some(&format!(r#"{{"format":{format},"base":null}}"#)));
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1, "it was built again");
+    }
+
+    /// A walk that could not read everything proves nothing by an equal fingerprint, so a
+    /// replacement left earlier is not installed on its word.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_is_not_reused_over_an_unclean_walk() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let hidden = root.join("CommonModules").join("Hidden");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&hidden).is_ok() {
+            // Privileged: nothing is unreadable to this process.
+            fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let format = crate::graph_db::SCHEMA_VERSION;
+        leave_a_candidate(
+            root,
+            Some(&format!(r#"{{"format":{format},"base":null,"complete":true}}"#)),
+        );
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let built = graph.full_builds_started.load(Ordering::SeqCst);
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(built, 1, "it was built again");
     }
 
     /// A replacement of this program's, prepared from another publication, is written over by
@@ -2759,6 +2896,30 @@ mod tests {
             "the outcome of a marks-sponsored build minted a primary retry budget",
         );
         lease.release();
+    }
+
+    /// A load attempted after the workspace was let go says the workspace was released, not
+    /// that the file is momentarily held elsewhere.
+    #[test]
+    fn a_load_after_the_workspace_was_released_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease.clone());
+        lease.release();
+        wait_until(&graph, "the file to be let go", || graph.released());
+
+        graph.run_load(false);
+
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(message) if message.contains("released")),
+            "{:?}",
+            graph.status()
+        );
     }
 
     /// A claim nobody will build on is given back.
@@ -3661,6 +3822,52 @@ mod tests {
             .unwrap();
         assert_eq!(junk, 0, "nothing of the interrupted write is left");
         assert!(crate::graph_query::GraphDb::open(&db).unwrap().quick_check().is_ok());
+    }
+
+    /// The boot recovers a journal an interrupted patch left before it inspects the cached
+    /// graph: the cache is served at once instead of looking unreadable.
+    #[test]
+    fn the_boot_recovers_a_hot_journal_before_serving_the_cache() {
+        const TEST: &str =
+            "graph::build::tests::the_boot_recovers_a_hot_journal_before_serving_the_cache";
+        if let Some(root) = patch_child_workspace("BOOT") {
+            let fixture = patch_fixture(&root);
+            let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+            conn.query_row("PRAGMA journal_mode = PERSIST", [], |r| r.get::<_, String>(0)).unwrap();
+            conn.execute_batch("PRAGMA cache_size = 10; BEGIN IMMEDIATE;").unwrap();
+            conn.execute_batch(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 20000)
+                 INSERT INTO meta (key, value) SELECT 'junk' || x, randomblob(1000) FROM c;",
+            )
+            .unwrap();
+            announce_and_wait(&fixture.db.display().to_string());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (child, db) = spawn_patch_child(TEST, "BOOT", dir.path());
+        kill(child);
+        let mut journal = PathBuf::from(&db).into_os_string();
+        journal.push("-journal");
+        assert!(
+            fs::metadata(Path::new(&journal)).is_ok_and(|journal| journal.len() > 0),
+            "the crash left a journal to recover"
+        );
+
+        let root = dir.path();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        let mut engine = bsl_search::SearchEngine::fts_only(&cache.search_db_path()).unwrap();
+        graph.start_workspace_graph(&mut engine, root);
+
+        assert!(
+            matches!(graph.status(), GraphStatus::Ready { .. }),
+            "the cached graph is served by the boot itself: {:?}",
+            graph.status()
+        );
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0, "nothing was rebuilt");
+        // The catch-up the stale cache owes runs on; it ends before the workspace goes away.
+        wait_until(&graph, "the catch-up to finish", || !graph.build_in_flight());
+        wait_ready(&graph);
     }
 
     /// A process that dies after the commit leaves the new publication whole: nothing is rolled
