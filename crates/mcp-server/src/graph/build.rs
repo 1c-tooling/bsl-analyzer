@@ -1382,12 +1382,14 @@ struct CandidateMarker {
     complete: bool,
 }
 
+/// Replaced by a rename, never rewritten in place: a marker torn by a crash would read as one of
+/// unknown origin and block every later build.
 fn write_candidate_marker(candidate: &Path, marker: &CandidateMarker) -> Result<(), LoadFailure> {
-    std::fs::write(
-        candidate_marker_path(candidate),
-        serde_json::to_string(marker).map_err(LoadFailure::operation)?,
-    )
-    .map_err(LoadFailure::operation)
+    let path = candidate_marker_path(candidate);
+    let staged = path.with_extension("owner.tmp");
+    std::fs::write(&staged, serde_json::to_string(marker).map_err(LoadFailure::operation)?)
+        .map_err(LoadFailure::operation)?;
+    std::fs::rename(&staged, &path).map_err(LoadFailure::operation)
 }
 
 fn candidate_marker_path(candidate: &Path) -> PathBuf {
