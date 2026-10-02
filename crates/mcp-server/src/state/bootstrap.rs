@@ -1335,7 +1335,7 @@ impl SharedState {
         // parameter (litellm's `UnsupportedParamsError` among them) answer only then.
         // An explicit width still wins and doubles as the expectation for the response,
         // so the index is never built for a width nobody declared.
-        let dim = Self::declared_embedding_dim()?;
+        let dim = bsl_search::EmbedderConfig::dim_from_env()?;
         // Background index/embedding workers otherwise saturate every core and starve interactive
         // `search_code` for tens of seconds during the one-time build. Default to leaving two cores
         // free for queries; an explicit EMBEDDING_CONCURRENCY still wins (operators who want max
@@ -1379,28 +1379,6 @@ impl SharedState {
                     .unwrap_or(20),
             },
         }))
-    }
-
-    /// `EMBEDDING_DIM` as declared: `None` means "unset — the request omits
-    /// `dimensions` and the model answers in its native width". A set-but-unusable
-    /// value is a configuration error rather than a silent fallback: now that the
-    /// field is optional, a typo must not quietly choose the width the index is
-    /// built for.
-    fn declared_embedding_dim() -> Result<Option<usize>, SearchError> {
-        fn invalid() -> SearchError {
-            bsl_search::EmbeddingFailure::new(
-                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
-            )
-            .into()
-        }
-        match std::env::var("EMBEDDING_DIM") {
-            Ok(value) => match value.parse::<usize>().ok().filter(|dim| *dim > 0) {
-                Some(dim) => Ok(Some(dim)),
-                None => Err(invalid()),
-            },
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(invalid()),
-        }
     }
 
     fn embedding_publish_retry_budget() -> std::time::Duration {

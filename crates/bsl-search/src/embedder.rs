@@ -53,6 +53,27 @@ impl EmbedderConfig {
         }
     }
 
+    /// `EMBEDDING_DIM` as declared. `None` means unset: the request omits `dimensions`
+    /// and the model answers in its native width. A set-but-unusable value is a
+    /// configuration error rather than a silent fallback, since a typo must not quietly
+    /// choose the width the index is built for.
+    pub fn dim_from_env() -> Result<Option<usize>, SearchError> {
+        match std::env::var("EMBEDDING_DIM") {
+            Ok(value) => Self::parse_dim(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse_dim(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(invalid_config()),
+        }
+    }
+
+    fn parse_dim(value: Option<&str>) -> Result<Option<usize>, SearchError> {
+        match value {
+            None => Ok(None),
+            Some(value) => {
+                value.parse::<usize>().ok().filter(|n| *n > 0).map(Some).ok_or_else(invalid_config)
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), SearchError> {
         if self.max_request_bytes == 0 {
             Err(invalid_config())
@@ -589,6 +610,12 @@ mod tests {
         assert_eq!(EmbedderConfig::parse_request_bytes(Some("73")).unwrap(), 73);
         for value in ["0", "", "-1", "not-a-number", "184467440737095516160"] {
             let error = EmbedderConfig::parse_request_bytes(Some(value)).unwrap_err();
+            assert_eq!(error.to_string(), "embedding_invalid_config");
+        }
+        assert_eq!(EmbedderConfig::parse_dim(None).unwrap(), None);
+        assert_eq!(EmbedderConfig::parse_dim(Some("7")).unwrap(), Some(7));
+        for value in ["0", "", " 7", "-1", "seven", "184467440737095516160"] {
+            let error = EmbedderConfig::parse_dim(Some(value)).unwrap_err();
             assert_eq!(error.to_string(), "embedding_invalid_config");
         }
         let embedder = Embedder::new(EmbedderConfig { max_request_bytes: 0, ..Default::default() });
