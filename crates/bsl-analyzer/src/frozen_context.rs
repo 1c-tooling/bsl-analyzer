@@ -100,6 +100,9 @@ pub struct LatencyRequestContext {
     /// Whether the client honors versioned `WorkspaceEdit.documentChanges`, so the
     /// rename handler can attach open-document versions to its edits.
     pub supports_workspace_edit_document_changes: bool,
+    /// The client's `rangeLimit` for folding ranges, if it named one; an
+    /// over-long `textDocument/foldingRange` response is truncated to it.
+    pub folding_range_limit: Option<u32>,
     pub task_sender: Sender<Task>,
     pub call_hierarchy_index: CallHierarchyIndexState,
     pub call_hierarchy_wait_policy: CallHierarchyWaitPolicy,

@@ -5,7 +5,8 @@ use vfs::FileId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldingRange {
-    pub range: TextRange,
+    pub start_line: u32,
+    pub end_line: u32,
     pub kind: Option<FoldingRangeKind>,
 }
 
@@ -28,8 +29,8 @@ pub fn folding_ranges<DB: RootDatabase>(db: &DB, file_id: FileId) -> Vec<Folding
     collect_syntax_ranges(&root, &line_index, &mut ranges);
     collect_comment_ranges(&root, &line_index, &mut ranges);
 
-    ranges.sort_by_key(|range| (range.range.start(), range.range.end()));
-    ranges.dedup_by_key(|range| (range.range.start(), range.range.end(), range.kind));
+    ranges.sort_by_key(|range| (range.start_line, range.end_line));
+    ranges.dedup_by_key(|range| (range.start_line, range.end_line, range.kind));
     ranges
 }
 
@@ -104,12 +105,13 @@ fn push_multiline_range(
     range: TextRange,
     kind: Option<FoldingRangeKind>,
 ) {
-    if folding_lines(line_index, range).is_none() {
-        return;
+    if let Some((start_line, end_line)) = folding_lines(line_index, range) {
+        ranges.push(FoldingRange { start_line, end_line, kind });
     }
-    ranges.push(FoldingRange { range, kind });
 }
 
+/// Единственная проекция диапазона в пару строк: наружу уезжают уже готовые
+/// номера, чтобы второй расчёт по другому тексту не мог с ними разойтись.
 fn folding_lines(line_index: &LineIndex, range: TextRange) -> Option<(u32, u32)> {
     if range.is_empty() {
         return None;
@@ -142,13 +144,9 @@ mod tests {
 
     fn ranges_by_lines(code: &str) -> Vec<(u32, u32, Option<FoldingRangeKind>)> {
         let (db, file_id) = setup_db(code);
-        let line_index = LineIndex::new(code);
         folding_ranges(&db, file_id)
             .into_iter()
-            .filter_map(|range| {
-                let (start, end) = folding_lines(&line_index, range.range)?;
-                Some((start, end, range.kind))
-            })
+            .map(|range| (range.start_line, range.end_line, range.kind))
             .collect()
     }
 

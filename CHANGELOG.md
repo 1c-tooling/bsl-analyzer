@@ -249,6 +249,10 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
   (индекс строится на 1024; модели другой ширины требуют явного `EMBEDDING_DIM`)
   (github#124). Значение, заданное, но негодное, теперь даёт отказ
   `embedding_invalid_config`, а не молчаливую подмену.
+- LSP `textDocument/foldingRange`: ответ урезается по `rangeLimit` клиента —
+  первыми уходят самые глубоко вложенные складки, при равной глубине самые
+  короткие — а номера строк считаются один раз, в `ide`, вместо второй проекции
+  через индекс открытого буфера (github#56, github#55).
 
 ### Changed
 
