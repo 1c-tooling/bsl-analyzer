@@ -408,10 +408,19 @@ mod tests {
 
     #[test]
     fn promotion_merges_base_and_extension_predefined_items() {
+        use bsl_metadata::ObjectBelonging;
+
         let mut main = Configuration::new("Main");
-        main.add_metadata_object(catalog("Валюты", vec!["Доллар"]));
+        let base_uuid = uuid::Uuid::new_v4();
+        let mut base_catalog = catalog("Валюты", vec!["Доллар"]);
+        base_catalog.set_uuid(base_uuid);
+        main.add_metadata_object(base_catalog);
+
         let mut ext = Configuration::new("Ext");
-        ext.add_metadata_object(catalog("Валюты", vec!["Евро"]));
+        let mut adopted_catalog = catalog("Валюты", vec!["Евро"]);
+        adopted_catalog.set_object_belonging(ObjectBelonging::Adopted);
+        adopted_catalog.set_extends_uuid(base_uuid);
+        ext.add_metadata_object(adopted_catalog);
         let configs = vec![
             VisibleConfig { name: None, configuration: Arc::new(main) },
             VisibleConfig { name: Some("Ext".into()), configuration: Arc::new(ext) },

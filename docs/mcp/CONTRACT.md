@@ -103,6 +103,9 @@ uri: bsl-analyzer://contract
 
 Пояснения к полям:
 
+- В контракте `3.2` `metadata` сохраняет прежние поля live object, добавляет `completeness` и `truncated`
+  в `schema_version="2"`; live `tree` и `object` учитывают `max_output_tokens` для `content` и
+  `structuredContent` вместе.
 - В контракте `3.3` `search` публикует `output_schema_version="9"` в workspace и `"7"` в reference,
   `syntax_help` — `"2"`, `symbol_info` — `"1"`. `syntax_help` и справочные
   действия `search(action=find_docs|search_docs|list_platform|status)` доступны
@@ -207,7 +210,7 @@ uri: bsl-analyzer://contract
 
 ```python
 major, minor = contract["contract_version"].split(".")
-assert major == "3" and int(minor) >= 1
+assert major == "3" and int(minor) >= 2
 ```
 
 `build_version` остаётся в документе, но для feature-detection он не нужен —

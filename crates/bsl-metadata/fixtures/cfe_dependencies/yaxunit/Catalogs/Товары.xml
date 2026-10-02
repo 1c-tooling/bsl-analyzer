@@ -2,7 +2,9 @@
 <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core">
 	<Catalog uuid="ec000004-0002-0000-0000-000000000004">
 		<Properties>
+			<ObjectBelonging>Adopted</ObjectBelonging>
 			<Name>Товары</Name>
+			<ExtendedConfigurationObject>ec000003-0002-0000-0000-000000000003</ExtendedConfigurationObject>
 			<Synonym/>
 			<Comment/>
 		</Properties>

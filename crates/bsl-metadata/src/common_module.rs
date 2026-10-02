@@ -21,6 +21,9 @@ pub struct CommonModule {
     #[serde(rename = "objectBelonging", default)]
     object_belonging: ObjectBelonging,
 
+    #[serde(rename = "extendedConfigurationObject", default)]
+    extended_configuration_object: Option<Uuid>,
+
     #[serde(rename = "supportVariant", default)]
     support_variant: SupportVariant,
 
@@ -59,6 +62,24 @@ impl CommonModule {
 
     pub fn return_values_reuse(&self) -> ReturnValueReuse {
         self.return_values_reuse
+    }
+
+    pub fn extends_uuid(&self) -> Option<&Uuid> {
+        self.extended_configuration_object.as_ref()
+    }
+
+    /// Apply an adopted extension's explicit properties to the base module.
+    /// `Unknown` represents an omitted `ReturnValuesReuse` in the extension XML.
+    pub fn apply_extension_overlay(&mut self, overlay: &CommonModule) {
+        if overlay.return_values_reuse != ReturnValueReuse::Unknown {
+            self.return_values_reuse = overlay.return_values_reuse;
+        }
+    }
+
+    pub fn adopts(&self, base: &CommonModule) -> bool {
+        self.object_belonging == ObjectBelonging::Adopted
+            && self.name.eq_ignore_ascii_case(&base.name)
+            && Some(&base.uuid) == self.extends_uuid()
     }
 
     pub fn is_server(&self) -> bool {
@@ -147,6 +168,7 @@ pub struct CommonModuleBuilder {
     comment: Option<String>,
     uri: Option<String>,
     object_belonging: ObjectBelonging,
+    extended_configuration_object: Option<Uuid>,
     support_variant: SupportVariant,
     protected: bool,
     server: bool,
@@ -182,6 +204,21 @@ impl CommonModuleBuilder {
 
     pub fn return_values_reuse(mut self, reuse: ReturnValueReuse) -> Self {
         self.return_values_reuse = reuse;
+        self
+    }
+
+    pub fn object_belonging(mut self, belonging: ObjectBelonging) -> Self {
+        self.object_belonging = belonging;
+        self
+    }
+
+    pub fn extends_uuid(mut self, uuid: Uuid) -> Self {
+        self.extended_configuration_object = Some(uuid);
+        self
+    }
+
+    pub fn extended_configuration_object(mut self, uuid: Option<Uuid>) -> Self {
+        self.extended_configuration_object = uuid;
         self
     }
 
@@ -232,6 +269,7 @@ impl CommonModuleBuilder {
             comment: self.comment,
             uri: self.uri,
             object_belonging: self.object_belonging,
+            extended_configuration_object: self.extended_configuration_object,
             support_variant: self.support_variant,
             protected: self.protected,
             server: self.server,

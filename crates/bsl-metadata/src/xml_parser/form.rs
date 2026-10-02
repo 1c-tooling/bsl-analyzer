@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(form.attributes().len(), 2);
         assert_eq!(
             form.find_attribute("Странный").unwrap().attr_type,
-            crate::metadata_object::AttributeType::Unknown
+            crate::metadata_object::AttributeType::UnknownNamed("cfg:NoSuchKind.X".into())
         );
         assert_eq!(
             form.find_attribute("Пустой").unwrap().attr_type,

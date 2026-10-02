@@ -69,7 +69,9 @@
 `list_platform` имеет версию `1`; `status` обоих профилей имеет версию `4` и форму
 `{action:"status",schema_version:"4",profile,state,indexing}` с необязательными
 `semantic_failure` и `embedding_profile`; профиль содержит `wire_model`, `storage_identity`
-и `dimension`. `state` — `ready|loading|busy|failed`. Машинный контракт имеет версию `3.3`. `syntax_help` имеет версию `2`, а все успешные варианты
+и `dimension`. `state` — `ready|loading|busy|failed`. Машинный контракт имеет версию `3.3`. `metadata` live object возвращает `schema_version="2"`
+с `completeness` и `truncated`; live `tree` и `object` учитывают общий `max_output_tokens`.
+`syntax_help` имеет версию `2`, а все успешные варианты
 `symbol_info`, включая transient `status="loading"`, — версию `1`.
 
 Справочный индекс проходит состояния `Uninitialized → Loading → Ready` либо `Failed`.
@@ -1122,6 +1124,30 @@ bsl-analyzer mcp serve --profile reference
 неверная форма возвращает ошибку live-сервиса. Действие `form` доступно только для
 source-пути.
 
+Примеры аргументов MCP-вызова `metadata`:
+
+```json tool=none
+{"action":"object","mode":"source","object_type":"Справочник","object_name":"Товары"}
+```
+
+```json tool=none
+{"action":"object","mode":"infobase","connection":"live","object_type":"Справочники","object_name":"Товары","max_output_tokens":700}
+```
+
+```json tool=none
+{"action":"tree","mode":"infobase","connection":"live","meta_type":"Справочники","max_items":100,"max_output_tokens":700}
+```
+
+Первый пример читает workspace source; два остальных передают collection type
+как его принимает HTTP producer. Live-бюджет ограничивает сумму сериализованных
+`content` и `structuredContent`.
+
+Live-карточка объекта с `schema_version=2` требует HTTP producer не ниже `1.2.0`:
+он возвращает варианты типов и реквизиты табличных частей. Проверьте именно
+`/version` после публикации; версия HTTP-сервиса отличается от версии расширения
+в `Configuration.xml` (для этого producer — `1.1.0`). Со старым producer клиент
+сохранит прежние поля и явно пометит недоступные типы или состав табличных частей.
+
 ### 1. Экспортируйте расширение
 
 ```bash
@@ -1160,7 +1186,7 @@ curl http://localhost/base/hs/bsl-analyzer/version
 Ожидаемый ответ:
 
 ```json tool=none
-{"version":"1.1.0"}
+{"version":"1.2.0"}
 ```
 
 ### 6. Запустите `workspace`-профиль с подключением
@@ -1178,7 +1204,10 @@ bsl-analyzer mcp serve \
 
 Расширение продолжает отдавать legacy-поле `type` и добавляет сырой массив
 `typeVariants`; MCP нормализует его в `type_variants` с `technical_name`, `presentation`,
-`resolution` и необязательным `reason`. Неизвестные будущие поля игнорируются, а
+`resolution` и необязательным `reason`. Producer HTTP `1.2.0` также передаёт
+`attributes` у каждой табличной части; live object использует `schema_version="2"`
+и сообщает причины неполноты. Версия расширения в `Configuration.xml` — `1.1.0`.
+Неизвестные будущие поля игнорируются, а
 неподдерживаемый технический тип остаётся явным unresolved-вариантом.
 
 Rollout выполняется строго последовательно:
@@ -1186,8 +1215,9 @@ Rollout выполняется строго последовательно:
 1. Остановить и дождаться завершения всех старых процессов, способных писать derived
    search cache. Одновременные writers разных версий запрещены.
 2. Запустить новый бинарник и дождаться публикации его нового engine/cache.
-3. Только затем установить новое расширение 1С и проверить raw `typeVariants`,
-   нормализованный `metadata object`, BA-007 и BA-010.
+3. Только затем установить новое расширение 1С и проверить `/version` (`1.2.0`),
+   raw `typeVariants` и табличные `attributes`, нормализованный `metadata object`,
+   BA-007 и BA-010.
 
 Rollback также не смешивает writers:
 

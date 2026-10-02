@@ -175,6 +175,17 @@ impl AnalysisProvider for SalsaProvider<'_> {
         file_id: FileId,
     ) -> Vec<Arc<bsl_metadata::EventSubscription>> {
         self.db
+            .main_event_subscription_names_for_file(file_id)
+            .into_iter()
+            .filter_map(|name| self.db.resolve_event_subscription(file_id, &name))
+            .collect()
+    }
+
+    fn visible_event_subscriptions(
+        &self,
+        file_id: FileId,
+    ) -> Vec<Arc<bsl_metadata::EventSubscription>> {
+        self.db
             .event_subscription_names(file_id)
             .into_iter()
             .filter_map(|name| self.db.resolve_event_subscription(file_id, &name))

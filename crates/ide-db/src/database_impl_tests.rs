@@ -2479,6 +2479,7 @@ fn sdbl_hir_for_extension_file_uses_base_configuration_standard_attributes() {
     <Catalog uuid="00000000-0000-0000-0000-000000000002">
         <Properties>
             <ObjectBelonging>Adopted</ObjectBelonging>
+            <ExtendedConfigurationObject>00000000-0000-0000-0000-000000000001</ExtendedConfigurationObject>
             <Name>Номенклатура</Name>
         </Properties>
     </Catalog>
@@ -6081,8 +6082,8 @@ fn ba010_effective_module_variables_resolve_for_object_and_manager_facets() {
     use hir::{Builders, HirDatabase, InferenceDiagnostic, MetadataKind, Name};
     use hir_ty::{lookup_field, lookup_manager_field, DbObjectResolver};
 
-    const BASE_OBJECT: &str = "Перем БазоваяОбъекта Экспорт;";
-    const EARLY_OBJECT: &str = "Перем РанняяОбъекта Экспорт;";
+    const BASE_OBJECT: &str = "Перем БазоваяОбъекта Экспорт; Перем ПриватнаяБазоваяОбъекта;";
+    const EARLY_OBJECT: &str = "Перем РанняяОбъекта Экспорт; Перем ПриватнаяРанняяОбъекта;";
     const LATE_OBJECT: &str = r#"
 Перем ПоздняяОбъекта Экспорт;
 Процедура Проверка()
@@ -6141,6 +6142,13 @@ fn ba010_effective_module_variables_resolve_for_object_and_manager_facets() {
             "late object facet must see {name}"
         );
     }
+    for name in ["ПриватнаяБазоваяОбъекта", "ПриватнаяРанняяОбъекта"]
+    {
+        assert!(
+            lookup_field(&db, &late_object_resolver, object_ty, &Name::new(name)).is_none(),
+            "non-exported object-module variable must stay private: {name}"
+        );
+    }
     assert!(
         lookup_field(
             &db,
@@ -6150,6 +6158,16 @@ fn ba010_effective_module_variables_resolve_for_object_and_manager_facets() {
         )
         .is_none(),
         "base object facet must not see an extension variable"
+    );
+    assert!(
+        lookup_field(
+            &db,
+            &DbObjectResolver::new(&db, FileId(0)),
+            object_ty,
+            &Name::new("ПриватнаяБазоваяОбъекта"),
+        )
+        .is_none(),
+        "non-exported base object-module variable stays private too"
     );
 
     let manager_ty = db.object_manager(MdoType::Catalog, "Товары".to_string(), &RootConfigCtx);
@@ -6185,6 +6203,73 @@ fn ba010_effective_module_variables_resolve_for_object_and_manager_facets() {
         })
         .collect();
     assert!(unresolved.is_empty(), "BA-010 false UnresolvedField: {unresolved:?}");
+}
+
+#[test]
+fn ba021_module_exports_follow_the_callers_extension_visibility_chain() {
+    use crate::effective_exports::{effective_module_exports_query, EffectiveModuleRole};
+    use crate::metadata::WorkspaceConfigsSnapshot;
+    use bsl_metadata::MdoType;
+
+    let roots = ["/base", "/dependency", "/consumer", "/unrelated"];
+    let paths: Vec<(Option<String>, std::path::PathBuf)> = vec![
+        (None, roots[0].into()),
+        (Some("Зависимость".to_string()), roots[1].into()),
+        (Some("Потребитель".to_string()), roots[2].into()),
+        (Some("Стороннее".to_string()), roots[3].into()),
+    ];
+    let mut db = RootDatabaseImpl::new();
+    db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+        canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
+        kinds: paths
+            .iter()
+            .map(|(label, _)| if label.is_none() { RootKind::Base } else { RootKind::Extension })
+            .collect(),
+        paths,
+        closures: vec![vec![], vec![], vec![1], vec![]],
+        topological_order: vec![0, 1, 2, 3],
+        fingerprint: Some("ba021-visibility".to_string()),
+    });
+
+    let source = [
+        "Процедура База() Экспорт\nКонецПроцедуры",
+        "Процедура ИзЗависимости() Экспорт\nКонецПроцедуры",
+        "Процедура Вызов()\n    Товары.ИзЗависимости();\nКонецПроцедуры",
+        "Процедура СтороннийЭкспорт() Экспорт\nКонецПроцедуры",
+    ];
+    let mut file_set = FileSet::new();
+    let mut caller = FileId(0);
+    for (index, root) in roots.iter().enumerate() {
+        let file = FileId(index as u32);
+        if index == 2 {
+            caller = file;
+        }
+        file_set.insert(file, VfsPath::new(format!("{root}/Catalogs/Товары/Ext/ObjectModule.bsl")));
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (index, text) in source.into_iter().enumerate() {
+        let file = FileId(index as u32);
+        db.set_file_source_root(file, SourceRootId(0));
+        db.set_file_text(file, text);
+    }
+
+    let exports = effective_module_exports_query(
+        &db,
+        SourceRootId(0),
+        Some(caller),
+        EffectiveModuleRole::Object,
+        MdoType::Catalog,
+        "Товары".to_string(),
+        None,
+    );
+    let names =
+        exports.methods.iter().map(|method| method.method.name.as_str()).collect::<Vec<_>>();
+    assert!(names.contains(&"База"), "base exports remain visible: {names:?}");
+    assert!(names.contains(&"ИзЗависимости"), "explicit dependency exports resolve: {names:?}");
+    assert!(
+        !names.contains(&"СтороннийЭкспорт"),
+        "unrelated installed extension stays invisible: {names:?}"
+    );
 }
 
 /// A register kind reached through the root-scoped resolver: an extension-only register is

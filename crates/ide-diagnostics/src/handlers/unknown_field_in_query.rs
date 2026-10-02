@@ -94,6 +94,50 @@ mod tests {
         expected.assert_eq(&format_diags(&code, &diagnostics));
     }
 
+    fn adopted_document_query(query_body: &str) -> Vec<crate::Diagnostic> {
+        use crate::test_utils::check_cfe_at_with_unreadable;
+        use test_fixture::CfeFixtureBuilder;
+
+        const BASE_UUID: &str = "11111111-1111-1111-1111-111111111111";
+        const EXT_UUID: &str = "22222222-2222-2222-2222-222222222222";
+        let base_xml = format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+<Document uuid="{BASE_UUID}"><Properties><Name>Документ1</Name></Properties><ChildObjects>
+<TabularSection uuid="33333333-3333-3333-3333-333333333333"><Properties><Name>Товары</Name></Properties><ChildObjects>
+<Attribute uuid="44444444-4444-4444-4444-444444444444"><Properties><Name>БазовоеПоле</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute>
+</ChildObjects></TabularSection></ChildObjects></Document></MetaDataObject>"#
+        );
+        let extension_xml = format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+<Document uuid="{EXT_UUID}"><Properties><Name>Документ1</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>{BASE_UUID}</ExtendedConfigurationObject></Properties><ChildObjects>
+<TabularSection uuid="55555555-5555-5555-5555-555555555555"><Properties><Name>Товары</Name></Properties><ChildObjects>
+<Attribute uuid="66666666-6666-6666-6666-666666666666"><Properties><Name>ДобавленноеПоле</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute>
+</ChildObjects></TabularSection></ChildObjects></Document></MetaDataObject>"#
+        );
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_extension("Расширение", "");
+        let fixture = builder.build();
+        let base_documents = fixture.root().join("Documents");
+        let extension_documents = fixture.extensions()[0].root().join("Documents");
+        std::fs::create_dir_all(&base_documents).expect("create base Documents");
+        std::fs::create_dir_all(&extension_documents).expect("create extension Documents");
+        std::fs::write(base_documents.join("Документ1.xml"), base_xml)
+            .expect("write base document metadata");
+        std::fs::write(extension_documents.join("Документ1.xml"), extension_xml)
+            .expect("write extension document metadata");
+
+        let source = format!(
+            "Процедура Проверка()\n    Запрос = Новый Запрос;\n    Запрос.Текст = \"{query_body}\";\nКонецПроцедуры"
+        );
+        check_cfe_at_with_unreadable(
+            "Documents/Документ1/Ext/ManagerModule.bsl",
+            &source,
+            fixture,
+            &[],
+            check,
+        )
+    }
+
     #[test]
     fn positive_unknown_field_on_register() {
         check_with_designer(
@@ -111,6 +155,27 @@ mod tests {
             "ВЫБРАТЬ Т.Справочник1 ИЗ РегистрСведений.РегистрСведений1 КАК Т",
             expect![[r#""#]],
         );
+    }
+
+    #[test]
+    fn adopted_document_query_keeps_base_and_added_tabular_fields() {
+        let diagnostics = adopted_document_query(
+            "ВЫБРАТЬ Т.БазовоеПоле, Т.ДобавленноеПоле ИЗ Документ.Документ1.Товары КАК Т",
+        );
+        assert!(diagnostics.is_empty(), "base and adopted columns should resolve: {diagnostics:?}");
+    }
+
+    #[test]
+    fn adopted_document_query_still_rejects_a_missing_tabular_field() {
+        let diagnostics = adopted_document_query(
+            "ВЫБРАТЬ Т.БазовоеПоле, Т.ДобавленноеПоле, Т.НетТакогоПоля ИЗ Документ.Документ1.Товары КАК Т",
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "only the missing column should be diagnosed: {diagnostics:?}"
+        );
+        assert!(diagnostics[0].message.contains("НетТакогоПоля"));
     }
 
     #[test]

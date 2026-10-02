@@ -8056,6 +8056,12 @@ mod tests {
 
         graph.ensure_loading();
         wait_ready(&graph);
+        wait_until(&graph, "the initial publication to return", || {
+            lock_recover(&marks).contains_key("returned")
+        });
+        // The initial publication establishes the unread obligations; only the next one can
+        // retire them. Keep its samples out of the recovery measurement below.
+        lock_recover(&marks).clear();
         let owed = lock_recover(&graph.debt).outstanding_recovery().keys;
         let outstanding = owed.len();
         assert_eq!(outstanding, hidden.len(), "every unreadable module is an obligation");
@@ -8069,6 +8075,9 @@ mod tests {
         graph.probe_recovery();
         wait_until(&graph, "the healed modules to be read", || {
             graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
+        });
+        wait_until(&graph, "the healing publication to return", || {
+            lock_recover(&marks).contains_key("returned")
         });
 
         let marks = lock_recover(&marks).clone();

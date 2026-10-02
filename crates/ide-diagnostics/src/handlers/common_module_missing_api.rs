@@ -53,6 +53,16 @@ fn check_for_module_type(
         return Vec::new();
     }
 
+    let item_tree = ctx.item_tree();
+    let methods = item_tree.methods().collect::<Vec<_>>();
+    if !methods.is_empty()
+        && methods.iter().all(|method| {
+            method.annotations().iter().any(|annotation| annotation.kind.is_interception())
+        })
+    {
+        return Vec::new();
+    }
+
     let has_export = has_export_methods(&root);
     let has_api_region = has_api_regions(&root);
 
@@ -140,6 +150,35 @@ mod tests {
 Процедура Тест() Экспорт
 КонецПроцедуры
 #КонецОбласти
+"#;
+        let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn interception_only_module_does_not_need_an_exported_api() {
+        let code = r#"&После("ОбработкаЗаполнения")
+Процедура Перехват()
+КонецПроцедуры
+"#;
+        let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn change_and_validate_only_module_does_not_need_an_exported_api() {
+        let code = r#"&ИзменениеИКонтроль("ОбработкаЗаполнения")
+Процедура Перехват()
+КонецПроцедуры
+"#;
+        let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn non_interception_method_still_needs_an_exported_api() {
+        let code = r#"Процедура СлужебныйМетод()
+КонецПроцедуры
 "#;
         let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
         assert_eq!(diagnostics.len(), 1);

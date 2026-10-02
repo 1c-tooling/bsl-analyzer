@@ -61,6 +61,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "line-layout check on preprocessor instructions; no identifier lookup",
     ),
     (DiagnosticCode::LineLength, "formatting-only diagnostic"),
+    (
+        DiagnosticCode::GlobalContextMethodConflict,
+        "form declaration checked against the platform global catalog; does not inspect a bilingual use-site",
+    ),
     (DiagnosticCode::MissingSpace, "formatting-only diagnostic"),
     (DiagnosticCode::OneStatementPerLine, "statement layout diagnostic"),
     (DiagnosticCode::SemicolonPresence, "punctuation/style diagnostic"),
@@ -278,10 +282,7 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "known bug: message embeds argument counts from resolved callee",
     ),
     (DiagnosticCode::TypeMismatch, "known bug: message embeds localized type names"),
-    (
-        DiagnosticCode::TypeMismatchByDocComment,
-        "known bug: message embeds localized type names",
-    ),
+    (DiagnosticCode::TypeMismatchByDocComment, "known bug: message embeds localized type names"),
     (DiagnosticCode::UnresolvedField, "known bug: message embeds field/type names"),
     (DiagnosticCode::ReadOnlyPropertyAssignment, "known bug: message embeds property/type names"),
     (
@@ -304,10 +305,7 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::AssignAliasFieldsInQuery,
         "SDBL alias policy; query-language parity needs dedicated metadata/query harness",
     ),
-    (
-        DiagnosticCode::DuplicateAliasInQuery,
-        "SDBL source-alias policy; not BSL identifier parity",
-    ),
+    (DiagnosticCode::DuplicateAliasInQuery, "SDBL source-alias policy; not BSL identifier parity"),
     (
         DiagnosticCode::FieldsFromJoinsWithoutIsNull,
         "SDBL join-field policy; not BSL identifier parity",
@@ -617,7 +615,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 194, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 195, "update the Track 3 Phase E inventory when DiagnosticCode changes");
 }
 
 #[test]

@@ -812,14 +812,32 @@ mod tests {
         });
         let (done_tx, done_rx) = bounded(1);
         shared.done.set(done_rx).unwrap();
+        let (appended_tx, appended_rx) = bounded(1);
         let worker_shared = shared.clone();
         let path = directory.path().to_owned();
         let handle = std::thread::spawn(move || {
-            worker(receiver, &worker_shared, &path, &mut Diagnostics::default());
+            let mut appended_records = 0;
+            worker_with(
+                receiver,
+                &worker_shared,
+                &path,
+                &mut Diagnostics::default(),
+                |directory, record, dropped| {
+                    let includes_gap = *dropped > 0;
+                    append(directory, record, dropped, SEGMENT_BYTES)?;
+                    appended_records += 1 + usize::from(includes_gap);
+                    if appended_records == QUEUE_RECORDS + 1 {
+                        let _ = appended_tx.send(());
+                    }
+                    Ok(())
+                },
+            );
             done_tx.send(()).unwrap();
         });
+        let drained = appended_rx.recv_timeout(Duration::from_secs(30));
         drop(JournalGuard(shared));
         handle.join().unwrap();
+        drained.expect("the worker should append the overflow gap and every queued record");
         let values = records(directory.path());
         assert_eq!(values.len(), QUEUE_RECORDS + 1);
         assert_eq!(values[0]["gap_reason"], "queue_overflow");

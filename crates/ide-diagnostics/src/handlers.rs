@@ -66,6 +66,7 @@ pub mod function_returns_same_primitive;
 pub mod function_should_have_return;
 pub mod get_form_method;
 pub mod global_context_method_collision8312;
+pub mod global_context_method_conflict;
 pub mod global_property_not_writable;
 pub mod identical_expressions;
 pub mod if_condition_complexity;
@@ -348,6 +349,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::GetFormMethod => Some(&get_form_method::METADATA),
         DiagnosticCode::GlobalContextMethodCollision8312 => {
             Some(&global_context_method_collision8312::METADATA)
+        }
+        DiagnosticCode::GlobalContextMethodConflict => {
+            Some(&global_context_method_conflict::METADATA)
         }
         DiagnosticCode::IsInRoleMethod => Some(&is_in_role_method::METADATA),
         DiagnosticCode::PairingBrokenTransaction => Some(&pairing_broken_transaction::METADATA),
