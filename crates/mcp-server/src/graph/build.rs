@@ -1492,7 +1492,11 @@ fn build_candidate(
     GraphDb::open(candidate).and_then(|db| db.quick_check()).map_err(|error| {
         LoadFailure::operation(format!("the built graph failed its check: {error}"))
     })?;
-    let file = std::fs::File::open(candidate).map_err(LoadFailure::operation)?;
+    // Opened for writing: Windows refuses to flush a read-only handle.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(candidate)
+        .map_err(LoadFailure::operation)?;
     file.sync_all().map_err(LoadFailure::operation)?;
     crate::graph_db::record_candidate(file.metadata().map_err(LoadFailure::operation)?.len());
     Ok((summary.modules, force_stale))
