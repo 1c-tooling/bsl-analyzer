@@ -1330,8 +1330,12 @@ impl SharedState {
         // vectors from different models into one index. Unset means FTS-only.
         let Ok(model) = std::env::var("EMBEDDING_MODEL") else { return Ok(None) };
         let max_request_bytes = bsl_search::EmbedderConfig::request_bytes_from_env()?;
-        let dim: usize =
-            std::env::var("EMBEDDING_DIM").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        // No declared width means the request carries no `dimensions` field at all and
+        // the model keeps its native one: OpenAI-compatible endpoints that refuse the
+        // parameter (litellm's `UnsupportedParamsError` among them) answer only then.
+        // An explicit width still wins and doubles as the expectation for the response,
+        // so the index is never built for a width nobody declared.
+        let dim = bsl_search::EmbedderConfig::dim_from_env()?;
         // Background index/embedding workers otherwise saturate every core and starve interactive
         // `search_code` for tens of seconds during the one-time build. Default to leaving two cores
         // free for queries; an explicit EMBEDDING_CONCURRENCY still wins (operators who want max
@@ -1349,7 +1353,7 @@ impl SharedState {
             embedder: bsl_search::EmbedderConfig {
                 base_url,
                 model,
-                dim: Some(dim),
+                dim,
                 api_key: std::env::var("EMBEDDING_API_KEY").ok(),
                 provider: std::env::var("EMBEDDING_PROVIDER").ok(),
                 query_prefix: prefixes.map_or_else(
@@ -2683,6 +2687,31 @@ mod tests {
         );
         assert!(state.engine.lock().unwrap().is_none());
         state.shutdown();
+    }
+
+    /// The declared width is optional: unset means the request carries no `dimensions`
+    /// at all (the model answers in its native width). An explicit one still wins, and
+    /// a set-but-unusable value must not silently become "unset": now that the field
+    /// is optional, a typo would otherwise choose a different width without a word.
+    #[test]
+    fn embedding_config_declares_a_width_only_when_asked() {
+        let _lock = env_lock();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _limit = EnvVarGuard::unset("EMBEDDING_MAX_REQUEST_BYTES");
+
+        let _dim = EnvVarGuard::unset("EMBEDDING_DIM");
+        assert_eq!(SharedState::embedding_config().unwrap().unwrap().embedder.dim, None);
+
+        let _dim = EnvVarGuard::set("EMBEDDING_DIM", "7");
+        assert_eq!(SharedState::embedding_config().unwrap().unwrap().embedder.dim, Some(7));
+
+        for unusable in ["", "seven", "0", " 7"] {
+            let _dim = EnvVarGuard::set("EMBEDDING_DIM", unusable);
+            let error = SharedState::embedding_config().err().expect("unusable width");
+            assert_eq!(error.to_string(), "embedding_invalid_config");
+        }
     }
 
     #[test]

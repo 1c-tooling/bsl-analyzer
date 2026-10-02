@@ -243,6 +243,12 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
   выполненный тест. Обёртки сохраняют вывод упавшего прогона, а
   `scripts/test-ci-test-output.py` проверяет и сами обёртки, и то, что в джобе не
   осталось непроверенных запусков (github#102).
+- embeddings: при незаданном `EMBEDDING_DIM` поле `dimensions` больше не
+  отправляется — OpenAI-совместимые эндпоинты, отвергающие параметр
+  (`litellm.UnsupportedParamsError`), принимают запрос, а ширину задаёт модель
+  (индекс строится на 1024; модели другой ширины требуют явного `EMBEDDING_DIM`)
+  (github#124). Значение, заданное, но негодное, теперь даёт отказ
+  `embedding_invalid_config`, а не молчаливую подмену.
 
 ### Changed
 
