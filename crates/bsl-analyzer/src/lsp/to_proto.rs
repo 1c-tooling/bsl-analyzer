@@ -312,6 +312,7 @@ pub fn semantic_tokens_legend() -> SemanticTokensLegend {
         SemanticTokenModifier::new("async"),
         SemanticTokenModifier::new("declaration"),
         SemanticTokenModifier::new("definition"),
+        SemanticTokenModifier::DOCUMENTATION,
     ];
 
     SemanticTokensLegend { token_types, token_modifiers }
@@ -354,6 +355,9 @@ fn token_modifiers_bitset(mods: HlMod) -> u32 {
     }
     if mods.contains(HlMod::DEFINITION) {
         bitset |= 1 << 4;
+    }
+    if mods.contains(HlMod::DOCUMENTATION) {
+        bitset |= 1 << 5;
     }
     bitset
 }
@@ -588,6 +592,52 @@ mod tests {
         assert_eq!(lsp_diag.code, Some(NumberOrString::String("EmptyCodeBlock".to_string())));
         assert_eq!(lsp_diag.source, Some("bsl-analyzer".to_string()));
         assert_eq!(lsp_diag.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+    }
+
+    /// Documentation tokens use the advertised modifier and negotiated Unicode units.
+    #[test]
+    fn test_documentation_semantic_tokens_unicode() {
+        let text = "// 😀 Параметры:\r\n// Имя - Строка\r\n";
+        let line_index = LineIndex::new(text);
+        let highlights: Vec<_> =
+            [("Параметры:", HlTag::Keyword), ("Имя", HlTag::Parameter), ("Строка", HlTag::Type)]
+                .into_iter()
+                .map(|(part, tag)| HlRange {
+                    range: TextRange::at(
+                        TextSize::from(text.find(part).unwrap() as u32),
+                        TextSize::of(part),
+                    ),
+                    tag,
+                    modifiers: HlMod::new().with(HlMod::DOCUMENTATION),
+                })
+                .collect();
+        let legend = semantic_tokens_legend();
+        let documentation = legend
+            .token_modifiers
+            .iter()
+            .position(|modifier| *modifier == SemanticTokenModifier::DOCUMENTATION)
+            .unwrap();
+        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+            let tokens = semantic_tokens_with_encoding(&line_index, text, &highlights, encoding);
+            assert_eq!(tokens.len(), 3);
+            for (token, highlight) in tokens.iter().zip(&highlights) {
+                assert_eq!(token.token_modifiers_bitset, 1 << documentation);
+                assert_eq!(
+                    legend.token_types[token.token_type as usize].as_str(),
+                    highlight.tag.as_str()
+                );
+            }
+            let (start, length) = match encoding {
+                PositionEncoding::Utf8 => ("// 😀 ".len(), "Параметры:".len()),
+                PositionEncoding::Utf16 => {
+                    ("// 😀 ".encode_utf16().count(), "Параметры:".encode_utf16().count())
+                }
+            };
+            assert_eq!(tokens[0].delta_start, start as u32);
+            assert_eq!(tokens[0].length, length as u32);
+            assert_eq!(tokens[1].delta_line, 1);
+            assert_eq!(tokens[1].delta_start, 3);
+        }
     }
 
     #[test]

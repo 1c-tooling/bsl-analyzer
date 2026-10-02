@@ -377,6 +377,19 @@ mod tests {
     }
 
     #[test]
+    fn test_report_compose_result_handler_external_report_no_diagnostic() {
+        let code = r#"Процедура ПриКомпоновкеРезультата(ДокументРезультат, ДанныеРасшифровки, СтандартнаяОбработка)
+    ДокументРезультат.Очистить();
+КонецПроцедуры"#;
+
+        check_object_module_snapshot(
+            object_module_of(bsl_metadata::MdoType::ExternalReport, "ВнешнийОтчет"),
+            code,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
     fn test_compose_result_name_in_catalog_object_module_is_flagged() {
         let code = r#"Процедура ПриКомпоновкеРезультата(ДокументРезультат, Лишний)
     ДокументРезультат.Очистить();

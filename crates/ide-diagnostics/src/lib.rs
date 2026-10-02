@@ -482,15 +482,6 @@ mod byte_order_mark_tests {
     /// него не добираются.
     const MODULE: &str = "// оооооооооооооооооооооочень длинный комментарий, который заведомо длиннее любого разумного предела длины строки в модуле\nпроцедура Тест(А, Б) экспорт\n\tЕсли А=1 Тогда\n\t\tВ = А+Б;\n\tКонецЕсли;\nконецпроцедуры\n";
 
-    /// Находка, которую BOM отменяет не через определения тривии.
-    ///
-    /// Расхождение старше этой сверки: оно живёт в привязке описания метода к
-    /// объявлению, а не в наборах видов, и воспроизводится на сборке, где ни
-    /// один набор ещё не сведён. Названо здесь, чтобы сверка ловила НОВЫЕ
-    /// расхождения, а не молчала обо всех разом; когда привязка починится,
-    /// исключение обязано стать лишним — это проверяется отдельно.
-    const KNOWN_BOM_SENSITIVE: &str = "MissingParameterDescription";
-
     fn codes(source: &str) -> Vec<String> {
         let mut found: Vec<String> =
             check_file_diagnostics(source).iter().map(|d| format!("{:?}", d.code)).collect();
@@ -505,24 +496,17 @@ mod byte_order_mark_tests {
 
         let with_bom = codes(&format!("\u{feff}{MODULE}"));
 
-        let expected: Vec<String> =
-            without.iter().filter(|c| *c != KNOWN_BOM_SENSITIVE).cloned().collect();
-        assert_eq!(with_bom, expected, "BOM изменил состав находок сверх известного");
+        assert_eq!(with_bom, without, "BOM изменил состав находок");
     }
 
-    /// Известное отклонение всё ещё существует.
-    ///
-    /// Без этой проверки исключение выше переживёт починку и будет молча
-    /// прикрывать новое расхождение того же кода.
+    /// BOM не должен скрывать описание метода от проверки документированности параметров.
     #[test]
-    fn the_known_deviation_is_still_there() {
-        assert!(
-            codes(MODULE).iter().any(|c| c == KNOWN_BOM_SENSITIVE),
-            "фикстура перестала давать находку, ради которой заведено исключение"
-        );
-        assert!(
-            !codes(&format!("\u{feff}{MODULE}")).iter().any(|c| c == KNOWN_BOM_SENSITIVE),
-            "отклонение исчезло — исключение в сверке пора убрать"
-        );
+    fn a_leading_byte_order_mark_keeps_parameter_documentation_checks() {
+        for source in [MODULE.to_owned(), format!("\u{feff}{MODULE}")] {
+            assert!(
+                codes(&source).iter().any(|code| code == "MissingParameterDescription"),
+                "описание метода должно проверяться независимо от BOM"
+            );
+        }
     }
 }
