@@ -308,7 +308,15 @@ jobs:
       - name: Build binary
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
       - name: CLI MCP mode and lifecycle tests
-        run: cargo test -p bsl-analyzer --bin bsl-analyzer-app cli::mcp
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::mcp
       - name: Vector lifecycle and bounded journal regressions
         shell: bash
         run: |
@@ -325,70 +333,177 @@ jobs:
           run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
           run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging::journal::windows::tests::private_dacl_and_unprivileged_junction_rejection -- --exact
       - name: Diagnostics baseline atomic create
-        run: cargo test -p bsl-analyzer diagnostics_baseline_create
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-analyzer diagnostics_baseline_create
       - name: Diagnostics baseline atomic update
-        run: cargo test -p bsl-analyzer diagnostics_baseline_update
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-analyzer diagnostics_baseline_update
       - name: Partitioned diagnostics baseline transaction
-        run: cargo test -p bsl-analyzer partitioned_baseline_transaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-analyzer partitioned_baseline_transaction
       - name: Selective diagnostics baseline transaction
-        run: cargo test -p bsl-analyzer selective_baseline_transaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-analyzer selective_baseline_transaction
       - name: Selective baseline path security
-        run: cargo test -p project-model partitioned_baseline_path_security && cargo test -p ide selective_loader_rejects_unsafe_enabled_paths_and_links
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p project-model partitioned_baseline_path_security
+          run_nonempty -p ide selective_loader_rejects_unsafe_enabled_paths_and_links
       - name: HTTP transport tests
-        run: cargo test -p mcp-server --test http
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server --test http
       - name: Broker runtime tests
-        run: cargo test -p mcp-server --test broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server --test broker
       - name: Name dictionary before graph publication
-        run: cargo test -p mcp-server --test name_dictionary
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server --test name_dictionary
       - name: Superseded workspace lease lifecycle
-        run: >-
-          cargo test -p mcp-server workspace_lease::tests::observed_foreign_owner_is_permanent &&
-          cargo test -p mcp-server workspace_lease::tests::publish_fence_latches_supersession &&
-          cargo test -p mcp-server workspace_lease::tests::observed_owner_race_cannot_reclaim &&
-          cargo test -p mcp-server workspace_lease::tests::transient_unclaimed_is_not_superseded &&
-          cargo test -p mcp-server workspace_lease::tests::non_witness_states_remain_reclaimable
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server workspace_lease::tests::observed_foreign_owner_is_permanent
+          run_nonempty -p mcp-server workspace_lease::tests::publish_fence_latches_supersession
+          run_nonempty -p mcp-server workspace_lease::tests::observed_owner_race_cannot_reclaim
+          run_nonempty -p mcp-server workspace_lease::tests::transient_unclaimed_is_not_superseded
+          run_nonempty -p mcp-server workspace_lease::tests::non_witness_states_remain_reclaimable
       - name: Fenced search construction and apply
-        run: >-
-          cargo test -p bsl-search engine::tests::workspace_constructor_publish_fence &&
-          cargo test -p mcp-server state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error &&
-          cargo test -p mcp-server state::bootstrap::tests::startup_metadata_fence_stops_after_takeover &&
-          cargo test -p mcp-server state::bootstrap::tests::startup_ingest_fence_does_not_repeat_preparation &&
-          cargo test -p mcp-server state::bootstrap::tests::superseded_bootstrap_stops_mutating &&
-          cargo test -p mcp-server state::sync::tests::superseded_daemon_cannot_mutate_shared_search
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-search engine::tests::workspace_constructor_publish_fence
+          run_nonempty -p mcp-server state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error
+          run_nonempty -p mcp-server state::bootstrap::tests::startup_metadata_fence_stops_after_takeover
+          run_nonempty -p mcp-server state::bootstrap::tests::startup_ingest_fence_does_not_repeat_preparation
+          run_nonempty -p mcp-server state::bootstrap::tests::superseded_bootstrap_stops_mutating
+          run_nonempty -p mcp-server state::sync::tests::superseded_daemon_cannot_mutate_shared_search
       - name: Terminal graph snapshot lifecycle
-        run: >-
-          cargo test -p mcp-server graph::state::tests::superseded_graph_never_adopts_or_reloads &&
-          cargo test -p mcp-server graph::state::tests::superseded_late_publish_is_fenced &&
-          cargo test -p mcp-server graph::build::tests::superseded_fused_writer_stops_mutating &&
-          cargo test -p mcp-server graph::build::tests::superseded_build_is_discarded_after_owner_release &&
-          cargo test -p mcp-server graph::snapshot::tests::superseded_graph_serves_only_preopened_snapshot &&
-          cargo test -p mcp-server graph::state::tests::superseded_status_truth_table &&
-          cargo test -p mcp-server graph_actions_fail_when_superseded_snapshot_is_gone
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server graph::state::tests::superseded_graph_never_adopts_or_reloads
+          run_nonempty -p mcp-server graph::state::tests::superseded_late_publish_is_fenced
+          run_nonempty -p mcp-server graph::build::tests::superseded_fused_writer_stops_mutating
+          run_nonempty -p mcp-server graph::build::tests::superseded_build_is_discarded_after_owner_release
+          run_nonempty -p mcp-server graph::snapshot::tests::superseded_graph_serves_only_preopened_snapshot
+          run_nonempty -p mcp-server graph::state::tests::superseded_status_truth_table
+          run_nonempty -p mcp-server graph_actions_fail_when_superseded_snapshot_is_gone
       - name: Terminal retry embedding and broker lifecycle
-        run: >-
-          cargo test -p mcp-server state::overlay_retry::tests::observed_supersession_never_resumes &&
-          cargo test -p bsl-search engine::tests::embedding_publish_fence &&
-          cargo test -p mcp-server state::embed::tests::embedding_fence_distinguishes_retry_from_supersession &&
-          cargo test -p mcp-server state::tests::terminal_supersession_is_not_transient_nonownership &&
-          cargo test -p mcp-server --test broker superseded_backend_lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server state::overlay_retry::tests::observed_supersession_never_resumes
+          run_nonempty -p bsl-search engine::tests::embedding_publish_fence
+          run_nonempty -p mcp-server state::embed::tests::embedding_fence_distinguishes_retry_from_supersession
+          run_nonempty -p mcp-server state::tests::terminal_supersession_is_not_transient_nonownership
+          run_nonempty -p mcp-server --test broker superseded_backend_lifecycle
       - name: Workspace lease operation semantics portable regressions
-        run: >-
-          cargo test -p mcp-server workspace_lease::tests::release_during_checkpointed_callback_rolls_back_as_terminal -- --exact &&
-          cargo test -p mcp-server workspace_lease::tests::release_waits_for_only_the_admitted_batch_and_refuses_the_next -- --exact &&
-          cargo test -p mcp-server workspace_lease::tests::takeover_between_batches_preserves_the_first_and_terminates_the_next -- --exact &&
-          cargo test -p mcp-server state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error -- --exact &&
-          cargo test -p mcp-server state::sync::tests::background_snapshot_failures_require_rescan_instead_of_empty_xml_success -- --exact &&
-          cargo test -p mcp-server state::embed::tests::embedding_fence_distinguishes_retry_from_supersession -- --exact &&
-          cargo test -p mcp-server state::overlay_retry::tests::transient_budget_fails_once_answers_mid_pass_facts_and_rearms_on_new_drift -- --exact &&
-          cargo test -p mcp-server graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement -- --exact &&
-          cargo test -p mcp-server graph::snapshot::tests::final_install_rechecks_token_through_the_preopened_descriptor -- --exact &&
-          cargo test -p mcp-server graph::snapshot::tests::publication_without_a_complete_descriptor_pool_cannot_be_ready -- --exact &&
-          cargo test -p mcp-server graph::build::tests::incremental_publish_propagates_transient_refusal -- --exact &&
-          cargo test -p mcp-server graph::build::tests::fresh_and_cached_publication_paths_propagate_final_install_refusal -- --exact &&
-          cargo test -p mcp-server graph_supersession_contract::graph_handler_misses_immediately_when_preopened_handles_are_busy -- --exact &&
-          cargo test -p mcp-server graph_supersession_contract::resolve_names_misses_immediately_when_preopened_handles_are_busy -- --exact &&
-          cargo test -p mcp-server graph_supersession_contract::symbol_info_misses_immediately_when_preopened_handles_are_busy -- --exact &&
-          cargo test -p mcp-server graph_supersession_contract::references_misses_immediately_when_preopened_handles_are_busy -- --exact
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exact names, each required to run at least one test: a renamed or moved test
+          # would otherwise match nothing and pass.
+          run_exact() {
+            local output status
+            output=$(cargo test -p "$1" --lib "$2" -- --exact 2>&1) && status=0 || status=$?
+            printf '%s\n' "$output"
+            if [ "$status" -ne 0 ]; then
+              echo "::error::$2 failed with status $status"
+              return "$status"
+            fi
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_exact mcp-server workspace_lease::tests::release_during_checkpointed_callback_rolls_back_as_terminal
+          run_exact mcp-server workspace_lease::tests::release_waits_for_only_the_admitted_batch_and_refuses_the_next
+          run_exact mcp-server workspace_lease::tests::takeover_between_batches_preserves_the_first_and_terminates_the_next
+          run_exact mcp-server state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error
+          run_exact mcp-server state::sync::tests::background_snapshot_failures_require_rescan_instead_of_empty_xml_success
+          run_exact mcp-server state::embed::tests::embedding_fence_distinguishes_retry_from_supersession
+          run_exact mcp-server state::overlay_retry::tests::transient_budget_fails_once_answers_mid_pass_facts_and_rearms_on_new_drift
+          run_exact mcp-server graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
+          run_exact mcp-server graph::snapshot::tests::final_install_rechecks_token_through_the_preopened_descriptor
+          run_exact mcp-server graph::snapshot::tests::publication_without_a_complete_descriptor_pool_cannot_be_ready
+          run_exact mcp-server graph::build::tests::incremental_publish_propagates_transient_refusal
+          run_exact mcp-server graph::build::tests::fresh_and_cached_publication_paths_propagate_final_install_refusal
+          run_exact mcp-server graph_supersession_contract::graph_handler_misses_immediately_when_preopened_handles_are_busy
+          run_exact mcp-server graph_supersession_contract::resolve_names_misses_immediately_when_preopened_handles_are_busy
+          run_exact mcp-server graph_supersession_contract::symbol_info_misses_immediately_when_preopened_handles_are_busy
+          run_exact mcp-server graph_supersession_contract::references_misses_immediately_when_preopened_handles_are_busy
       - name: Portable workspace lease profiles
         shell: bash
         run: |
