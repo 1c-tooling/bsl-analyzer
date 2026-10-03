@@ -147,6 +147,7 @@ pub fn function_def_content(p: &mut Parser) {
     p.expect(T![KwFunction]);
 
     let recovered = p.within_boundary(at_end_function, |p| {
+        // The same division as [`procedure_def_content`].
         if p.at(T![Ident]) || p.current().is_some_and(|k| k.is_keyword()) {
             p.bump();
         }
@@ -212,6 +213,25 @@ pub fn var_declaration(p: &mut Parser) {
     m.complete(p, NodeKind::VarDef);
 }
 
+/// Reports a name the position requires, without moving the cursor.
+///
+/// The token the position tripped over is what holds the rest of the parse
+/// together: `;` closes the declaration, `,` ends the item, `Экспорт` is still
+/// read by its own `eat`. Taking it as recovery costs the statement, so the
+/// complaint stands where the name should have been and the token stays
+/// (github#209). At end of input the position stays silent: the line is still
+/// being typed, and the name may yet be written.
+///
+/// The SDBL half keeps a `report_missing_name` of its own
+/// (`grammar/sdbl/expressions.rs`): there the report goes at a marker span and
+/// no punctuation is ever taken, while here a word of the wrong kind is taken
+/// by the ordinary recovery when the position is the parameter's.
+fn report_missing_name(p: &mut Parser, expected: &'static str) {
+    if !p.at_end() {
+        p.error_custom_no_bump(expected);
+    }
+}
+
 /// `Экспорт` is taken after the whole list, and after a single name.
 ///
 /// Section 4.6.1 states this three ways that do not agree: the production puts
@@ -226,12 +246,16 @@ pub fn var_declaration_content(p: &mut Parser) {
 
     if p.at(T![Ident]) {
         p.bump();
+    } else {
+        report_missing_name(p, "ожидалось имя переменной");
     }
 
     while p.eat(T![Comma]) {
         p.check_iteration_limit();
         if p.at(T![Ident]) {
             p.bump();
+        } else {
+            report_missing_name(p, "ожидалось имя переменной");
         }
     }
 

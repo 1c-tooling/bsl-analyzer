@@ -900,3 +900,26 @@ fn a_keyword_standing_where_a_name_belongs_is_a_name() {
         assert!(!parse.has_errors(), "`{input}`: {:#?}", parse.errors());
     }
 }
+
+// --- BSL: имя там, где оно обязательно ------------------------------------
+
+/// #209: `Перем` без имени сообщает о пропаже, не сдвигая позицию.
+///
+/// Токен, на котором позиция споткнулась, держит продолжение разбора: `;`
+/// закрывает объявление, `,` — список, `Экспорт` ещё будет прочитан своим
+/// `eat`. Сообщение стоит там, где имени не хватает, а токен остаётся тексту.
+#[test]
+fn a_var_declaration_without_a_name_reports_and_keeps_the_statement() {
+    for input in
+        ["Перем ;", "Перем;", "Перем А, ;", "Перем , А;", "Перем А, , Б;", "Перем Экспорт;"]
+    {
+        let messages = messages(input, true);
+        assert_eq!(messages.len(), 1, "{input}: {messages:?}");
+        assert!(messages[0].contains("имя переменной"), "{input}: {messages:?}");
+        assert!(covers(input, true), "{input}: текст потерян");
+    }
+
+    // Незавершённый набор на конце ввода — не ошибка: после `Перем` имя ещё
+    // может быть набрано.
+    assert!(messages("Перем", true).is_empty(), "{:?}", messages("Перем", true));
+}
