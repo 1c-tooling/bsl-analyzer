@@ -16,6 +16,7 @@ pub(crate) fn create_register_standard_attribute(
 ) -> RegisterAttribute {
     let nil_uuid = Uuid::nil();
     let mut attr = RegisterAttribute::new(nil_uuid, kind.russian_name());
+    attr.set_name_en(kind.english_name());
     attr.set_attr_type(kind.attribute_type(mdo_type, object_name));
     attr
 }

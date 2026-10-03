@@ -899,6 +899,33 @@ mod tests {
         assert!(attr_names.contains(&"Регистратор"));
     }
 
+    /// The synthesiser is the single owner of the register's standard attributes, so it is
+    /// also the one that must give them their English spellings: consumers that match by
+    /// `name_en` (the SDBL scope, completion, hover) have no other source.
+    #[test]
+    fn register_standard_attribute_synthesis_carries_english_names() {
+        let xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<InformationRegister uuid="12345678-1234-1234-1234-123456789012">
+<Properties><Name>Курсы</Name><InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity></Properties>
+</InformationRegister></MetaDataObject>"#;
+
+        let register = parse_information_register_xml(xml).unwrap();
+
+        let name_en = |ru: &str| {
+            register
+                .attributes()
+                .iter()
+                .find(|attr| attr.name() == ru)
+                .unwrap_or_else(|| panic!("`{ru}` must be synthesised"))
+                .name_en()
+                .map(str::to_string)
+        };
+        assert_eq!(name_en("Регистратор").as_deref(), Some("Recorder"));
+        assert_eq!(name_en("Активность").as_deref(), Some("Active"));
+        assert_eq!(name_en("НомерСтроки").as_deref(), Some("LineNumber"));
+        assert_eq!(name_en("Период").as_deref(), Some("Period"));
+    }
+
     #[test]
     fn test_catalog_standard_attributes_with_code_description() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>

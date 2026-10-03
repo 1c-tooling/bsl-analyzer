@@ -496,11 +496,10 @@ impl ResolvedTable {
 
     /// Whether this table's offer of `name` is provisional — the field may not exist at all.
     ///
-    /// Asks about every entry under the name, not the first one, because a conditional
-    /// register field is listed twice: once by the metadata XML reader, which injects
-    /// `Активность`/`НомерСтроки`/`Регистратор` into every information register, and once by
-    /// the query layer's standard-field set. Only one of the two carries the mark, and which
-    /// one [`Self::find_field`] returns is an accident of ordering.
+    /// Asks about every entry under the name rather than the first one, so the answer does
+    /// not depend on the order the offering buckets are concatenated in: a name can be
+    /// offered by more than one of them, and only the offering that knows the condition
+    /// carries the mark.
     pub fn column_is_provisional(&self, name: &str) -> bool {
         self.fields().iter().any(|f| f.matches_name(name) && f.provisional)
     }
