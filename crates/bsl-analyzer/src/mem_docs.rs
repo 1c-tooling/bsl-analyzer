@@ -166,16 +166,17 @@ impl MemDocs {
 /// Byte offset of an LSP position inside the document text.
 ///
 /// The bounds and the character boundary are proven by
-/// [`crate::lsp::offset_with_encoding`] — the same conversion the request
-/// handlers use, so an edit range and a cursor position can never disagree
-/// about what a column means.
+/// [`crate::lsp::edit_offset_with_encoding`], which refuses a column past the
+/// line end: clamping an edit would silently rewrite the span between the line
+/// end and the column the client actually named. A cursor position on a request
+/// clamps there instead (LSP 3.17) — the two conversions share every other rule.
 fn lsp_position_to_offset(
     line_index: &LineIndex,
     text: &str,
     position: lsp_types::Position,
     encoding: PositionEncoding,
 ) -> Result<usize> {
-    crate::lsp::offset_with_encoding(line_index, text, position, encoding).map(usize::from)
+    crate::lsp::edit_offset_with_encoding(line_index, text, position, encoding).map(usize::from)
 }
 
 #[cfg(test)]
@@ -235,6 +236,30 @@ mod tests {
 
         assert_eq!(mem_docs.get(&uri), Some("hello rust".to_string()));
         assert_eq!(mem_docs.get_version(&uri), Some(2));
+    }
+
+    /// Правка с колонкой за концом строки отвергается: усечение молча
+    /// переписало бы не тот участок буфера — ради этого у правок и у позиций
+    /// запросов разные политики (github#91).
+    #[test]
+    fn an_edit_range_past_the_line_end_is_refused_and_changes_nothing() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///test.bsl").unwrap();
+
+        mem_docs.insert(uri.clone(), "Процедура\nТест".to_string(), 1);
+
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(lsp_types::Range {
+                start: lsp_types::Position { line: 0, character: 40 },
+                end: lsp_types::Position { line: 0, character: 40 },
+            }),
+            range_length: None,
+            text: "X".to_string(),
+        }];
+
+        assert!(mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).is_err());
+        assert_eq!(mem_docs.get(&uri), Some("Процедура\nТест".to_string()));
+        assert_eq!(mem_docs.get_version(&uri), Some(1));
     }
 
     #[test]
