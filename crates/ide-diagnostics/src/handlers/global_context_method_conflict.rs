@@ -57,11 +57,14 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
         return;
     }
 
-    if ctx
-        .lower()
-        .diagnostics
-        .iter()
-        .any(|diag| matches!(diag, hir::BodyDiagnostic::GlobalContextMethodCollision8312 { .. }))
+    // The 8312 collision is the precise account of this declaration: while that
+    // check is enabled it already names the problem, and this report would be a
+    // duplicate. Disabling it must not silence this one too — the two toggles
+    // are independent (github#170), so ask the config, not the lowering alone.
+    if !ctx.is_disabled_with_metadata(DiagnosticCode::GlobalContextMethodCollision8312)
+        && ctx.lower().diagnostics.iter().any(|diag| {
+            matches!(diag, hir::BodyDiagnostic::GlobalContextMethodCollision8312 { .. })
+        })
     {
         return;
     }
@@ -78,13 +81,25 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::{check_metadata_diagnostic, make_non_common_module_metadata};
+    use crate::test_utils::{
+        check_metadata_diagnostic_with_config, make_non_common_module_metadata,
+    };
     use crate::DiagnosticCode;
     use std::sync::Arc;
 
     fn conflicts(
         source: &str,
         form_type: Option<bsl_metadata::FormType>,
+    ) -> Vec<crate::Diagnostic> {
+        conflicts_with(source, form_type, &[])
+    }
+
+    /// `disabled` выключает коды в конфиге — так же, как их выключает
+    /// пользователь, чтобы проверить независимость тумблеров (github#170).
+    fn conflicts_with(
+        source: &str,
+        form_type: Option<bsl_metadata::FormType>,
+        disabled: &[DiagnosticCode],
     ) -> Vec<crate::Diagnostic> {
         let mut metadata = make_non_common_module_metadata(bsl_metadata::ModuleType::FormModule);
         metadata.form = form_type.map(|form_type| {
@@ -94,7 +109,9 @@ mod tests {
                 uuid::Uuid::nil(),
             ))
         });
-        check_metadata_diagnostic(metadata, source, |_, ctx| {
+        let mut config = crate::DiagnosticsConfig::all_enabled();
+        config.disabled.extend_from_slice(disabled);
+        check_metadata_diagnostic_with_config(metadata, source, config, |_, ctx| {
             crate::diagnostics(ctx)
                 .into_iter()
                 .filter(|diag| diag.code == DiagnosticCode::GlobalContextMethodConflict)
@@ -118,5 +135,29 @@ mod tests {
         let source =
             "Функция ПредставлениеПериода(Начало, Конец)\n    Возврат Начало;\nКонецФункции";
         assert_eq!(conflicts(source, None).len(), 1);
+    }
+
+    /// Выключение `GlobalContextMethodCollision8312` не глушит этот конфликт:
+    /// у проверок независимые тумблеры. Пока 8312 включена, её точный отчёт
+    /// выигрывает и дубля нет; выключили — конфликт обязан ответить (github#170).
+    #[test]
+    fn disabling_the_8312_collision_does_not_silence_the_conflict() {
+        // `ПроверитьБит` лежит и в списке коллизий 8312, и в глобальных
+        // функциях платформы — пересечение, на котором связка и была видна.
+        let source = "Функция ПроверитьБит()\n    Возврат Ложь;\nКонецФункции";
+
+        let both = conflicts(source, Some(bsl_metadata::FormType::Managed));
+        assert!(both.is_empty(), "with 8312 enabled its precise report wins: {both:#?}");
+
+        let conflict_only = conflicts_with(
+            source,
+            Some(bsl_metadata::FormType::Managed),
+            &[DiagnosticCode::GlobalContextMethodCollision8312],
+        );
+        assert_eq!(
+            conflict_only.len(),
+            1,
+            "disabling 8312 must not silence the conflict: {conflict_only:#?}"
+        );
     }
 }

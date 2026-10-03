@@ -274,6 +274,10 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
   исказило бы буфер, — а колонка внутри многобайтового символа отвергается в
   обоих случаях. Концом строки с CRLF считается позиция перед `\r`: усечение
   туда и попадает, а правка между `\r` и `\n` отвергается (github#91).
+- Диагностика `GlobalContextMethodConflict` больше не замолкает при
+  выключенном `GlobalContextMethodCollision8312`: точный отчёт 8312
+  вытесняет конфликт, только пока сам включён, а тумблеры у проверок
+  независимы (github#170).
 
 ### Changed
 
