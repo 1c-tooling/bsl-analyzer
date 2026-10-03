@@ -278,6 +278,10 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
   выключенном `GlobalContextMethodCollision8312`: точный отчёт 8312
   вытесняет конфликт, только пока сам включён, а тумблеры у проверок
   независимы (github#170).
+- `MissingEventSubscriptionHandler`: в проекте, где единственная конфигурация —
+  расширение, подписки расширения снова проверяются: без главной конфигурации
+  main-область берёт их из цепочки видимости файла, а не из несуществующей
+  главной (github#172).
 
 ### Changed
 

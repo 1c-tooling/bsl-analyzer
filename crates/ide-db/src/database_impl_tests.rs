@@ -622,6 +622,161 @@ fn resolve_event_subscription_for_file_uses_bootstrapped_listing() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Проект из одного расширения: главной конфигурации нет, и main-scope
+/// диагностика обязана видеть подписки расширения — их владелец и есть
+/// единственная конфигурация проекта (github#172).
+#[test]
+fn main_event_subscription_names_fall_back_to_the_chain_for_an_extension_only_project() {
+    use crate::metadata::EventSubscriptionEntry;
+
+    fn event_subscription_xml(name: &str, event: &str, handler: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <EventSubscription uuid="00000000-0000-0000-0000-000000000172">
+        <Properties>
+            <Name>{name}</Name>
+            <Source><Type>CatalogRef.Номенклатура</Type></Source>
+            <Event>{event}</Event>
+            <Handler>{handler}</Handler>
+        </Properties>
+    </EventSubscription>
+</MetaDataObject>"#
+        )
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "bsl_main_event_subscription_extension_only_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let subscription_path = root.join("EventSubscriptions/ПередЗаписью.xml");
+    std::fs::create_dir_all(subscription_path.parent().unwrap()).unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    let subscription_file = FileId(0);
+    let module_file = FileId(1);
+    let module_path = root.join("EventSubscriptionConsumer.bsl");
+
+    let mut file_set = FileSet::new();
+    file_set.insert(subscription_file, VfsPath::new(subscription_path.to_string_lossy().as_ref()));
+    file_set.insert(module_file, VfsPath::new(module_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(1), SourceRoot::new_local(file_set));
+    db.set_file_source_root(subscription_file, SourceRootId(1));
+    db.set_file_source_root(module_file, SourceRootId(1));
+    db.set_file_text(
+        subscription_file,
+        &event_subscription_xml(
+            "ПередЗаписью",
+            "BeforeWrite",
+            "CommonModule.ПодпискиНаСобытия.ПередЗаписью",
+        ),
+    );
+    db.set_file_text(module_file, "Процедура Т() КонецПроцедуры");
+
+    // Единственная конфигурация — расширение X: главной нет вовсе.
+    db.set_all_config_paths(vec![(Some("X".to_string()), root.clone())]);
+    db.set_metadata_listing(
+        &root.to_string_lossy(),
+        MetadataListingData {
+            entries: Vec::new(),
+            defined_types: Vec::new(),
+            common_modules: Vec::new(),
+            event_subscriptions: vec![EventSubscriptionEntry {
+                name: "ПередЗаписью".to_string(),
+                main: subscription_file,
+            }],
+            scheduled_jobs: Vec::new(),
+            roles: Vec::new(),
+            http_services: Vec::new(),
+            web_services: Vec::new(),
+            integration_services: Vec::new(),
+            subsystems: Vec::new(),
+        },
+    );
+
+    assert_eq!(
+        db.main_event_subscription_names_for_file(module_file),
+        vec!["ПередЗаписью".to_string()],
+        "without a base the main scope falls back to the file's extension chain"
+    );
+    assert_eq!(db.event_subscription_names_for_file(module_file), vec!["ПередЗаписью".to_string()]);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Главная конфигурация зарегистрирована, но субстрат не поднят (batch/CLI):
+/// main-область обязана остаться main-only — фолбэк на цепочку полагается лишь
+/// проекту, у которого главного корня нет вовсе (github#172).
+#[test]
+fn main_event_subscription_names_stay_main_only_without_the_substrate() {
+    fn event_subscription_xml(uuid: &str, name: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <EventSubscription uuid="{uuid}">
+        <Properties>
+            <Name>{name}</Name>
+            <Source><Type>CatalogRef.Номенклатура</Type></Source>
+            <Event>BeforeWrite</Event>
+            <Handler>CommonModule.Сервер.Обработчик</Handler>
+        </Properties>
+    </EventSubscription>
+</MetaDataObject>"#
+        )
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "bsl_main_event_subscription_main_unbootstrapped_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let main_root = root.join("cf");
+    let ext_root = root.join("cfe/X");
+    std::fs::create_dir_all(main_root.join("EventSubscriptions")).unwrap();
+    std::fs::create_dir_all(ext_root.join("EventSubscriptions")).unwrap();
+    std::fs::write(main_root.join("Configuration.xml"), "<Configuration/>").unwrap();
+    std::fs::write(ext_root.join("Configuration.xml"), "<Configuration/>").unwrap();
+    std::fs::write(
+        main_root.join("EventSubscriptions/ИзГлавной.xml"),
+        event_subscription_xml("00000000-0000-0000-0000-000000000201", "ИзГлавной"),
+    )
+    .unwrap();
+    std::fs::write(
+        ext_root.join("EventSubscriptions/ИзРасширения.xml"),
+        event_subscription_xml("00000000-0000-0000-0000-000000000202", "ИзРасширения"),
+    )
+    .unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    let module_file = FileId(0);
+    let module_path = ext_root.join("EventSubscriptionConsumer.bsl");
+    let mut file_set = FileSet::new();
+    file_set.insert(module_file, VfsPath::new(module_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(module_file, SourceRootId(0));
+    db.set_file_text(module_file, "Процедура Т() КонецПроцедуры");
+
+    db.set_all_config_paths(vec![
+        (None, main_root.clone()),
+        (Some("X".to_string()), ext_root.clone()),
+    ]);
+    // Субстрат намеренно не поднят: `set_metadata_listing` не зовётся.
+
+    assert_eq!(
+        db.main_event_subscription_names_for_file(module_file),
+        vec!["ИзГлавной".to_string()],
+        "a registered main root keeps the main-only scope even without a substrate"
+    );
+    assert_eq!(
+        db.event_subscription_names_for_file(module_file),
+        vec!["ИзГлавной".to_string(), "ИзРасширения".to_string()],
+        "the visible enumeration still sees the extension"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn resolve_scheduled_job_isolates_content_and_structure() {
     use crate::metadata::{

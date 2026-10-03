@@ -1445,10 +1445,26 @@ impl RootDatabaseImpl {
     /// EventSubscription names declared by the main configuration only. Kept
     /// separate from the visible enumeration because older diagnostics explicitly
     /// inspect main-owned declarations while UnusedParameters needs the full chain.
+    ///
+    /// A project whose only configuration is an extension has no main to inspect:
+    /// there the file's own visibility chain stands in for the main scope, or the
+    /// subscription diagnostics of that project would see nothing at all
+    /// (github#172). A registered main root whose substrate is absent (batch/CLI)
+    /// is not that case: its whole-config lookup below stays main-only.
     pub fn main_event_subscription_names_for_file(&self, file_id: FileId) -> Vec<String> {
         let Some((main_listing, _, bootstrapped)) = self.metadata_listings_for_file(file_id) else {
             return Vec::new();
         };
+
+        // `main_listing` is None both when the project has no main root at all
+        // (the extension-only case) and when a main root is registered but the
+        // substrate was not bootstrapped. Only the former stands the chain in
+        // for the missing main; the latter keeps the main-only lookup below.
+        if main_listing.is_none()
+            && self.visible_roots_for_file(file_id).is_some_and(|roots| roots.main.is_none())
+        {
+            return self.event_subscription_names_for_file(file_id);
+        }
 
         if bootstrapped {
             return main_listing
