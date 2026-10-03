@@ -145,6 +145,69 @@ fn a_reference_gives_the_slot_the_fields_its_target_documents() {
 }
 
 #[test]
+fn a_container_slot_gives_the_fields_its_target_documents() {
+    // `Структура - см. Модуль.Метод`: the marker stands in the description, where the signature's
+    // own parser does not look, so the slot arrives as an untyped structure and the reference has
+    // to fill it — 1 244 such slots in one configuration.
+    let fixture = format!(
+        "{TARGETS}
+//- /test.bsl
+// Параметры:
+//   Параметры - Структура - см. База.Создать
+// Возвращаемое значение:
+//   Структура - см. База.Создать
+Функция Читает(Параметры) Экспорт
+	Возврат Неопределено;
+КонецФункции
+"
+    );
+    let (db, file_id) = setup(&fixture);
+
+    let signature = resolved(&db, file_id, "Читает");
+
+    let param = signature.param(0).expect("слот параметра разрешён");
+    assert_eq!(field_names(&db, param), vec!["Адрес", "Таймаут"]);
+    let ret = signature.ret.expect("слот возврата разрешён");
+    assert_eq!(field_names(&db, ret), vec!["Адрес", "Таймаут"]);
+}
+
+#[test]
+fn a_return_union_keeps_the_arm_documented_beside_the_reference() {
+    // The return half of `Неопределено, см. X.Y`: the union must survive as a slot, and the
+    // reference arm must reach the caller. Asserted on the decomposition, in both orders — the
+    // link-first order is the one the hyperlink branch used to swallow whole.
+    for (line, order) in [
+        ("//   Неопределено, см. База.Создать - необязательные.", "ссылка последней"),
+        ("//   см. База.Создать, Неопределено - необязательные.", "ссылка первой"),
+    ] {
+        let fixture = format!(
+            "{TARGETS}
+//- /test.bsl
+// Возвращаемое значение:
+{line}
+Функция Читает() Экспорт
+	Возврат Неопределено;
+КонецФункции
+"
+        );
+        let (db, file_id) = setup(&fixture);
+
+        let ret = resolved(&db, file_id, "Читает").ret.expect("слот возврата разрешён");
+        let members = union_members(&db, ret);
+        assert!(
+            members.iter().any(|m| field_names(&db, *m) == vec!["Адрес", "Таймаут"]),
+            "{order}: структура цели не попала в слот: {:?}",
+            db.lookup_type(ret),
+        );
+        assert!(
+            members.contains(&db.undefined()),
+            "{order}: рукав Неопределено не пережил разрешение: {:?}",
+            db.lookup_type(ret),
+        );
+    }
+}
+
+#[test]
 fn the_third_segment_names_a_parameter_of_the_target() {
     // The three-segment form is the larger half of the population in the configurations this
     // serves: 7 699 occurrences, headed by the modules an implementation edits daily.

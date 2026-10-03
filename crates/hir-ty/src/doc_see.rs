@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::TypeId;
 use hir_def::docs::{parse_type_expr, DocTypeExpr, TypeDoc};
@@ -344,6 +345,12 @@ pub fn doc_see_signature_query<'db>(
 /// own type stands — the difference has nothing to do with references, and substituting it would
 /// take away what the caller already had.
 ///
+/// One disagreement is the same form read differently, not a lost arm: a marker in the slot's
+/// description (`Структура - см. Модуль.Метод`) puts the reference where the hint parser does
+/// not look, so the signature holds an untyped structure while the rebuild holds the top type.
+/// Such a slot carries no keys and no nominal identity to take away — it is the placeholder the
+/// reference fills; a slot holding anything else beside the placeholder is still rejected.
+///
 /// **A reference has to have been accepted.** Without that a slot whose references all failed to
 /// resolve would still be replaced by a rebuild that carries nothing new.
 fn resolve_own_slot(
@@ -355,11 +362,30 @@ fn resolve_own_slot(
     lowered_by_the_signature: TypeId,
 ) -> Option<TypeId> {
     let alternatives = slot_alternatives(symbol, slot)?;
-    if lower_alternatives(db, alternatives, &SeePolicy::Permissive)? != lowered_by_the_signature {
+    let rebuilt = lower_alternatives(db, alternatives, &SeePolicy::Permissive)?;
+    if rebuilt != lowered_by_the_signature
+        && !(rebuilt == db.any() && is_only_placeholder_structures(db, lowered_by_the_signature))
+    {
         return None;
     }
 
     let accepted_before = driver.state.borrow().accepted;
     let lowered = driver.lower_slot(db, module, symbol, slot)?;
     (driver.state.borrow().accepted > accepted_before).then_some(lowered)
+}
+
+/// Whether the slot's declared type is nothing but untyped structures: one, or a union of them.
+/// Such a slot has no keys and no nominal identity — it is the placeholder a documented
+/// structure fills. Both halves are checked: a structure with keys carries the identity a
+/// reference must not overwrite.
+fn is_only_placeholder_structures(db: &dyn TypeKernelDb, ty: TypeId) -> bool {
+    use bsl_types::kind::TypeKind;
+    match db.lookup_type(ty) {
+        TypeKind::Structure(facet) => facet.fields.is_none() && facet.keys.is_none(),
+        TypeKind::Union(members) => {
+            !members.is_empty()
+                && members.iter().all(|member| is_only_placeholder_structures(db, *member))
+        }
+        _ => false,
+    }
 }
