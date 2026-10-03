@@ -289,6 +289,45 @@ fn a_field_continuation_stays_with_its_field() {
     assert_eq!(fields[0].types.len(), 3, "{:?}", fields[0].types);
 }
 
+/// One-word prose after the marker (`см. также`, `см. ниже`) names no target wherever it stands:
+/// in a placeholder's description it must not replace the declared structure, and as a union
+/// member it must not turn a prose line into a type alternative.
+#[test]
+fn one_word_prose_beside_a_type_stays_prose() {
+    let docs = parse_docs(&[
+        "Параметры:",
+        "  Параметры - Структура - см. также",
+        "Возвращаемое значение:",
+        "  Структура:",
+        "   * Данные - Структура - см. ниже",
+    ]);
+
+    let parsed = parse_type_expr(&docs.parameters[0].types[0]);
+    assert!(
+        matches!(parsed, Some(DocTypeExpr::Structure { .. })),
+        "проза в описании заменила объявленную структуру: {parsed:?}"
+    );
+    let Some(DocTypeExpr::Structure { fields }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!("expected the documented structure, got {:?}", docs.returned_value);
+    };
+    assert!(
+        matches!(fields[0].types.as_slice(), [DocTypeExpr::Structure { .. }]),
+        "проза в описании поля заменила объявленную структуру: {:?}",
+        fields[0].types
+    );
+
+    let docs = parse_docs(&["Возвращаемое значение:", "  Строка, см. ниже."]);
+    assert!(
+        docs.returned_value.iter().all(|ty| !is_see_candidate_name(&ty.name)),
+        "проза стала членом союза: {:?}",
+        docs.returned_value
+    );
+}
+
+fn is_see_candidate_name(name: &str) -> bool {
+    name.trim().to_lowercase().starts_with("см.")
+}
+
 #[test]
 fn prose_and_plain_types_name_no_target() {
     // `см. в`, `см. также` and their kin parse into a one-segment reference — there are 16 291 of
