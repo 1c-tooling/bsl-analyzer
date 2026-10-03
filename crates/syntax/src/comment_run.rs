@@ -111,17 +111,27 @@ fn collect_runs(tokens: impl Iterator<Item = (SyntaxKind, TextRange, bool)>) -> 
 }
 
 /// Комментарий между частями одного многострочного литерала — текст строки,
-/// а не комментарий: слева его открывает `STRING_START` или продолжает
-/// `STRING_PART`, справа продолжает `STRING_PART` или закрывает
-/// `STRING_TAIL`. Комментарий за незакрытой строкой, за которой литерал не
-/// продолжен, — настоящий комментарий: строка уже оборвана, и дальше идёт
-/// не её текст. Правило лексическое, потому что судить его приходится и там,
-/// где дерева нет, — по токенам одного блока строк.
+/// а не комментарий. Слева его открывает `STRING_START` или продолжает
+/// `STRING_PART`; справа строку продолжает `STRING_PART`, закрывает
+/// `STRING_TAIL` — или закрывает тело метода `КонецПроцедуры`/`КонецФункции`,
+/// когда литерал не закрыт вовсе: тело кончилось, строка так и осталась
+/// открытой, и всё до его конца — её текст. Любой другой значимый токен
+/// справа означает, что строка оборвана и литерал ею не продолжен, — это
+/// настоящий комментарий. Правило лексическое, потому что судить его
+/// приходится и там, где дерева нет, — по токенам одного блока строк.
 fn is_string_text_at(tokens: &[LineToken], index: usize) -> bool {
     let left = tokens[..index].iter().rev().map(|t| t.kind).find(|k| !k.is_trivia());
     let right = tokens[index + 1..].iter().map(|t| t.kind).find(|k| !k.is_trivia());
     matches!(left, Some(SyntaxKind::STRING_START | SyntaxKind::STRING_PART))
-        && matches!(right, Some(SyntaxKind::STRING_PART | SyntaxKind::STRING_TAIL))
+        && matches!(
+            right,
+            Some(
+                SyntaxKind::STRING_PART
+                    | SyntaxKind::STRING_TAIL
+                    | SyntaxKind::KW_END_PROCEDURE
+                    | SyntaxKind::KW_END_FUNCTION
+            )
+        )
 }
 
 fn push_run(runs: &mut Vec<CommentRun>, lines: Vec<CommentLine>) {
