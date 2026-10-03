@@ -244,6 +244,34 @@ fn a_see_member_of_a_return_union_survives_in_every_order() {
     }
 }
 
+/// A continuation of a field's type list belongs to the FIELD, and the bullets after it are
+/// still parsed. The shape is live: an ERP method documents its returned structure this way.
+#[test]
+fn a_field_continuation_stays_with_its_field() {
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Структура:",
+        "   * Ссылка - Неопределено",
+        "            - ДокументСсылка.ЭлектронныйДокументИсходящийЭДО",
+        "            - ДокументСсылка.ЭлектронныйДокументВходящийЭДО",
+        "   * ПометкаУдаления - Булево",
+        "   * ВидДокумента - СправочникСсылка.ВидыДокументовЭДО",
+    ]);
+
+    assert_eq!(docs.returned_value.len(), 1, "{:?}", docs.returned_value);
+    let Some(DocTypeExpr::Structure { fields }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!(
+            "expected one documented structure, got {:?}",
+            parse_type_expr(&docs.returned_value[0])
+        );
+    };
+    assert_eq!(
+        fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
+        ["Ссылка", "ПометкаУдаления", "ВидДокумента"]
+    );
+    assert_eq!(fields[0].types.len(), 3, "{:?}", fields[0].types);
+}
+
 #[test]
 fn prose_and_plain_types_name_no_target() {
     // `см. в`, `см. также` and their kin parse into a one-segment reference — there are 16 291 of
