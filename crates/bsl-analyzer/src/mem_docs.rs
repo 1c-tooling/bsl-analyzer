@@ -86,24 +86,24 @@ impl MemDocs {
         let mut docs = self.docs.write();
 
         if let Some(data) = docs.get_mut(uri) {
+            // The batch lands whole or not at all: on an error the caller leaves
+            // the VFS untouched, so a half-applied batch would split the two.
+            let mut text = data.text.clone();
+            let mut line_index = data.line_index.clone();
             for change in changes {
                 if let Some(range) = change.range {
-                    let start = lsp_position_to_offset(
-                        &data.line_index,
-                        &data.text,
-                        range.start,
-                        encoding,
-                    )?;
-                    let end =
-                        lsp_position_to_offset(&data.line_index, &data.text, range.end, encoding)?;
+                    let start = lsp_position_to_offset(&line_index, &text, range.start, encoding)?;
+                    let end = lsp_position_to_offset(&line_index, &text, range.end, encoding)?;
 
-                    data.text.replace_range(start..end, &change.text);
+                    text.replace_range(start..end, &change.text);
                 } else {
-                    data.text = change.text;
+                    text = change.text;
                 }
 
-                data.line_index = LineIndex::new(&data.text);
+                line_index = LineIndex::new(&text);
             }
+            data.text = text;
+            data.line_index = line_index;
             data.version += 1;
         } else {
             tracing::warn!("Attempted to update non-existent document: {}", uri);
@@ -280,6 +280,31 @@ mod tests {
 
         assert!(mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).is_err());
         assert_eq!(mem_docs.get(&uri), Some("a\r\nb".to_string()));
+        assert_eq!(mem_docs.get_version(&uri), Some(1));
+    }
+
+    #[test]
+    fn a_refused_change_rolls_back_the_changes_before_it_in_the_batch() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///test.bsl").unwrap();
+
+        mem_docs.insert(uri.clone(), "abc\ndef".to_string(), 1);
+
+        let change =
+            |start: (u32, u32), end: (u32, u32), text: &str| TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position { line: start.0, character: start.1 },
+                    end: lsp_types::Position { line: end.0, character: end.1 },
+                }),
+                range_length: None,
+                text: text.to_string(),
+            };
+        // The caller skips the VFS on an error, so a half-applied batch would
+        // leave the two holding different texts.
+        let changes = vec![change((0, 0), (0, 1), "X"), change((1, 0), (1, 99), "Y")];
+
+        assert!(mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).is_err());
+        assert_eq!(mem_docs.get(&uri), Some("abc\ndef".to_string()));
         assert_eq!(mem_docs.get_version(&uri), Some(1));
     }
 
