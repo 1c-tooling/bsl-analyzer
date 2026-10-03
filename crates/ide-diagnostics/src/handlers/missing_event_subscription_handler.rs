@@ -395,4 +395,67 @@ mod tests {
             "an unread body may declare the handler, so absence is not provable: {unread:?}"
         );
     }
+
+    /// Проект из одного расширения: главной конфигурации нет, и проверка
+    /// обработчиков обязана увидеть подписку расширения и сообщить о её
+    /// негодном обработчике (github#172).
+    #[test]
+    fn a_broken_handler_of_an_extension_only_project_is_reported() {
+        let root = std::env::temp_dir().join(format!(
+            "bsl_missing_handler_extension_only_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(root.join("Ext")).unwrap();
+        std::fs::create_dir_all(root.join("EventSubscriptions")).unwrap();
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        std::fs::write(
+            root.join("EventSubscriptions/ПередЗаписью.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <EventSubscription uuid="00000000-0000-0000-0000-000000000172">
+        <Properties>
+            <Name>ПередЗаписью</Name>
+            <Source><Type>CatalogRef.Номенклатура</Type></Source>
+            <Event>BeforeWrite</Event>
+            <Handler>CommonModule.Сервер.Обработчик</Handler>
+        </Properties>
+    </EventSubscription>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+
+        let mut db = RootDatabaseImpl::new();
+        let session_file = FileId(0);
+        let mut file_set = FileSet::default();
+        let session_path =
+            VfsPath::new(root.join("Ext/SessionModule.bsl").to_string_lossy().as_ref());
+        file_set.insert(session_file, session_path);
+        let source_root_id = SourceRootId(0);
+        db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
+        db.set_file_source_root(session_file, source_root_id);
+        db.set_file_text(session_file, "Функция Маркер()\nКонецФункции\n");
+
+        // Единственная конфигурация — расширение X: главной нет вовсе.
+        db.set_all_config_paths(vec![(Some("X".to_string()), root.clone())]);
+
+        let configuration_path_input = ide_db::metadata::ConfigurationPathInput::new(
+            &db,
+            root.to_string_lossy().to_string(),
+            0,
+        );
+        let provider = ide_db::SalsaProvider::new(&db, Some(configuration_path_input));
+        let config = DiagnosticsConfig::default();
+        let ctx = DiagnosticsContext::new(&config, session_file, &provider);
+
+        let diagnostics = check(&ctx);
+        assert_eq!(diagnostics.len(), 1, "one broken handler must be reported: {diagnostics:#?}");
+        assert!(
+            diagnostics[0].message.contains("Создайте модуль")
+                && diagnostics[0].message.contains("ПередЗаписью"),
+            "the report must name the extension's subscription: {diagnostics:#?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

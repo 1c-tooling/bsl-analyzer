@@ -135,6 +135,8 @@ pub trait AnalysisProvider {
 
     /// Main-configuration EventSubscription enumeration for diagnostics that scan
     /// declared subscriptions while preserving the existing main-only behavior.
+    /// The Salsa override falls back to the file's visibility chain when the
+    /// project has no main root at all — an extension-only project (github#172).
     fn main_event_subscriptions(
         &self,
         file_id: FileId,
