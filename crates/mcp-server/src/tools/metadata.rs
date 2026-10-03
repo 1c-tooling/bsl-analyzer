@@ -895,13 +895,17 @@ fn append_type_completeness(out: &mut String, reasons: &[(String, &'static str)]
     }
 }
 
+/// Markdown-safe by structure, not by presentation: object names are identifiers the
+/// caller matches against the source configuration, so they travel verbatim — `_` and
+/// `*` used to be escaped and made the names unmatchable (github#171). Only what would
+/// corrupt the emitted structure is handled: the table cell separator (and the
+/// backslash that could otherwise unescape it) and line breaks.
 fn escape_markdown(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
-        if matches!(ch, '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '<' | '>') {
-            escaped.push('\\');
-        }
         match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '|' => escaped.push_str("\\|"),
             '\n' | '\r' => escaped.push(' '),
             _ => escaped.push(ch),
         }
@@ -1493,6 +1497,49 @@ mod tests {
             partial.contains("Полнота типов: partial\n- Реквизиты.Вариант: unknown_technical_name"),
             "{partial}"
         );
+    }
+
+    /// Имена — идентификаторы для последующих вызовов, и `_`/`*` в них не
+    /// экранируются; экранирование осталось только структурным (github#171).
+    #[test]
+    fn names_travel_verbatim_and_only_structure_is_escaped() {
+        assert_eq!(
+            escape_markdown("Номенклатура_С_Подчёркиванием"),
+            "Номенклатура_С_Подчёркиванием"
+        );
+        assert_eq!(escape_markdown("Тип*Звёздочка"), "Тип*Звёздочка");
+        assert_eq!(escape_markdown("a|b"), "a\\|b");
+        // Обратный слэш перед `|` обязан удвоиться: иначе `\|` из имени
+        // «разэкранировался» бы и пайп разорвал ячейку.
+        assert_eq!(escape_markdown("a\\|b"), "a\\\\\\|b");
+        assert_eq!(escape_markdown("a\nb"), "a b");
+        assert_eq!(escape_markdown("a\\b"), "a\\\\b");
+    }
+
+    /// Подчёркивание в имени объекта и реквизита доезжает до вывода дословно:
+    /// агент сопоставляет эти имена с исходной конфигурацией и не должен
+    /// разбирать экранирование (github#171).
+    #[test]
+    fn object_and_attribute_names_with_underscores_stay_verbatim() {
+        use bsl_metadata::metadata_object::MdoType;
+        use bsl_metadata::{Attribute, AttributeType, Configuration, MetadataObject};
+
+        let mut config = Configuration::new("Тест");
+        let mut object = MetadataObject::new(MdoType::Catalog, "Номенклатура_С_Подчёркиванием");
+        object.add_attribute(Attribute {
+            name: "Характеристика_НДС".into(),
+            name_en: None,
+            attr_type: AttributeType::String { length: Some(20) },
+        });
+        config.add_metadata_object(object);
+
+        let result =
+            get_object_structure(&config, "Справочник", "Номенклатура_С_Подчёркиванием").unwrap();
+        let text = extract_text(&result);
+
+        assert!(text.contains("# Справочник.Номенклатура_С_Подчёркиванием"), "{text}");
+        assert!(text.contains("Характеристика_НДС"), "{text}");
+        assert!(!text.contains('\\'), "имена обязаны ехать дословно: {text}");
     }
 
     #[test]
