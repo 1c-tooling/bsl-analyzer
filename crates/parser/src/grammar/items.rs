@@ -112,8 +112,19 @@ pub fn procedure_def_content(p: &mut Parser) {
     p.expect(T![KwProcedure]);
 
     let recovered = p.within_boundary(at_end_procedure, |p| {
-        if p.at(T![Ident]) || p.current().is_some_and(|k| k.is_keyword()) {
+        // A keyword standing here is a name: the rule takes it and the
+        // `ReservedWordAsMethodName` diagnostic says why it is not one (D5).
+        // The word closing THIS declaration is the exception — taking it as
+        // the name loses the closer, and the declaration then ends at end of
+        // file with a complaint about end of file. A closer of something else
+        // (a `)` of a group still open) is not reported on: that recovery's
+        // count is pinned by `a_word_inside_a_group_is_not_the_separator_the_header_awaits`.
+        if p.at(T![Ident])
+            || (p.current().is_some_and(|k| k.is_keyword()) && !p.at(T![KwEndProcedure]))
+        {
             p.bump();
+        } else if p.at(T![KwEndProcedure]) {
+            report_missing_name(p, "ожидалось имя процедуры");
         }
 
         if p.at(T![LParen]) {
@@ -147,8 +158,13 @@ pub fn function_def_content(p: &mut Parser) {
     p.expect(T![KwFunction]);
 
     let recovered = p.within_boundary(at_end_function, |p| {
-        if p.at(T![Ident]) || p.current().is_some_and(|k| k.is_keyword()) {
+        // The same division as [`procedure_def_content`], closer included.
+        if p.at(T![Ident])
+            || (p.current().is_some_and(|k| k.is_keyword()) && !p.at(T![KwEndFunction]))
+        {
             p.bump();
+        } else if p.at(T![KwEndFunction]) {
+            report_missing_name(p, "ожидалось имя функции");
         }
 
         if p.at(T![LParen]) {
@@ -197,6 +213,17 @@ fn param(p: &mut Parser) {
 
     if p.at(T![Ident]) {
         p.bump();
+    } else if !p.at_end() && !p.at_enclosing_boundary() && !p.at_error() && !p.at(T![Eq]) {
+        // A word of the wrong kind where the name belongs is reported and
+        // taken by the ordinary recovery — leaving it behind would let the
+        // list's own `expect(RParen)` spend it, and the closing paren with it
+        // (github#259). The comma and the closing paren are a different state:
+        // a typed list and its already-typed end, with the name still to be
+        // written (finding D10); so is `=`, the parameter's own default value
+        // ahead of the name, which taking would hand the value to
+        // `expect(RParen)`. Text the lexer already rejected is not complained
+        // about twice (the norm of `at_error`).
+        p.error_custom("ожидалось имя параметра");
     }
 
     if p.eat(T![Eq]) {
@@ -210,6 +237,26 @@ pub fn var_declaration(p: &mut Parser) {
     let m = p.start();
     var_declaration_content(p);
     m.complete(p, NodeKind::VarDef);
+}
+
+/// Reports a name the position requires, without moving the cursor.
+///
+/// The token the position tripped over is what holds the rest of the parse
+/// together: `;` closes the declaration, `,` ends the item, `Экспорт` is still
+/// read by its own `eat`. Taking it as recovery costs the statement, so the
+/// complaint stands where the name should have been and the token stays
+/// (github#209). At end of input the position stays silent: the line is still
+/// being typed, and the name may yet be written. On text the lexer already
+/// rejected it stays silent too (the norm of `at_error`).
+///
+/// The SDBL half keeps a `report_missing_name` of its own
+/// (`grammar/sdbl/expressions.rs`): there the report goes at a marker span and
+/// no punctuation is ever taken, while here a word of the wrong kind is taken
+/// by the ordinary recovery when the position is the parameter's.
+fn report_missing_name(p: &mut Parser, expected: &'static str) {
+    if !p.at_end() && !p.at_error() {
+        p.error_custom_no_bump(expected);
+    }
 }
 
 /// `Экспорт` is taken after the whole list, and after a single name.
@@ -226,12 +273,16 @@ pub fn var_declaration_content(p: &mut Parser) {
 
     if p.at(T![Ident]) {
         p.bump();
+    } else {
+        report_missing_name(p, "ожидалось имя переменной");
     }
 
     while p.eat(T![Comma]) {
         p.check_iteration_limit();
         if p.at(T![Ident]) {
             p.bump();
+        } else {
+            report_missing_name(p, "ожидалось имя переменной");
         }
     }
 
