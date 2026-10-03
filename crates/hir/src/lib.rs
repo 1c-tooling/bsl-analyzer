@@ -20,7 +20,8 @@ pub use hir_ty::{is_form_items_collection_ty, FORM_ITEMS_TYPE_EN, FORM_ITEMS_TYP
 pub use hir_ty::{PlatformMethodHandle, PlatformMethodOrigin};
 pub use name_classify::{classify_token, NameClass};
 pub use semantic_symbol::{
-    FileSymbolCtx, SemanticSymbol, SemanticSymbolKey, SemanticSymbolKind, SymbolDeclaration,
+    FileSymbolCtx, MemberReceiver, SemanticSymbol, SemanticSymbolKey, SemanticSymbolKind,
+    SymbolDeclaration,
 };
 pub use type_facade::{
     execution_environment_at, form_element_type, kernel_type_label, module_implicit_field_names,
