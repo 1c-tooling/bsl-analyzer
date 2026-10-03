@@ -291,11 +291,19 @@ impl<'db, DB: HirDatabase + base_db::RootQueryDb> FileSymbolCtx<'db, DB> {
     /// Only a name-shaped receiver has an identity: an identifier (`С.Поле`), or a chain
     /// ending in one (`А.Б.Поле` reads the member of what `А.Б` means). Anything else — a
     /// parenthesized expression, a call result, an inline constructor — names nothing, and
-    /// its member keeps to the spelling of its own occurrence.
+    /// its member keeps to the spelling of its own occurrence. A definition the receiver names
+    /// is stored folded: the key is compared by derived equality, and BSL does not tell
+    /// `Справочник1` from `СПРАВОЧНИК1`.
     fn member_receiver(&self, receiver: &syntax::SyntaxNode) -> MemberReceiver {
         if let Some(name_token) = receiver_name_token(receiver) {
             if let Some(symbol) = self.symbol_for_token(&name_token) {
-                return MemberReceiver::Symbol(Box::new(symbol.key));
+                let key = match symbol.key {
+                    SemanticSymbolKey::Definition(definition) => {
+                        SemanticSymbolKey::Definition(definition.folded())
+                    }
+                    key => key,
+                };
+                return MemberReceiver::Symbol(Box::new(key));
             }
         }
         MemberReceiver::Spelling { file_id: self.file_id, range: receiver.text_range() }
