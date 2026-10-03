@@ -3410,3 +3410,194 @@ fn every_virtual_table_shape_inherits_the_provisional_marks_of_its_register() {
 
     assert!(checked_any > 0, "no shape produced a conditional name — the gate asserted nothing");
 }
+
+/// The metadata XML reader synthesises the register's object-model standard attributes into
+/// `attributes`; the query layer must not append a second copy of them (issue #83).
+fn config_with_information_register_from_xml(periodicity: &str) -> bsl_metadata::Configuration {
+    let xml = format!(
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<InformationRegister uuid="59f8d329-f39c-4999-b470-ae9fc74511ac">
+<Properties><Name>Курсы</Name><InformationRegisterPeriodicity>{periodicity}</InformationRegisterPeriodicity></Properties>
+<ChildObjects>
+<Dimension uuid="532f2a7f-4c1e-4a49-8281-3c21232da2d7"><Properties><Name>Валюта</Name></Properties></Dimension>
+</ChildObjects>
+</InformationRegister></MetaDataObject>"#
+    );
+    let register = bsl_metadata::xml_parser::parse_information_register_xml(&xml)
+        .expect("information register fixture must parse");
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    config
+}
+
+fn config_with_accumulation_register_from_xml() -> bsl_metadata::Configuration {
+    let xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<AccumulationRegister uuid="11111111-1111-1111-1111-111111111111">
+<Properties><Name>ОстаткиТоваров</Name></Properties>
+<ChildObjects>
+<Dimension uuid="22222222-2222-2222-2222-222222222222"><Properties><Name>Товар</Name></Properties></Dimension>
+</ChildObjects>
+</AccumulationRegister></MetaDataObject>"#;
+    let register = bsl_metadata::xml_parser::parse_accumulation_register_xml(xml)
+        .expect("accumulation register fixture must parse");
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    config
+}
+
+fn register_field_name_counts(
+    fields: &[crate::hir::FieldDef],
+) -> std::collections::HashMap<&str, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for field in fields {
+        *counts.entry(field.name.as_str()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn resolved_main_table(package: &SdblPackage) -> &crate::hir::ResolvedTable {
+    single_query_hir(package).from[0].metadata.as_ref().expect("register main table must resolve")
+}
+
+/// Issue #83: a standard field name must be offered exactly once, for a periodic and for a
+/// non-periodic information register alike, and the `provisional` marks must survive the dedup.
+#[test]
+fn information_register_standard_fields_are_offered_once() {
+    for (periodicity, period_is_provisional) in [("Nonperiodical", true), ("Day", false)] {
+        let config = config_with_information_register_from_xml(periodicity);
+        let code = "ВЫБРАТЬ Т.Регистратор, Т.Период ИЗ РегистрСведений.Курсы КАК Т";
+        let ast = parser::parse_sdbl(code);
+        let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+        let resolved = resolved_main_table(&package);
+
+        let counts = register_field_name_counts(resolved.fields());
+        for (name, count) in &counts {
+            assert_eq!(*count, 1, "[{periodicity}] `{name}` is offered {count} times: {counts:?}");
+        }
+        for name in ["Активность", "НомерСтроки", "Период", "Регистратор", "МоментВремени"]
+        {
+            assert!(counts.contains_key(name), "[{periodicity}] `{name}` is missing: {counts:?}");
+        }
+
+        let period = resolved.find_field("Период").expect("Период must be offered");
+        assert_eq!(
+            period.provisional, period_is_provisional,
+            "[{periodicity}] `Период` provisional flag must reflect the periodicity",
+        );
+        assert!(
+            resolved.find_field("МоментВремени").expect("listed above").provisional,
+            "[{periodicity}] `МоментВремени` is recorder-mode-only and must stay provisional",
+        );
+        assert!(
+            resolved.find_field("Регистратор").expect("listed above").provisional,
+            "[{periodicity}] recorder-mode fields of an information register must stay provisional",
+        );
+    }
+}
+
+/// Issue #83: accumulation-register standards are unconditional — offered once and unmarked.
+#[test]
+fn accumulation_register_standard_fields_are_offered_once() {
+    let config = config_with_accumulation_register_from_xml();
+    let code = "ВЫБРАТЬ Т.Регистратор, Т.ВидДвижения ИЗ РегистрНакопления.ОстаткиТоваров КАК Т";
+    let ast = parser::parse_sdbl(code);
+    let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+    let resolved = resolved_main_table(&package);
+
+    let counts = register_field_name_counts(resolved.fields());
+    for (name, count) in &counts {
+        assert_eq!(*count, 1, "`{name}` is offered {count} times: {counts:?}");
+    }
+    for name in
+        ["Активность", "ВидДвижения", "МоментВремени", "НомерСтроки", "Период", "Регистратор"]
+    {
+        assert!(counts.contains_key(name), "`{name}` is missing: {counts:?}");
+        assert!(
+            !resolved.find_field(name).expect("listed above").provisional,
+            "`{name}` is unconditional for an accumulation register and must not be provisional",
+        );
+    }
+}
+
+/// Issue #83, acceptance point 2: completions derive from the field list one-to-one, so a
+/// deduplicated register table offers every column exactly once.
+#[test]
+fn register_column_completions_have_no_duplicates() {
+    let config = config_with_information_register_from_xml("Day");
+    let code = "ВЫБРАТЬ Т.Регистратор ИЗ РегистрСведений.Курсы КАК Т";
+    let ast = parser::parse_sdbl(code);
+    let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+    let table = single_query_hir(&package).from[0].clone();
+
+    let mut scope = crate::Scope::new();
+    let _ = scope.add_table(table);
+    let completions = scope.column_completions(Some("Т"));
+
+    let mut seen = std::collections::HashSet::new();
+    for completion in &completions {
+        assert!(
+            seen.insert(completion.column_name.as_str().to_string()),
+            "duplicate completion `{}` in {:?}",
+            completion.column_name,
+            completions.iter().map(|c| c.column_name.as_str()).collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        completions.iter().filter(|c| c.column_name.as_str() == "Регистратор").count(),
+        1,
+        "`Регистратор` must be completed once",
+    );
+}
+
+/// Issue #83 follow-up: with the metadata reader as the single owner, standard fields must
+/// keep resolving by their English spellings too — `name_en` is the only path `matches_name`
+/// has for them.
+#[test]
+fn register_standard_fields_resolve_under_english_names() {
+    for periodicity in ["Day", "Nonperiodical"] {
+        let config = config_with_information_register_from_xml(periodicity);
+        let code = "ВЫБРАТЬ T.Recorder, T.Period, T.Active, T.LineNumber, T.PointInTime \
+                    ИЗ РегистрСведений.Курсы КАК T";
+        let ast = parser::parse_sdbl(code);
+        let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+        assert!(
+            unknown_fields(&package).is_empty(),
+            "[{periodicity}] english standard names must resolve for an information register, \
+             got: {:?}",
+            unknown_fields(&package),
+        );
+    }
+
+    let config = config_with_accumulation_register_from_xml();
+    let code = "ВЫБРАТЬ T.Recorder, T.Period, T.Active, T.LineNumber, T.PointInTime, \
+                T.RecordType ИЗ РегистрНакопления.ОстаткиТоваров КАК T";
+    let ast = parser::parse_sdbl(code);
+    let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+    assert!(
+        unknown_fields(&package).is_empty(),
+        "english standard names must resolve for an accumulation register, got: {:?}",
+        unknown_fields(&package),
+    );
+}
+
+/// Issue #83: the slice shapes rebuild a literal `Период`; when the register already carries
+/// the reader's `Период` attribute, the literal must not join it as a second copy.
+#[test]
+fn register_slice_offers_period_once() {
+    for periodicity in ["Nonperiodical", "Day"] {
+        let config = config_with_information_register_from_xml(periodicity);
+        let code = "ВЫБРАТЬ T.Период ИЗ РегистрСведений.Курсы.СрезПоследних(&Дата,) КАК T";
+        let ast = parser::parse_sdbl(code);
+        let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+        let fields = single_query_hir(&package).from[0]
+            .metadata
+            .as_ref()
+            .expect("slice must resolve")
+            .fields();
+        let periods = fields.iter().filter(|field| field.matches_name("Период")).count();
+        assert_eq!(
+            periods, 1,
+            "[{periodicity}] `Период` must be offered once in the slice: {fields:?}"
+        );
+    }
+}

@@ -101,6 +101,12 @@ impl RegisterAttribute {
         self.name_en.as_deref()
     }
 
+    /// The English spelling of a synthesised standard attribute. A user attribute parses its
+    /// own names from XML; the synthesiser is the only writer here.
+    pub fn set_name_en(&mut self, name_en: impl Into<String>) {
+        self.name_en = Some(name_en.into());
+    }
+
     pub fn type_str(&self) -> &str {
         &self.type_str
     }

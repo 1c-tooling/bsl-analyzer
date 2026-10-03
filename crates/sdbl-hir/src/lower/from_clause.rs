@@ -518,11 +518,15 @@ impl LoweringContext<'_> {
                 .attr_type()
                 .map(|at| self.resolve_attribute_type(at))
                 .unwrap_or(SdblType::Unknown);
+            // Only the synthesiser writes `name_en`, so its presence marks exactly the
+            // reader-injected standard attributes; a user attribute named like another
+            // object's standard (`Код`) must not be misclassified as one.
+            let is_synthesized = attr.name_en().is_some();
             let mut field = FieldDef::new_with_names(
                 attr.name().to_string(),
                 attr.name_en().map(|s| s.to_string()),
                 ty,
-                false,
+                is_synthesized,
             );
             // The metadata reader injects the recorder-mode fields into every register's
             // attribute list, so the mark has to be applied HERE and not only to the standard
@@ -537,27 +541,16 @@ impl LoweringContext<'_> {
         fields.extend(resources.iter().cloned());
         fields.extend(attributes.iter().cloned());
 
-        // Standard fields of the register main table, per ITS query-language
-        // reference (pubqlang ch.82/92/130 + accounting ch.111). Each kind has
-        // its own fixed set; conditional fields (e.g. calc-register action/base
-        // periods) are over-added — that is an acceptable false-negative, while
-        // the diagnostic contract forbids only false-positives.
-        let (mut standard_fields, field_model_complete) = Self::register_standard_fields(mdo_type);
-        if mdo_type == MdoType::InformationRegister {
-            // `Период` exists only on a periodic register — the metadata reader adds it under
-            // exactly that condition. The set above adds it to every register, so mark it
-            // unless this one is known to be periodic.
-            let periodic = matches!(
-                register.periodicity(),
-                Some(p) if p != bsl_metadata::RegisterPeriodicity::Nonperiodical
-            );
-            if !periodic {
-                for field in standard_fields.iter_mut().filter(|f| f.matches_name("Период")) {
-                    field.provisional = true;
-                }
-            }
-        }
-        fields.extend(standard_fields);
+        // The register's object-model standard fields (`Регистратор`/`Активность`/`НомерСтроки`
+        // [/`Период`]) are synthesised by the metadata XML reader and already sit in
+        // `attributes` above; they are NOT repeated here, so each name is offered exactly
+        // once. Only the query table's own additions are appended: virtual columns and the
+        // conditional names the reader did not emit for this very register. What the reader
+        // did emit is answered by `attributes` itself, not by re-deriving the condition.
+        let reader_has_period = attributes.iter().any(|field| field.matches_name("Период"));
+        let (query_only_fields, field_model_complete) =
+            Self::register_query_only_fields(mdo_type, reader_has_period);
+        fields.extend(query_only_fields);
 
         tracing::debug!(
             mdo_type = ?mdo_type,
@@ -597,41 +590,46 @@ impl LoweringContext<'_> {
         RECORDER_MODE_ONLY.iter().any(|known| stdx::case::eq_ignore_case(known, name))
     }
 
-    /// Standard (platform) fields of a register MAIN table, paired with whether
-    /// the resulting field model is exhaustive enough to drive the unknown-field
-    /// diagnostic. Sets follow the ITS query-language reference (pubqlang
+    /// Fields the register MAIN table has on top of the object-model set — query-only virtual
+    /// columns and the conditional names the metadata reader did not synthesise for this very
+    /// register — paired with whether the resulting field model is exhaustive enough to drive
+    /// the unknown-field diagnostic. Sets follow the ITS query-language reference (pubqlang
     /// ch.82/92/111/130).
-    fn register_standard_fields(mdo_type: MdoType) -> (Vec<FieldDef>, bool) {
+    ///
+    /// The object-model standard fields themselves are owned by the metadata reader
+    /// (`register.attributes()`); repeating them here is what offered every one of them twice.
+    /// `reader_has_period` answers what the reader actually emitted for this register, so the
+    /// two layers cannot drift apart on the periodicity condition.
+    fn register_query_only_fields(
+        mdo_type: MdoType,
+        reader_has_period: bool,
+    ) -> (Vec<FieldDef>, bool) {
         match mdo_type {
+            // The reader emits `Период` only for a periodic register, while the query
+            // reference lists it for every register — so it is over-added here, provisional,
+            // when the reader did not emit it. `МоментВремени` is query-only (like on
+            // documents) and exists only in "Подчинение регистратору" mode.
+            MdoType::InformationRegister => {
+                let mut fields = vec![FieldDef::provisional_standard(
+                    "МоментВремени",
+                    "PointInTime",
+                    SdblType::DateTime,
+                )];
+                if !reader_has_period {
+                    fields.push(FieldDef::provisional_standard("Период", "Period", SdblType::Date));
+                }
+                (fields, true)
+            }
             MdoType::AccumulationRegister => (
                 vec![
-                    FieldDef::standard("Период", "Period", SdblType::Date),
-                    FieldDef::standard("Регистратор", "Recorder", SdblType::AnyRef),
-                    FieldDef::standard("Активность", "Active", SdblType::Boolean),
-                    FieldDef::standard("НомерСтроки", "LineNumber", SdblType::number()),
                     FieldDef::standard("МоментВремени", "PointInTime", SdblType::DateTime),
                     FieldDef::standard("ВидДвижения", "RecordType", SdblType::string()),
                 ],
                 true,
             ),
-            // Регистратор/НомерСтроки/Активность/МоментВремени exist only in
-            // "Подчинение регистратору" mode, which the metadata model does not read, so they
-            // are listed provisionally: silent for the unknown-field rule, invisible to the
-            // ambiguity rule.
-            MdoType::InformationRegister => (
-                vec![
-                    FieldDef::standard("Период", "Period", SdblType::Date),
-                    FieldDef::provisional_standard("Регистратор", "Recorder", SdblType::AnyRef),
-                    FieldDef::provisional_standard("Активность", "Active", SdblType::Boolean),
-                    FieldDef::provisional_standard("НомерСтроки", "LineNumber", SdblType::number()),
-                    FieldDef::provisional_standard(
-                        "МоментВремени",
-                        "PointInTime",
-                        SdblType::DateTime,
-                    ),
-                ],
-                true,
-            ),
+            // The metadata reader has no standard-attribute synthesis for the kinds below,
+            // so these sets remain the only source of their standard fields.
+            //
             // No plain `Период` here — `ПериодРегистрации` is the anchor. The
             // action-/base-period fields are conditional on register properties the metadata
             // model does not read, so they are listed provisionally.
@@ -840,7 +838,12 @@ impl LoweringContext<'_> {
                 }
             }
             VirtualTableType::SliceLast | VirtualTableType::SliceFirst => {
-                let mut fields = vec![FieldDef::standard("Период", "Period", SdblType::Date)];
+                // The register's own `Период` (a periodic register carries it as a standard
+                // attribute) must not be joined by a second, literal copy.
+                let mut fields = Vec::new();
+                if !attributes.iter().any(|field| field.matches_name("Период")) {
+                    fields.push(FieldDef::standard("Период", "Period", SdblType::Date));
+                }
                 fields.extend(dimensions.iter().cloned());
                 fields.extend(resources.iter().cloned());
                 fields.extend(attributes.iter().cloned());
