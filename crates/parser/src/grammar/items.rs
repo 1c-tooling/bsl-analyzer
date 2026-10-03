@@ -213,14 +213,16 @@ fn param(p: &mut Parser) {
 
     if p.at(T![Ident]) {
         p.bump();
-    } else if !p.at_end() && !p.at_enclosing_boundary() && !p.at_error() {
+    } else if !p.at_end() && !p.at_enclosing_boundary() && !p.at_error() && !p.at(T![Eq]) {
         // A word of the wrong kind where the name belongs is reported and
         // taken by the ordinary recovery — leaving it behind would let the
         // list's own `expect(RParen)` spend it, and the closing paren with it
         // (github#259). The comma and the closing paren are a different state:
         // a typed list and its already-typed end, with the name still to be
-        // written (finding D10); text the lexer already rejected is not
-        // complained about twice (the norm of `at_error`).
+        // written (finding D10); so is `=`, the parameter's own default value
+        // ahead of the name, which taking would hand the value to
+        // `expect(RParen)`. Text the lexer already rejected is not complained
+        // about twice (the norm of `at_error`).
         p.error_custom("ожидалось имя параметра");
     }
 
@@ -244,14 +246,15 @@ pub fn var_declaration(p: &mut Parser) {
 /// read by its own `eat`. Taking it as recovery costs the statement, so the
 /// complaint stands where the name should have been and the token stays
 /// (github#209). At end of input the position stays silent: the line is still
-/// being typed, and the name may yet be written.
+/// being typed, and the name may yet be written. On text the lexer already
+/// rejected it stays silent too (the norm of `at_error`).
 ///
 /// The SDBL half keeps a `report_missing_name` of its own
 /// (`grammar/sdbl/expressions.rs`): there the report goes at a marker span and
 /// no punctuation is ever taken, while here a word of the wrong kind is taken
 /// by the ordinary recovery when the position is the parameter's.
 fn report_missing_name(p: &mut Parser, expected: &'static str) {
-    if !p.at_end() {
+    if !p.at_end() && !p.at_error() {
         p.error_custom_no_bump(expected);
     }
 }

@@ -940,6 +940,17 @@ fn a_missing_parameter_name_does_not_swallow_the_list_closer() {
         "{:?}",
         messages(lexer_error, true)
     );
+
+    // `=` в позиции имени — продолжение самого параметра: значение по умолчанию
+    // при ещё не набранном имени. Взятый восстановлением, он отдал бы значение
+    // `expect(RParen)`, а закрыватель списка — телу.
+    for typing in [
+        "Процедура П(= 5)\nКонецПроцедуры",
+        "Процедура П(Знач = 5)\nКонецПроцедуры",
+        "Процедура П(А, = А + 1)\nКонецПроцедуры",
+    ] {
+        assert_eq!(messages(typing, true), Vec::<String>::new(), "{typing}");
+    }
 }
 
 /// #209: `Перем` без имени сообщает о пропаже, не сдвигая позицию.
@@ -956,6 +967,20 @@ fn a_var_declaration_without_a_name_reports_and_keeps_the_statement() {
         assert_eq!(messages.len(), 1, "{input}: {messages:?}");
         assert!(messages[0].contains("имя переменной"), "{input}: {messages:?}");
         assert!(covers(input, true), "{input}: текст потерян");
+        for kept in [";", ",", "Экспорт"] {
+            assert!(
+                !swallowed(input, true, kept),
+                "{input}: `{kept}` уехал в восстановление: {:?}",
+                error_node_texts(input, true)
+            );
+        }
+    }
+
+    // Текст, отвергнутый лексером, в позиции имени второй жалобы не получает.
+    for input in ["Перем &;", "Перем А, !;"] {
+        let messages = messages(input, true);
+        assert_eq!(messages.len(), 1, "{input}: {messages:?}");
+        assert!(!messages[0].contains("имя переменной"), "{input}: {messages:?}");
     }
 
     // Незавершённый набор на конце ввода — не ошибка: после `Перем` имя ещё
