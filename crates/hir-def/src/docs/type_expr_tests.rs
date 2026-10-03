@@ -218,6 +218,32 @@ fn a_marker_in_the_description_names_the_target_too() {
     );
 }
 
+/// A return union may declare a `см.` member. Every order and both shapes from the
+/// measurement keep two alternatives, one of them naming a target; today the slot is lost
+/// whole (0 alternatives, or 1 with the marker as the type name).
+#[test]
+fn a_see_member_of_a_return_union_survives_in_every_order() {
+    for line in [
+        "  Неопределено, см. База.Создать",
+        "  Неопределено, см. База.Создать - описание.",
+        "  Строка, см. База.Создать",
+        "  см. База.Создать, Неопределено",
+    ] {
+        let docs = parse_docs(&["Возвращаемое значение:", line]);
+        let returned: Vec<DocTypeExpr> =
+            docs.returned_value.iter().filter_map(parse_type_expr).collect();
+        assert_eq!(returned.len(), 2, "{line}: {returned:?}");
+        assert!(
+            returned.iter().any(DocTypeExpr::names_documentation_target),
+            "{line}: the reference member was lost: {returned:?}"
+        );
+        assert!(
+            returned.iter().any(|expr| matches!(expr, DocTypeExpr::TypeRef(_))),
+            "{line}: the plain member was lost: {returned:?}"
+        );
+    }
+}
+
 #[test]
 fn prose_and_plain_types_name_no_target() {
     // `см. в`, `см. также` and their kin parse into a one-segment reference — there are 16 291 of

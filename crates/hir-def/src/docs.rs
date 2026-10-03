@@ -814,7 +814,11 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
         if trimmed.is_empty() {
             continue;
         }
-        if is_hyperlink_line(trimmed) {
+        // A whole-slot reference is a link, but a comma union that happens to START with
+        // `см.` is a list of alternatives whose first member is a reference: the union parser
+        // must see it, or the slot is lost to the link branch (`см. База.Создать, Неопределено`
+        // must stay two alternatives, one of them the target).
+        if is_hyperlink_line(trimmed) && parse_return_type_union(trimmed).is_none() {
             return vec![TypeDoc::hyperlink(trimmed.to_string())];
         }
         break;
@@ -951,7 +955,8 @@ fn parse_return_type_union(line: &str) -> Option<Vec<TypeDoc>> {
         if member.is_empty() {
             return None;
         }
-        let (type_name, member_description) = parse_return_type_name(member)?;
+        let (type_name, member_description) =
+            parse_return_type_name(member).or_else(|| see_member(member))?;
         let description = merge_type_descriptions(member_description, description.clone());
         members.push(TypeDoc::simple(type_name, description));
     }
@@ -1010,6 +1015,13 @@ fn parse_return_type_name(type_part: &str) -> Option<(String, Option<String>)> {
     }
 
     None
+}
+
+/// A `см. Модуль.Метод` member of a union is an alternative of its own: the parameter side
+/// keeps it (its slot splits by the same comma), and the return side must not lose the whole
+/// slot because of it.
+fn see_member(member: &str) -> Option<(String, Option<String>)> {
+    type_expr::see_reference_of(member).map(|_| (member.to_string(), None))
 }
 
 fn parse_collection_type(type_part: &str) -> Option<(String, String)> {
