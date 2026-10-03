@@ -2061,11 +2061,10 @@ const DEFINITION_MEMBER_TWICE: &str = "\
 /// Gate — two mentions of ONE member of a typed receiver are one symbol.
 ///
 /// `SemanticSymbolKey::TypedMember` names the member by its receiver and its folded field
-/// name, so both mentions share one key by construction. Before that identity existed the
-/// key was the occurrence's own range, and a dedup trusting it would answer `ambiguous` with
-/// two clones of one place — against this stage's own promise that one symbol on several
-/// lines is one answer, and against a hint (`narrow line_content`) that cannot help, since
-/// any narrowing still holds the member.
+/// name, so both mentions share one key by construction. A key that varied per occurrence
+/// would answer `ambiguous` with two clones of one place — against the promise that one
+/// symbol on several lines is one answer, and against a hint (`narrow line_content`) that
+/// cannot help, since any narrowing still holds the member.
 #[test]
 fn two_mentions_of_one_typed_member_are_not_an_ambiguity() {
     let (db, files) =

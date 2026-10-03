@@ -756,9 +756,9 @@ struct AnchorCandidate {
 ///
 /// The key IS that identity, and a typed member's key names the member — its receiver and its
 /// folded field name — so two readings of one local's field collapse by themselves, while
-/// same-named fields of two different locals stay two. The private comparison by field type
-/// and name, which existed only because `TypedMember` was keyed by the occurrence's own range,
-/// is gone: the walk and the anchor read one equality.
+/// same-named fields of two different locals stay two. The walk and the anchor read one
+/// equality; the field type is no substitute, since a scalar field's type is soft (`unknown`)
+/// and separates nothing.
 fn same_anchor(left: &SemanticSymbol, right: &SemanticSymbol) -> bool {
     match (&left.key, &right.key) {
         // A definition keyed by a name carries the spelling of the occurrence, and BSL does
