@@ -19,6 +19,12 @@ pub enum DocumentHighlightKind {
     Write,
 }
 
+/// Highlights for one file.
+///
+/// Answered without the reference-scope gate on purpose: this consumer is read-only and
+/// local, while the gate protects walks that leave the file and feeds rename. A typed member
+/// carries a real identity — its receiver and its field name — so the ungated walk lights
+/// every read of the member instead of the occurrence alone.
 pub fn document_highlights<DB: RootDatabase>(
     db: &DB,
     file_id: FileId,
@@ -285,6 +291,120 @@ mod tests {
         let call_token = root.token_at_offset(call_offset).right_biased().unwrap();
         assert_eq!(classify_reference_token(&call_token), ReferenceKind::Call);
         assert_eq!(classify_highlight_token(&call_token), DocumentHighlightKind::Read);
+    }
+
+    /// A member of a local reached through a typed receiver is identified by the RECEIVER it
+    /// is read from and the field name. Two readings of one field are one member; a highlight
+    /// that trusted the occurrence's own range would light only the one under the cursor.
+    #[test]
+    fn typed_member_highlights_every_read_of_one_receiver() {
+        let source = "Процедура Тест() Экспорт\n    С = Новый Структура(\"Поле\", 1);\n    Х = С.Поле;\n    У = С.Поле;\nКонецПроцедуры\n";
+        let (db, file_id) = create_db_with_file(source);
+
+        let at = source.find("С.Поле").unwrap() + "С.".len();
+        let mut highlights = document_highlights(&db, file_id, TextSize::from(at as u32));
+        highlights.sort_by_key(|highlight| highlight.range.start());
+
+        let lines: Vec<usize> = highlights
+            .iter()
+            .map(|highlight| source[..highlight.range.start().into()].matches('\n').count())
+            .collect();
+        assert_eq!(lines, vec![2, 3], "only the cursor's own read lit: {highlights:?}");
+        assert!(
+            highlights.iter().all(|highlight| highlight.kind == DocumentHighlightKind::Read),
+            "{highlights:?}"
+        );
+    }
+
+    /// Gate — the other direction: equal-shaped fields of two DIFFERENT locals are two
+    /// members. A key of name and field type would collapse all three reads into one answer:
+    /// the scalar field type is deliberately soft (`unknown`), so it separates nothing.
+    #[test]
+    fn typed_member_highlight_does_not_cross_receivers() {
+        let source = "Процедура Тест() Экспорт\n    С = Новый Структура(\"Поле\", 1);\n    Д = Новый Структура(\"Поле\", 2);\n    Х = С.Поле;\n    У = С.Поле;\n    Т = Д.Поле;\nКонецПроцедуры\n";
+        let (db, file_id) = create_db_with_file(source);
+
+        let lines_from = |needle: &str| {
+            let at = source.find(needle).unwrap() + needle.find('.').unwrap() + 1;
+            let mut highlights = document_highlights(&db, file_id, TextSize::from(at as u32));
+            highlights.sort_by_key(|highlight| highlight.range.start());
+            highlights
+                .iter()
+                .map(|highlight| source[..highlight.range.start().into()].matches('\n').count())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(lines_from("С.Поле"), vec![3, 4], "С's reads are not one member");
+        assert_eq!(lines_from("Д.Поле"), vec![5], "Д's read belongs to its own member");
+    }
+
+    /// The receiver's value type is a property of a program point, not of the member's
+    /// identity: reassigning the local to a structure whose key carries another value type
+    /// does not make a second member. The mirror of the implicit-local doctrine gate.
+    #[test]
+    fn typed_member_highlights_ignore_the_type_of_the_reassignment() {
+        let source = "Процедура Тест() Экспорт\n    С = Новый Структура(\"Поле\", 1);\n    Х = С.Поле;\n    С = Новый Структура(\"Поле\", \"текст\");\n    У = С.Поле;\nКонецПроцедуры\n";
+        let (db, file_id) = create_db_with_file(source);
+
+        let at = source.find("С.Поле").unwrap() + "С.".len();
+        let mut highlights = document_highlights(&db, file_id, TextSize::from(at as u32));
+        highlights.sort_by_key(|highlight| highlight.range.start());
+
+        let lines: Vec<usize> = highlights
+            .iter()
+            .map(|highlight| source[..highlight.range.start().into()].matches('\n').count())
+            .collect();
+        assert_eq!(lines, vec![2, 4], "the reassignment split the member: {highlights:?}");
+    }
+
+    /// A receiver that is itself a member (`С.Внутр.Поле`) is identified by its own key,
+    /// recursively: both reads of the nested member light, another outer local's nested
+    /// member stays out.
+    #[test]
+    fn typed_member_highlights_nested_receiver_chain() {
+        let source = "Процедура Тест() Экспорт\n    С = Новый Структура(\"Внутр\", Новый Структура(\"Поле\", 1));\n    Д = Новый Структура(\"Внутр\", Новый Структура(\"Поле\", 2));\n    Х = С.Внутр.Поле;\n    У = С.Внутр.Поле;\n    Т = Д.Внутр.Поле;\nКонецПроцедуры\n";
+        let (db, file_id) = create_db_with_file(source);
+
+        let lines_from = |needle: &str| {
+            let at = source.find(needle).unwrap() + needle.rfind('.').unwrap() + 1;
+            let mut highlights = document_highlights(&db, file_id, TextSize::from(at as u32));
+            highlights.sort_by_key(|highlight| highlight.range.start());
+            highlights
+                .iter()
+                .map(|highlight| source[..highlight.range.start().into()].matches('\n').count())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(lines_from("С.Внутр.Поле"), vec![3, 4], "С's nested member split");
+        assert_eq!(lines_from("Д.Внутр.Поле"), vec![5], "Д's nested member leaked");
+    }
+
+    /// A receiver that names nothing the rule can take (`Получить().Поле` — the result of a
+    /// call) has no identity beyond its spelling: each read answers for itself alone. The
+    /// call's type flows here from the returned typed local, so the member resolves and the
+    /// spelling branch is live, not defensive.
+    #[test]
+    fn typed_member_highlights_of_a_call_receiver_stay_one_site() {
+        let source = "Функция Получить() Экспорт\n    С = Новый Структура(\"Поле\", 1);\n    Возврат С;\nКонецФункции\n\nПроцедура Тест() Экспорт\n    Х = Получить().Поле;\n    У = Получить().Поле;\nКонецПроцедуры\n";
+        let (db, file_id) = create_db_with_file(source);
+
+        let at = |nth: usize| {
+            source
+                .match_indices("Получить().Поле")
+                .nth(nth)
+                .map(|(at, _)| TextSize::from((at + "Получить().".len()) as u32))
+                .expect("the input must carry two call reads")
+        };
+
+        for (nth, own_line) in [(0usize, 6usize), (1usize, 7usize)] {
+            let mut highlights = document_highlights(&db, file_id, at(nth));
+            highlights.sort_by_key(|highlight| highlight.range.start());
+            let lines: Vec<usize> = highlights
+                .iter()
+                .map(|highlight| source[..highlight.range.start().into()].matches('\n').count())
+                .collect();
+            assert_eq!(lines, vec![own_line], "call read #{nth}: {highlights:?}");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::{MethodId, ModuleId, Name, VariableId};
 use hir_def::DefDatabase;
 use hir_ty::PlatformMethodHandle;
 use std::sync::Arc;
+use stdx::case::fold_lower_per_char;
 use syntax::TextRange;
 use vfs::FileId;
 
@@ -36,35 +37,39 @@ impl Definition {
     /// two methods called `Расчёт` in two modules are genuinely two, and folding them would
     /// hide an ambiguity that is real.
     pub fn same_entity(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Definition::BuiltinFunction(left), Definition::BuiltinFunction(right)) => {
-                left.eq_ignore_case(right)
+        self.folded() == other.folded()
+    }
+
+    /// This definition with every occurrence-spelled name folded: derived equality of two
+    /// folded definitions is exactly [`Self::same_entity`]. A definition stored inside a key is
+    /// compared and hashed only by derived `Eq` and `Hash`, so it must be stored folded.
+    pub fn folded(&self) -> Definition {
+        let fold = |name: &Name| Name::from(fold_lower_per_char(name.as_str()));
+        match self {
+            Definition::BuiltinFunction(name) => Definition::BuiltinFunction(fold(name)),
+            Definition::BuiltinMethodHandle { handle, method_name } => {
+                Definition::BuiltinMethodHandle {
+                    handle: handle.clone(),
+                    method_name: fold(method_name),
+                }
             }
-            (
-                Definition::BuiltinMethodHandle { handle: left, method_name: left_name },
-                Definition::BuiltinMethodHandle { handle: right, method_name: right_name },
-            ) => left == right && left_name.eq_ignore_case(right_name),
-            (
-                Definition::MdoObject { mdo_type: left, object_name: left_name },
-                Definition::MdoObject { mdo_type: right, object_name: right_name },
-            ) => left == right && left_name.eq_ignore_case(right_name),
-            (
+            Definition::MdoObject { mdo_type, object_name } => {
+                Definition::MdoObject { mdo_type: *mdo_type, object_name: fold(object_name) }
+            }
+            Definition::MdoManagerModule { mdo_type, object_name, file_id } => {
                 Definition::MdoManagerModule {
-                    mdo_type: left,
-                    object_name: left_name,
-                    file_id: left_file,
-                },
-                Definition::MdoManagerModule {
-                    mdo_type: right,
-                    object_name: right_name,
-                    file_id: right_file,
-                },
-            ) => left == right && left_file == right_file && left_name.eq_ignore_case(right_name),
-            (
-                Definition::VirtualTableField { table_name: left_table, field_name: left_field },
-                Definition::VirtualTableField { table_name: right_table, field_name: right_field },
-            ) => left_table.eq_ignore_case(right_table) && left_field.eq_ignore_case(right_field),
-            (left, right) => left == right,
+                    mdo_type: *mdo_type,
+                    object_name: fold(object_name),
+                    file_id: *file_id,
+                }
+            }
+            Definition::VirtualTableField { table_name, field_name } => {
+                Definition::VirtualTableField {
+                    table_name: fold(table_name),
+                    field_name: fold(field_name),
+                }
+            }
+            other => other.clone(),
         }
     }
 }
@@ -241,5 +246,45 @@ impl Definition {
                 | Definition::MdoObject { .. }
                 | Definition::MdoManagerModule { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A folded definition is what a key stores, so two spellings of one entity must land in
+    /// one hash bucket, while the id- and kind-bearing parts still tell entities apart.
+    #[test]
+    fn folded_definitions_are_equal_exactly_when_same_entity() {
+        let catalog = |name: &str| Definition::MdoObject {
+            mdo_type: bsl_metadata::MdoType::Catalog,
+            object_name: Name::new(name),
+        };
+        let document = Definition::MdoObject {
+            mdo_type: bsl_metadata::MdoType::Document,
+            object_name: Name::new("Номенклатура"),
+        };
+        let builtin = |name: &str| Definition::BuiltinFunction(Name::new(name));
+        let table = |table: &str, field: &str| Definition::VirtualTableField {
+            table_name: Name::new(table),
+            field_name: Name::new(field),
+        };
+
+        let pairs = [
+            (catalog("Номенклатура"), catalog("НОМЕНКЛАТУРА"), true),
+            (catalog("Номенклатура"), document.clone(), false),
+            (catalog("Номенклатура"), catalog("Контрагенты"), false),
+            (builtin("Сообщить"), builtin("сообщить"), true),
+            (table("Остатки", "Количество"), table("ОСТАТКИ", "количество"), true),
+            (table("Остатки", "Количество"), table("Обороты", "Количество"), false),
+        ];
+        for (left, right, same) in pairs {
+            assert_eq!(left.same_entity(&right), same, "{left:?} vs {right:?}");
+            assert_eq!(left.folded() == right.folded(), same, "{left:?} vs {right:?}");
+            let bucket: HashSet<_> = [left.folded(), right.folded()].into_iter().collect();
+            assert_eq!(bucket.len() == 1, same, "{left:?} vs {right:?}");
+        }
     }
 }

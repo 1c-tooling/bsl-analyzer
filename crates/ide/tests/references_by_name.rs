@@ -2060,10 +2060,11 @@ const DEFINITION_MEMBER_TWICE: &str = "\
 
 /// Gate — two mentions of ONE member of a typed receiver are one symbol.
 ///
-/// `SemanticSymbolKey::TypedMember` is the OCCURRENCE's own range, so a dedup that trusted
-/// the key everywhere would answer `ambiguous` with two clones of one place — against this
-/// stage's own promise that one symbol on several lines is one answer, and against a hint
-/// (`narrow line_content`) that cannot help, since any narrowing still holds the member.
+/// `SemanticSymbolKey::TypedMember` names the member by its receiver and its folded field
+/// name, so both mentions share one key by construction. A key that varied per occurrence
+/// would answer `ambiguous` with two clones of one place — against the promise that one
+/// symbol on several lines is one answer, and against a hint (`narrow line_content`) that
+/// cannot help, since any narrowing still holds the member.
 #[test]
 fn two_mentions_of_one_typed_member_are_not_an_ambiguity() {
     let (db, files) =
@@ -2092,6 +2093,42 @@ fn two_mentions_of_one_typed_member_are_not_an_ambiguity() {
         ReferencesOutcome::UnsupportedSymbol { category: ide::UnsupportedCategory::UnknownScope },
     );
     assert!(calls.anchor_sites.is_empty());
+}
+
+/// Two same-named fields of two DIFFERENT locals are two members — the second structure is
+/// no control for the first. Their anchor faces two symbols, and only the caller's own line
+/// can choose between them: the answer is ambiguity with both sites, never one collapsed
+/// "cannot walk" that hides the choice.
+#[test]
+fn two_members_of_different_receivers_are_two_anchors() {
+    const TWO_STRUCTURES: &str = "\
+Процедура Тест() Экспорт
+    С = Новый Структура(\"Поле\", 1);
+    Д = Новый Структура(\"Поле\", 2);
+    Х = С.Поле;
+    У = С.Поле;
+    Т = Д.Поле;
+КонецПроцедуры
+";
+    let (db, files) =
+        db_with(&[("/ws/src/cf/CommonModules/Первый/Ext/Module.bsl", TWO_STRUCTURES)]);
+
+    let result = by_text(&db, files[0], None, None, "Поле");
+
+    assert_eq!(result.outcome, ReferencesOutcome::Ambiguous);
+    assert_eq!(result.anchor_sites.len(), 2, "{:?}", result.anchor_sites);
+
+    // The narrowing hint still chooses: naming the occurrence by position leaves one member,
+    // and walking it stays gated by its unknown scope.
+    let aimed = find_references_by_name(
+        &db,
+        &request(ReferenceAnchor::Position { file_id: files[0], line: 3, column: 10 }),
+        &[],
+    );
+    assert_eq!(
+        aimed.outcome,
+        ReferencesOutcome::UnsupportedSymbol { category: ide::UnsupportedCategory::UnknownScope },
+    );
 }
 
 /// Gate — the shared line reader excludes the whole terminator, and a CRLF terminator is

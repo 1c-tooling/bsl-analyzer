@@ -20,18 +20,37 @@ use vfs::FileId;
 /// What makes two occurrences the SAME symbol.
 ///
 /// A key holds what a symbol IS, never which occurrence was asked about: the reference
-/// walk compares keys, so a field varying per occurrence splits one symbol into as many
-/// as it has spellings of that field, and each half is then reported as a complete answer.
+/// walk compares keys, so a key that varied per occurrence — the occurrence's own range,
+/// say — would split one symbol into as many slices as it has occurrences, and each slice
+/// would then be reported as a complete answer.
 ///
 /// A variable a body never declares is identified exactly like a declared one — by its
-/// owner and its folded name. Which assignment an occurrence reads its declaration and
-/// type from is a per-occurrence choice, and it lives outside the key, on the symbol.
+/// owner and its folded name. A member of a typed receiver has neither declaration nor
+/// definition; it is identified by the RECEIVER it is read from and the folded field name.
+/// Which assignment an occurrence reads its declaration and type from is a per-occurrence
+/// choice, and it lives outside the key, on the symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticSymbolKey {
     Definition(Definition),
     BodyLocal { file_id: FileId, owner: DefWithBodyId, name_lower: String },
     ImplicitLocal { file_id: FileId, owner: DefWithBodyId, name_lower: String },
-    TypedMember { file_id: FileId, range: TextRange },
+    TypedMember { receiver: MemberReceiver, name_lower: String },
+}
+
+/// What makes two typed-receiver expressions the same place a member can be read from.
+///
+/// The receiver's TYPE is not that identity: two locals built as `Новый Структура("Поле", …)`
+/// share one structural `TypeId` — equal keys, equal soft value types — so keying by the type
+/// would merge fields of two different locals into one symbol. What the receiver MEANS
+/// separates them, and that is the symbol the receiver names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MemberReceiver {
+    /// The receiver names a place — a local (`С.Поле`), a definition, or another member
+    /// (`А.Б.Поле`); the identity is that key, recursively.
+    Symbol(Box<SemanticSymbolKey>),
+    /// The receiver names nothing the identity rule can take (`Получить().Поле`): there is
+    /// no identity beyond the spelling, and the member answers for its own occurrence alone.
+    Spelling { file_id: FileId, range: TextRange },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,6 +158,19 @@ pub struct FileSymbolCtx<'db, DB: HirDatabase + base_db::RootQueryDb> {
 
 type NarrowEntry = Option<(Arc<dataflow::DataflowResult<NarrowState>>, Arc<NarrowExprIndex>)>;
 
+/// The token that names the receiver, when the receiver is name-shaped.
+///
+/// A bare identifier names itself, and a chain names what its tail names (`А.Б.Поле` reads
+/// the member of what `А.Б` is). A call result, a parenthesized expression and an inline
+/// constructor name nothing.
+fn receiver_name_token(receiver: &syntax::SyntaxNode) -> Option<syntax::SyntaxToken> {
+    match receiver.kind() {
+        SyntaxKind::IDENT => receiver.first_token(),
+        SyntaxKind::FIELD_EXPR => syntax::ast_utils::field_tail_name_token(receiver),
+        _ => None,
+    }
+}
+
 impl<'db, DB: HirDatabase + base_db::RootQueryDb> FileSymbolCtx<'db, DB> {
     pub fn new(db: &'db DB, file_id: FileId) -> Self {
         let module_id = ModuleId::new(file_id);
@@ -243,8 +275,8 @@ impl<'db, DB: HirDatabase + base_db::RootQueryDb> FileSymbolCtx<'db, DB> {
         let field = hir_ty::lookup_field(self.db(), &obj_resolver, receiver_id, &name)?;
         Some(SemanticSymbol {
             key: SemanticSymbolKey::TypedMember {
-                file_id: self.file_id,
-                range: token.text_range(),
+                receiver: self.member_receiver(receiver),
+                name_lower: name.as_str().fold_lower(),
             },
             name: field.name,
             kind: SemanticSymbolKind::Property,
@@ -252,6 +284,29 @@ impl<'db, DB: HirDatabase + base_db::RootQueryDb> FileSymbolCtx<'db, DB> {
             declaration: None,
             ty: Some(field.ty),
         })
+    }
+
+    /// What the receiver expression names, for [`SemanticSymbolKey::TypedMember`].
+    ///
+    /// Only a name-shaped receiver has an identity: an identifier (`С.Поле`), or a chain
+    /// ending in one (`А.Б.Поле` reads the member of what `А.Б` means). Anything else — a
+    /// parenthesized expression, a call result, an inline constructor — names nothing, and
+    /// its member keeps to the spelling of its own occurrence. A definition the receiver names
+    /// is stored folded: the key is compared by derived equality, and BSL does not tell
+    /// `Справочник1` from `СПРАВОЧНИК1`.
+    fn member_receiver(&self, receiver: &syntax::SyntaxNode) -> MemberReceiver {
+        if let Some(name_token) = receiver_name_token(receiver) {
+            if let Some(symbol) = self.symbol_for_token(&name_token) {
+                let key = match symbol.key {
+                    SemanticSymbolKey::Definition(definition) => {
+                        SemanticSymbolKey::Definition(definition.folded())
+                    }
+                    key => key,
+                };
+                return MemberReceiver::Symbol(Box::new(key));
+            }
+        }
+        MemberReceiver::Spelling { file_id: self.file_id, range: receiver.text_range() }
     }
 
     fn symbol_for_type_ref(&self, token: &syntax::SyntaxToken) -> Option<SemanticSymbol> {
@@ -815,4 +870,49 @@ fn definition_source_range(
     method_id: MethodId,
 ) -> Option<TextRange> {
     Definition::Method(method_id).source_range(db)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::receiver_name_token;
+    use syntax::SyntaxKind;
+
+    fn receivers_of(code: &str) -> Vec<(SyntaxKind, Option<String>)> {
+        let parse = parser::parse(code);
+        parse
+            .syntax_node()
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FIELD_EXPR)
+            .filter_map(|field| {
+                let receiver = field.children().next()?;
+                let named = receiver_name_token(&receiver).map(|token| token.text().to_string());
+                Some((receiver.kind(), named))
+            })
+            .collect()
+    }
+
+    /// Only a bare identifier and a chain are name-shaped; the shapes that name nothing are
+    /// pinned so their member keys to its own spelling.
+    #[test]
+    fn only_name_shaped_receivers_have_a_name_token() {
+        let seen = receivers_of(
+            "А = С.Поле;\nБ = С.Внутр.Поле;\nВ = Получить().Поле;\nГ = (С).Поле;\n\
+             Д = Новый Структура(\"Поле\", 1).Поле;\n",
+        );
+
+        assert!(
+            seen.contains(&(SyntaxKind::IDENT, Some("С".to_string()))),
+            "a bare identifier must be named: {seen:?}"
+        );
+        assert!(
+            seen.contains(&(SyntaxKind::FIELD_EXPR, Some("Внутр".to_string()))),
+            "a chain must be named by its tail: {seen:?}"
+        );
+        for kind in [SyntaxKind::CALL_EXPR, SyntaxKind::PAREN_EXPR, SyntaxKind::NEW_EXPR] {
+            assert!(
+                seen.contains(&(kind, None)),
+                "a `{kind:?}` receiver must stay unnamed: {seen:?}"
+            );
+        }
+    }
 }

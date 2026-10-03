@@ -754,22 +754,13 @@ struct AnchorCandidate {
 
 /// Whether two candidates are the SAME symbol, for the purpose of choosing an anchor.
 ///
-/// `SemanticSymbolKey` is that identity almost everywhere, and deliberately not for a member
-/// reached through a typed receiver: `TypedMember` is keyed by the OCCURRENCE's own range
-/// (`crates/hir/src/semantic_symbol.rs`), so two reads of one field would never collapse and
-/// an unambiguous quote would come back ambiguous with two clones of one place. Worse, the
-/// hint that answer carries — narrow the quote — cannot help, because every narrowing still
-/// holds the member.
-///
-/// Such a member is identified by what it IS: its name and its type. Two same-named members
-/// of the same type reached through different receivers do collapse, and that costs nothing —
-/// a typed member carries no definition, so its reference scope is `Unknown` and each of them
-/// alone answers `unsupported_symbol` anyway.
+/// The key IS that identity, and a typed member's key names the member — its receiver and its
+/// folded field name — so two readings of one local's field collapse by themselves, while
+/// same-named fields of two different locals stay two. The walk and the anchor read one
+/// equality; the field type is no substitute, since a scalar field's type is soft (`unknown`)
+/// and separates nothing.
 fn same_anchor(left: &SemanticSymbol, right: &SemanticSymbol) -> bool {
     match (&left.key, &right.key) {
-        (SemanticSymbolKey::TypedMember { .. }, SemanticSymbolKey::TypedMember { .. }) => {
-            left.ty == right.ty && left.name.eq_ignore_case(&right.name)
-        }
         // A definition keyed by a name carries the spelling of the occurrence, and BSL does
         // not distinguish spellings: one platform function written twice in two cases is one
         // function. `same_entity` folds exactly the variants where that holds and keeps exact
