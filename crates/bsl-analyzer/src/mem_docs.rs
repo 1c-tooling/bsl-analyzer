@@ -263,6 +263,27 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_on_the_carriage_return_of_a_crlf_line_is_refused_and_changes_nothing() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///test.bsl").unwrap();
+
+        mem_docs.insert(uri.clone(), "a\r\nb".to_string(), 1);
+
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(lsp_types::Range {
+                start: lsp_types::Position { line: 0, character: 2 },
+                end: lsp_types::Position { line: 0, character: 2 },
+            }),
+            range_length: None,
+            text: "X".to_string(),
+        }];
+
+        assert!(mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).is_err());
+        assert_eq!(mem_docs.get(&uri), Some("a\r\nb".to_string()));
+        assert_eq!(mem_docs.get_version(&uri), Some(1));
+    }
+
+    #[test]
     fn test_remove() {
         let mut mem_docs = MemDocs::new();
         let uri = Url::parse("file:///test.bsl").unwrap();

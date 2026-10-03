@@ -78,6 +78,17 @@ fn offset_with_overlong_column(
     let line_len = line_index
         .line_len(position.line)
         .ok_or_else(|| anyhow!("line {} is out of bounds", position.line))?;
+    // The LSP line length excludes the terminator, but the line index splits on
+    // `\n` alone and leaves a CRLF line's `\r` inside it. A column past the `\r`
+    // would land between `\r` and `\n` — and an edit there splits the terminator.
+    let line_len = if line_index
+        .safe_line_str(text, position.line)
+        .is_some_and(|line| line.ends_with('\r') && position.line + 1 < line_index.len_lines())
+    {
+        line_len - 1
+    } else {
+        line_len
+    };
 
     let byte_col = match encoding {
         PositionEncoding::Utf8 => {
@@ -174,6 +185,47 @@ mod tests {
 
         let pos = Position { line: 10, character: 0 };
         assert!(offset(&line_index, text, pos).is_err());
+    }
+
+    #[test]
+    fn column_past_a_crlf_line_end_clamps_before_the_carriage_return() {
+        let text = "a\r\nb";
+        let line_index = LineIndex::new(text);
+
+        // The LSP line length excludes the terminator, but the line index splits
+        // on `\n` only and keeps the `\r` inside line 0.
+        let pos = Position { line: 0, character: 40 };
+        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+            let result = offset_with_encoding(&line_index, text, pos, encoding).unwrap();
+            assert_eq!(result, TextSize::from(1), "{encoding:?}");
+        }
+    }
+
+    #[test]
+    fn edit_column_on_the_carriage_return_of_a_crlf_line_is_refused() {
+        let text = "a\r\nb";
+        let line_index = LineIndex::new(text);
+
+        // Column 2 sits between `\r` and `\n`: an insert there would split the
+        // line terminator.
+        let past = Position { line: 0, character: 2 };
+        let end = Position { line: 0, character: 1 };
+        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
+            assert!(edit_offset_with_encoding(&line_index, text, past, encoding).is_err());
+            let result = edit_offset_with_encoding(&line_index, text, end, encoding).unwrap();
+            assert_eq!(result, TextSize::from(1), "{encoding:?}");
+        }
+    }
+
+    #[test]
+    fn a_lone_carriage_return_at_the_end_of_text_is_line_content() {
+        let text = "a\r";
+        let line_index = LineIndex::new(text);
+
+        // No `\n` follows, so the `\r` terminates nothing and stays addressable.
+        let pos = Position { line: 0, character: 2 };
+        let result = edit_offset_with_encoding(&line_index, text, pos, PositionEncoding::Utf8);
+        assert_eq!(result.unwrap(), TextSize::from(2));
     }
 
     #[test]
