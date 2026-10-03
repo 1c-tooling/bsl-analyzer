@@ -218,6 +218,23 @@ fn a_marker_in_the_description_names_the_target_too() {
     );
 }
 
+/// A slot that documents its own bullets keeps them: a marker in the description refines a
+/// PLACEHOLDER, and a structure with local fields is not one.
+#[test]
+fn a_marker_beside_local_fields_keeps_them() {
+    let docs = parse_docs(&[
+        "Параметры:",
+        "  Данные - Структура - см. База.Создать",
+        "   * Ключ - Строка - локальное поле.",
+    ]);
+
+    let parsed = parse_type_expr(&docs.parameters[0].types[0]);
+    let Some(DocTypeExpr::Structure { fields }) = parsed else {
+        panic!("expected the locally documented structure, got {parsed:?}");
+    };
+    assert_eq!(fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Ключ"]);
+}
+
 /// A return union may declare a `см.` member. Every order and both shapes from the
 /// measurement keep two alternatives, one of them naming a target; today the slot is lost
 /// whole (0 alternatives, or 1 with the marker as the type name).

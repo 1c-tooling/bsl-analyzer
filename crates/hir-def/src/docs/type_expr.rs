@@ -58,10 +58,14 @@ pub fn parse_type_expr(type_doc: &TypeDoc) -> Option<DocTypeExpr> {
 
     // `Имя - Структура - см. Модуль.Метод`: the marker stands in the DESCRIPTION, and the
     // declared `Структура` is a placeholder — the keys are documented at the target, exactly
-    // as in the plain `Имя - см. Модуль.Метод` form. Only a structure slot takes this path:
-    // an array or a scalar beside a marker would claim a target their type never had.
+    // as in the plain `Имя - см. Модуль.Метод` form. Only a structure slot with no bullets of
+    // its own takes this path: a slot that documents fields locally has already said where its
+    // keys are, and a reference beside them would drop them (documentation adds, never removes).
     let bare_name = type_doc.name.trim().trim_end_matches(':').trim();
-    if is_structure_name(bare_name) || collection_head(bare_name).is_some_and(is_structure_name) {
+    if type_doc.parameters.is_empty()
+        && (is_structure_name(bare_name)
+            || collection_head(bare_name).is_some_and(is_structure_name))
+    {
         if let Some(target) = type_doc.description.as_deref().and_then(see_reference_of) {
             return Some(DocTypeExpr::See(target));
         }
