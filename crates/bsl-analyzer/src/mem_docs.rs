@@ -86,24 +86,24 @@ impl MemDocs {
         let mut docs = self.docs.write();
 
         if let Some(data) = docs.get_mut(uri) {
+            // The batch lands whole or not at all: on an error the caller leaves
+            // the VFS untouched, so a half-applied batch would split the two.
+            let mut text = data.text.clone();
+            let mut line_index = data.line_index.clone();
             for change in changes {
                 if let Some(range) = change.range {
-                    let start = lsp_position_to_offset(
-                        &data.line_index,
-                        &data.text,
-                        range.start,
-                        encoding,
-                    )?;
-                    let end =
-                        lsp_position_to_offset(&data.line_index, &data.text, range.end, encoding)?;
+                    let start = lsp_position_to_offset(&line_index, &text, range.start, encoding)?;
+                    let end = lsp_position_to_offset(&line_index, &text, range.end, encoding)?;
 
-                    data.text.replace_range(start..end, &change.text);
+                    text.replace_range(start..end, &change.text);
                 } else {
-                    data.text = change.text;
+                    text = change.text;
                 }
 
-                data.line_index = LineIndex::new(&data.text);
+                line_index = LineIndex::new(&text);
             }
+            data.text = text;
+            data.line_index = line_index;
             data.version += 1;
         } else {
             tracing::warn!("Attempted to update non-existent document: {}", uri);
@@ -166,16 +166,17 @@ impl MemDocs {
 /// Byte offset of an LSP position inside the document text.
 ///
 /// The bounds and the character boundary are proven by
-/// [`crate::lsp::offset_with_encoding`] — the same conversion the request
-/// handlers use, so an edit range and a cursor position can never disagree
-/// about what a column means.
+/// [`crate::lsp::edit_offset_with_encoding`], which refuses a column past the
+/// line end: clamping an edit would silently rewrite the span between the line
+/// end and the column the client actually named. A cursor position on a request
+/// clamps there instead (LSP 3.17) — the two conversions share every other rule.
 fn lsp_position_to_offset(
     line_index: &LineIndex,
     text: &str,
     position: lsp_types::Position,
     encoding: PositionEncoding,
 ) -> Result<usize> {
-    crate::lsp::offset_with_encoding(line_index, text, position, encoding).map(usize::from)
+    crate::lsp::edit_offset_with_encoding(line_index, text, position, encoding).map(usize::from)
 }
 
 #[cfg(test)]
@@ -235,6 +236,76 @@ mod tests {
 
         assert_eq!(mem_docs.get(&uri), Some("hello rust".to_string()));
         assert_eq!(mem_docs.get_version(&uri), Some(2));
+    }
+
+    /// Правка с колонкой за концом строки отвергается: усечение молча
+    /// переписало бы не тот участок буфера — ради этого у правок и у позиций
+    /// запросов разные политики (github#91).
+    #[test]
+    fn an_edit_range_past_the_line_end_is_refused_and_changes_nothing() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///test.bsl").unwrap();
+
+        mem_docs.insert(uri.clone(), "Процедура\nТест".to_string(), 1);
+
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(lsp_types::Range {
+                start: lsp_types::Position { line: 0, character: 40 },
+                end: lsp_types::Position { line: 0, character: 40 },
+            }),
+            range_length: None,
+            text: "X".to_string(),
+        }];
+
+        assert!(mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).is_err());
+        assert_eq!(mem_docs.get(&uri), Some("Процедура\nТест".to_string()));
+        assert_eq!(mem_docs.get_version(&uri), Some(1));
+    }
+
+    #[test]
+    fn an_edit_on_the_carriage_return_of_a_crlf_line_is_refused_and_changes_nothing() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///test.bsl").unwrap();
+
+        mem_docs.insert(uri.clone(), "a\r\nb".to_string(), 1);
+
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(lsp_types::Range {
+                start: lsp_types::Position { line: 0, character: 2 },
+                end: lsp_types::Position { line: 0, character: 2 },
+            }),
+            range_length: None,
+            text: "X".to_string(),
+        }];
+
+        assert!(mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).is_err());
+        assert_eq!(mem_docs.get(&uri), Some("a\r\nb".to_string()));
+        assert_eq!(mem_docs.get_version(&uri), Some(1));
+    }
+
+    #[test]
+    fn a_refused_change_rolls_back_the_changes_before_it_in_the_batch() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///test.bsl").unwrap();
+
+        mem_docs.insert(uri.clone(), "abc\ndef".to_string(), 1);
+
+        let change =
+            |start: (u32, u32), end: (u32, u32), text: &str| TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position { line: start.0, character: start.1 },
+                    end: lsp_types::Position { line: end.0, character: end.1 },
+                }),
+                range_length: None,
+                text: text.to_string(),
+            };
+        // The caller skips the VFS on an error, so a half-applied batch would
+        // leave the two holding different texts.
+        let changes = vec![change((0, 0), (0, 1), "X"), change((1, 0), (1, 99), "Y")];
+
+        assert!(mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).is_err());
+        assert_eq!(mem_docs.get(&uri), Some("abc\ndef".to_string()));
+        assert_eq!(mem_docs.get_version(&uri), Some(1));
     }
 
     #[test]
