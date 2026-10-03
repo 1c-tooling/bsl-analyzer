@@ -193,6 +193,31 @@ fn a_reference_is_found_wherever_the_slot_puts_it() {
     assert!(names_target(&docs, "ВПоле"), "ссылка в поле документированной структуры");
 }
 
+/// `Имя - Структура - см. Модуль.Метод`: the marker stands in the description, and the slot
+/// must name the same target the plain `- см. ...` form names — 1 244 such slots in one
+/// configuration alone.
+#[test]
+fn a_marker_in_the_description_names_the_target_too() {
+    let docs = parse_docs(&[
+        "Параметры:",
+        "  Параметры - Структура - см. ОбщегоНазначенияКлиентСервер.ПараметрыЗаписи",
+    ]);
+
+    assert!(
+        names_target(&docs, "Параметры"),
+        "the marker in the description was lost: {:?}",
+        param_types(&docs, "Параметры")
+    );
+    let parsed = param_types(&docs, "Параметры");
+    let [DocTypeExpr::See(target)] = parsed.as_slice() else {
+        panic!("expected the documented reference, got {parsed:?}");
+    };
+    assert_eq!(
+        target.segments().iter().map(|segment| segment.as_str()).collect::<Vec<_>>(),
+        ["ОбщегоНазначенияКлиентСервер", "ПараметрыЗаписи"]
+    );
+}
+
 #[test]
 fn prose_and_plain_types_name_no_target() {
     // `см. в`, `см. также` and their kin parse into a one-segment reference — there are 16 291 of

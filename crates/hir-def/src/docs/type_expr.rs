@@ -56,6 +56,17 @@ pub fn parse_type_expr(type_doc: &TypeDoc) -> Option<DocTypeExpr> {
         return parse_see_reference(&type_doc.name).map(DocTypeExpr::See);
     }
 
+    // `Имя - Структура - см. Модуль.Метод`: the marker stands in the DESCRIPTION, and the
+    // declared `Структура` is a placeholder — the keys are documented at the target, exactly
+    // as in the plain `Имя - см. Модуль.Метод` form. Only a structure slot takes this path:
+    // an array or a scalar beside a marker would claim a target their type never had.
+    let bare_name = type_doc.name.trim().trim_end_matches(':').trim();
+    if is_structure_name(bare_name) || collection_head(bare_name).is_some_and(is_structure_name) {
+        if let Some(target) = type_doc.description.as_deref().and_then(see_reference_of) {
+            return Some(DocTypeExpr::See(target));
+        }
+    }
+
     parse_non_hyperlink_type(&type_doc.name, type_doc.description.as_deref(), &type_doc.parameters)
 }
 
@@ -167,6 +178,14 @@ fn is_see_candidate(name: &str) -> bool {
             .fold_lower()
             .strip_prefix("see")
             .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+}
+
+/// The target of a `см.` / `See` marker standing as a whole text — a type name, a slot's
+/// description, a union member. Prose that merely starts with the marker (`см. в описании`)
+/// names no target and stays prose.
+pub(super) fn see_reference_of(text: &str) -> Option<QualifiedName> {
+    let text = text.trim();
+    is_see_candidate(text).then(|| parse_see_reference(text)).flatten()
 }
 
 fn parse_see_reference(name: &str) -> Option<QualifiedName> {
