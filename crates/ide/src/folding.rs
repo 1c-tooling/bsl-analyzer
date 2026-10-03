@@ -271,6 +271,21 @@ mod tests {
         );
     }
 
+    /// Оборванный многострочный литерал, дотянувшийся до конца тела, — текст
+    /// строки, а не серия комментариев: ложная складка на нём не собирается,
+    /// а тот же хвост без оборванной строки сворачивается.
+    #[test]
+    fn unclosed_multiline_literal_reaching_the_body_end_is_not_folded() {
+        let with_literal =
+            "Процедура П()\n    Т = \"ВЫБРАТЬ *\n    // Сообщить(1);\n    // Возврат;\nКонецПроцедуры";
+        assert_eq!(ranges_by_lines(with_literal), vec![(0, 4, None)]);
+
+        let without_literal = "Процедура П()\n    // Сообщить(1);\n    // Возврат;\nКонецПроцедуры";
+        let mut ranges = ranges_by_lines(without_literal);
+        ranges.sort_by_key(|&(start, end, _)| (start, end));
+        assert_eq!(ranges, vec![(0, 3, None), (1, 2, Some(FoldingRangeKind::Comment))]);
+    }
+
     #[test]
     fn ignores_single_line_ranges() {
         let code = "Процедура Тест() КонецПроцедуры";
