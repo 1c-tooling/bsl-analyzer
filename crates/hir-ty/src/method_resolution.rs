@@ -594,6 +594,36 @@ mod tests {
         assert_eq!(signature.params[2], db.any());
     }
 
+    /// `Имя - Структура - см. Модуль.Метод`: the marker stands in the slot's DESCRIPTION, and
+    /// the slot names a target all the same — the declared `Структура` is a placeholder for the
+    /// keys documented at the target (1 244 such slots in one configuration).
+    #[test]
+    fn a_marker_in_the_description_is_recorded_as_a_target() {
+        let db = InMemoryDb::new();
+        let mut docs = hir_def::docs::MethodDocs::empty();
+        docs.parameters = vec![hir_def::docs::ParameterDoc::new(
+            "Параметры".into(),
+            vec![hir_def::docs::TypeDoc::simple(
+                "Структура".to_string(),
+                Some("см. ОбщегоНазначенияКлиентСервер.ПараметрыЗаписи".to_string()),
+            )],
+        )];
+        let symbol = method_with_docs(
+            docs,
+            &[(
+                "Параметры",
+                Some(hir_def::TypeRef::Builtin(hir_def::type_ref::BuiltinTypeRef::Structure)),
+            )],
+        );
+
+        let signature = materialise_signature(&db, &symbol);
+
+        assert!(
+            signature.doc_see.param(0),
+            "маркер в описании обязан назвать цель, как и форма с маркером в имени"
+        );
+    }
+
     #[test]
     fn a_signature_without_references_records_none() {
         // Tier 1 behaviour must be unchanged where no reference occurs, and the record must not

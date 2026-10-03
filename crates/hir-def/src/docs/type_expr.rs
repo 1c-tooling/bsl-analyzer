@@ -40,7 +40,7 @@ impl DocTypeExpr {
     /// it in a field of a documented structure.
     pub fn names_documentation_target(&self) -> bool {
         match self {
-            Self::See(name) => matches!(name.segments().len(), 2 | 3),
+            Self::See(name) => is_target_reference(name),
             Self::Array(element) => element.names_documentation_target(),
             Self::Structure { fields } => {
                 fields.iter().any(|field| field.types.iter().any(Self::names_documentation_target))
@@ -54,6 +54,21 @@ impl DocTypeExpr {
 pub fn parse_type_expr(type_doc: &TypeDoc) -> Option<DocTypeExpr> {
     if type_doc.is_hyperlink || is_see_candidate(&type_doc.name) {
         return parse_see_reference(&type_doc.name).map(DocTypeExpr::See);
+    }
+
+    // `Имя - Структура - см. Модуль.Метод`: the marker stands in the DESCRIPTION, and the
+    // declared `Структура` is a placeholder — the keys are documented at the target, exactly
+    // as in the plain `Имя - см. Модуль.Метод` form. Only a structure slot with no bullets of
+    // its own takes this path: a slot that documents fields locally has already said where its
+    // keys are, and a reference beside them would drop them (documentation adds, never removes).
+    let bare_name = type_doc.name.trim().trim_end_matches(':').trim();
+    if type_doc.parameters.is_empty()
+        && (is_structure_name(bare_name)
+            || collection_head(bare_name).is_some_and(is_structure_name))
+    {
+        if let Some(target) = type_doc.description.as_deref().and_then(see_reference_of) {
+            return Some(DocTypeExpr::See(target));
+        }
     }
 
     parse_non_hyperlink_type(&type_doc.name, type_doc.description.as_deref(), &type_doc.parameters)
@@ -167,6 +182,19 @@ fn is_see_candidate(name: &str) -> bool {
             .fold_lower()
             .strip_prefix("see")
             .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+}
+
+/// The target of a `см.` / `See` marker standing as a whole text — a type name, a slot's
+/// description, a union member. Prose that merely starts with the marker (`см. в описании`,
+/// `см. также`) names no target and stays prose.
+pub(super) fn see_reference_of(text: &str) -> Option<QualifiedName> {
+    let text = text.trim();
+    is_see_candidate(text).then(|| parse_see_reference(text)).flatten().filter(is_target_reference)
+}
+
+/// `Модуль.Метод` or `Модуль.Метод.Параметр`: one segment is prose (`см. в`, `см. также`).
+fn is_target_reference(name: &QualifiedName) -> bool {
+    matches!(name.segments().len(), 2 | 3)
 }
 
 fn parse_see_reference(name: &str) -> Option<QualifiedName> {

@@ -193,6 +193,141 @@ fn a_reference_is_found_wherever_the_slot_puts_it() {
     assert!(names_target(&docs, "ВПоле"), "ссылка в поле документированной структуры");
 }
 
+/// `Имя - Структура - см. Модуль.Метод`: the marker stands in the description, and the slot
+/// must name the same target the plain `- см. ...` form names — 1 244 such slots in one
+/// configuration alone.
+#[test]
+fn a_marker_in_the_description_names_the_target_too() {
+    let docs = parse_docs(&[
+        "Параметры:",
+        "  Параметры - Структура - см. ОбщегоНазначенияКлиентСервер.ПараметрыЗаписи",
+    ]);
+
+    assert!(
+        names_target(&docs, "Параметры"),
+        "the marker in the description was lost: {:?}",
+        param_types(&docs, "Параметры")
+    );
+    let parsed = param_types(&docs, "Параметры");
+    let [DocTypeExpr::See(target)] = parsed.as_slice() else {
+        panic!("expected the documented reference, got {parsed:?}");
+    };
+    assert_eq!(
+        target.segments().iter().map(|segment| segment.as_str()).collect::<Vec<_>>(),
+        ["ОбщегоНазначенияКлиентСервер", "ПараметрыЗаписи"]
+    );
+}
+
+/// A slot that documents its own bullets keeps them: a marker in the description refines a
+/// PLACEHOLDER, and a structure with local fields is not one.
+#[test]
+fn a_marker_beside_local_fields_keeps_them() {
+    let docs = parse_docs(&[
+        "Параметры:",
+        "  Данные - Структура - см. База.Создать",
+        "   * Ключ - Строка - локальное поле.",
+    ]);
+
+    let parsed = parse_type_expr(&docs.parameters[0].types[0]);
+    let Some(DocTypeExpr::Structure { fields }) = parsed else {
+        panic!("expected the locally documented structure, got {parsed:?}");
+    };
+    assert_eq!(fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Ключ"]);
+}
+
+/// A return union may declare a `см.` member. Every order and both shapes from the
+/// measurement keep two alternatives, one of them naming a target; today the slot is lost
+/// whole (0 alternatives, or 1 with the marker as the type name).
+#[test]
+fn a_see_member_of_a_return_union_survives_in_every_order() {
+    for line in [
+        "  Неопределено, см. База.Создать",
+        "  Неопределено, см. База.Создать - описание.",
+        "  Строка, см. База.Создать",
+        "  см. База.Создать, Неопределено",
+    ] {
+        let docs = parse_docs(&["Возвращаемое значение:", line]);
+        let returned: Vec<DocTypeExpr> =
+            docs.returned_value.iter().filter_map(parse_type_expr).collect();
+        assert_eq!(returned.len(), 2, "{line}: {returned:?}");
+        assert!(
+            returned.iter().any(DocTypeExpr::names_documentation_target),
+            "{line}: the reference member was lost: {returned:?}"
+        );
+        assert!(
+            returned.iter().any(|expr| matches!(expr, DocTypeExpr::TypeRef(_))),
+            "{line}: the plain member was lost: {returned:?}"
+        );
+    }
+}
+
+/// A continuation of a field's type list belongs to the FIELD, and the bullets after it are
+/// still parsed. The shape is live: an ERP method documents its returned structure this way.
+#[test]
+fn a_field_continuation_stays_with_its_field() {
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Структура:",
+        "   * Ссылка - Неопределено",
+        "            - ДокументСсылка.ЭлектронныйДокументИсходящийЭДО",
+        "            - ДокументСсылка.ЭлектронныйДокументВходящийЭДО",
+        "   * ПометкаУдаления - Булево",
+        "   * ВидДокумента - СправочникСсылка.ВидыДокументовЭДО",
+    ]);
+
+    assert_eq!(docs.returned_value.len(), 1, "{:?}", docs.returned_value);
+    let Some(DocTypeExpr::Structure { fields }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!(
+            "expected one documented structure, got {:?}",
+            parse_type_expr(&docs.returned_value[0])
+        );
+    };
+    assert_eq!(
+        fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
+        ["Ссылка", "ПометкаУдаления", "ВидДокумента"]
+    );
+    assert_eq!(fields[0].types.len(), 3, "{:?}", fields[0].types);
+}
+
+/// One-word prose after the marker (`см. также`, `см. ниже`) names no target wherever it stands:
+/// in a placeholder's description it must not replace the declared structure, and as a union
+/// member it must not turn a prose line into a type alternative.
+#[test]
+fn one_word_prose_beside_a_type_stays_prose() {
+    let docs = parse_docs(&[
+        "Параметры:",
+        "  Параметры - Структура - см. также",
+        "Возвращаемое значение:",
+        "  Структура:",
+        "   * Данные - Структура - см. ниже",
+    ]);
+
+    let parsed = parse_type_expr(&docs.parameters[0].types[0]);
+    assert!(
+        matches!(parsed, Some(DocTypeExpr::Structure { .. })),
+        "проза в описании заменила объявленную структуру: {parsed:?}"
+    );
+    let Some(DocTypeExpr::Structure { fields }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!("expected the documented structure, got {:?}", docs.returned_value);
+    };
+    assert!(
+        matches!(fields[0].types.as_slice(), [DocTypeExpr::Structure { .. }]),
+        "проза в описании поля заменила объявленную структуру: {:?}",
+        fields[0].types
+    );
+
+    let docs = parse_docs(&["Возвращаемое значение:", "  Строка, см. ниже."]);
+    assert!(
+        docs.returned_value.iter().all(|ty| !is_see_candidate_name(&ty.name)),
+        "проза стала членом союза: {:?}",
+        docs.returned_value
+    );
+}
+
+fn is_see_candidate_name(name: &str) -> bool {
+    name.trim().to_lowercase().starts_with("см.")
+}
+
 #[test]
 fn prose_and_plain_types_name_no_target() {
     // `см. в`, `см. также` and their kin parse into a one-segment reference — there are 16 291 of
