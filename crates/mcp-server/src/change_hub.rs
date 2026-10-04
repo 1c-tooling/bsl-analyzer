@@ -2250,14 +2250,6 @@ impl WorkspaceChangeHub {
         }
     }
 
-    /// Ask the hub thread to re-point the watch set at `targets`, blocking until it
-    /// acknowledges or `timeout` elapses. The hub identity is stable across a
-    /// re-arm: cursors, health and all clonable handles keep working — only the
-    /// covered subtrees change. `timeout` bounds the WHOLE call: the enqueue onto
-    /// a possibly-full channel and the wait for the acknowledgement share one
-    /// deadline. Returns whether every desired target is actually armed; `false`
-    /// for a timeout, a dead hub thread, or partial coverage (an unwatchable
-    /// target) — the caller must not treat any of those as covered.
     /// Declare `targets` as of now — a test-side convenience. Production always states the
     /// age of its composition ([`Self::rearm_with_epoch`]), because a declaration with no
     /// age cannot be ordered against the one in force (github#184).
@@ -2266,10 +2258,19 @@ impl WorkspaceChangeHub {
         self.rearm_with_epoch(targets, next_topology_epoch(), timeout)
     }
 
-    /// [`Self::rearm`] under the age of the composition that chose `targets`: a caller whose
-    /// snapshot predates a newer one must say so, or the thread cannot tell its declaration
-    /// from a fresh one and a slow build finishing last would roll the hub back onto the
-    /// roots the newer build left (github#184).
+    /// Ask the hub thread to re-point the watch set at `targets`, blocking until it
+    /// acknowledges or `timeout` elapses. The hub identity is stable across a
+    /// re-arm: cursors, health and all clonable handles keep working — only the
+    /// covered subtrees change. `timeout` bounds the WHOLE call: the enqueue onto
+    /// a possibly-full channel and the wait for the acknowledgement share one
+    /// deadline. Returns whether every desired target is actually armed; `false`
+    /// for a timeout, a dead hub thread, or partial coverage (an unwatchable
+    /// target) — the caller must not treat any of those as covered.
+    ///
+    /// `epoch` is the age of the composition that chose `targets` ([`next_topology_epoch`]).
+    /// A caller whose snapshot predates a newer one must say so, or the thread cannot tell
+    /// its declaration from a fresh one and a slow build finishing last would roll the hub
+    /// back onto the roots the newer build left (github#184).
     pub(crate) fn rearm_with_epoch(
         &self,
         targets: Vec<WatchTarget>,
@@ -4831,7 +4832,7 @@ fn apply_declaration(
                         // And the registration goes with the record (github#185) — under
                         // the twin guard the same drop carries in `apply_rearm`: a path
                         // with another record's watch beneath it is left alone.
-                        if !a_record_lies_beneath(
+                        if !an_unwatch_would_strip_a_record(
                             staying.iter().map(PathBuf::as_path),
                             &entry.target().path,
                         ) {
@@ -5365,6 +5366,24 @@ fn a_kept_target_must_be_re_armed() -> bool {
     true
 }
 
+/// Whether handing `path` to `unwatch` would take the registration of any of `records`
+/// with it: one of them names a path strictly BENEATH `path`, and the backend strips by
+/// spelling ([`an_unwatch_takes_what_lies_beneath_it`]).
+///
+/// Asked before an unwatch that goes with a dropped record: such an unwatch would take the
+/// registrations of records that are staying, and their claims of coverage would then be
+/// lies nothing downstream could notice. The leak left by NOT unwatching is the smaller
+/// wrong: it belongs to a declared root that is reported blind and put back by the retry,
+/// which is exactly what walks the two back into agreement (github#185). Where each
+/// registration stands on its own, nothing beneath is at stake, and the unwatch always goes.
+fn an_unwatch_would_strip_a_record<'a>(
+    records: impl IntoIterator<Item = &'a Path>,
+    path: &Path,
+) -> bool {
+    an_unwatch_takes_what_lies_beneath_it()
+        && records.into_iter().any(|other| other != path && other.starts_with(path))
+}
+
 /// Re-point the watch set at `new_targets`, on the hub thread. Additions are armed
 /// BEFORE obsolete targets are unwatched, so a subtree present in both sets has no
 /// unwatched window; every surviving target is then defensively re-armed, because a
@@ -5378,18 +5397,6 @@ fn a_kept_target_must_be_re_armed() -> bool {
 /// re-armed nor disarmed with the declared targets: it is kept while the new scope still
 /// walks it and dropped when it does not. Returns whether EVERY desired target is armed
 /// afterwards.
-/// Whether any of `records` names a path strictly BENEATH `path`.
-///
-/// Asked before an unwatch that goes with a dropped record: an unwatch strips by spelling
-/// on inotify, so it would take the registrations of every record below with it — records
-/// that are staying, and whose claims of coverage would then be lies nothing downstream
-/// could notice. The leak left by NOT unwatching is the smaller wrong: it belongs to a
-/// declared root that is reported blind and put back by the retry, which is exactly what
-/// walks the two back into agreement (github#185).
-fn a_record_lies_beneath<'a>(records: impl IntoIterator<Item = &'a Path>, path: &Path) -> bool {
-    records.into_iter().any(|other| other != path && other.starts_with(path))
-}
-
 fn apply_rearm(
     inner: &HubInner,
     watcher: &mut Watch,
@@ -5571,8 +5578,8 @@ fn apply_rearm(
                 // are claimed by records that are staying. The spellings of THIS pass count
                 // too — a declared root can be spelled under this one while resolving
                 // elsewhere, and the canonical order that decided the loop may have placed
-                // it already. See [`a_record_lies_beneath`].
-                if !a_record_lies_beneath(
+                // it already. See [`an_unwatch_would_strip_a_record`].
+                if !an_unwatch_would_strip_a_record(
                     armed
                         .iter()
                         .map(|other| other.target().path.as_path())
@@ -8236,6 +8243,27 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(hub.rescan_request_count(), rescans, "polls raised reconciles of their own");
         hub.shutdown();
+    }
+
+    /// The guard on a dropped record's unwatch spares a staying record only where the backend
+    /// would actually take it along: on a backend whose registrations stand alone, sparing it
+    /// would leave the dropped registration with no name able to remove it (github#185).
+    #[test]
+    fn an_unwatch_spares_a_record_beneath_only_where_it_would_strip_it() {
+        let root = Path::new("/w/a");
+        let beneath = [Path::new("/w/a/b")];
+        assert_eq!(
+            an_unwatch_would_strip_a_record(beneath, root),
+            an_unwatch_takes_what_lies_beneath_it(),
+        );
+        assert!(
+            !an_unwatch_would_strip_a_record([Path::new("/w/a")], root),
+            "the record's own spelling is not one beneath it",
+        );
+        assert!(
+            !an_unwatch_would_strip_a_record([Path::new("/w/ab"), Path::new("/w")], root),
+            "a sibling sharing a prefix of the spelling, or a parent, is not beneath it",
+        );
     }
 
     /// A kept target whose defensive re-arm fails is dropped from the records — and the
