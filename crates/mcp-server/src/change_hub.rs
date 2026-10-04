@@ -4801,11 +4801,7 @@ fn apply_declaration(
         // survives the strip, so nothing downstream would ever notice: the blind set reads
         // the set, not the backend.
         if !dropped.is_empty() && a_kept_target_must_be_re_armed() {
-            // The records that are staying, read before the drain and narrowed as the pass
-            // drops them: the guard below asks whether an unwatch of a dropped one would
-            // strip a keepable watch, and a record already dropped holds nothing to keep.
-            let mut staying: Vec<PathBuf> =
-                armed.iter().map(|entry| entry.target().path.clone()).collect();
+            let mut lost: Vec<PathBuf> = Vec::new();
             let mut restored: Vec<ArmedTarget> = Vec::with_capacity(armed.len());
             for entry in armed.drain(..) {
                 if !entry.is_declared() {
@@ -4821,21 +4817,13 @@ fn apply_declaration(
                     // root and the periodic check put it back.
                     Err(error) => {
                         tracing::warn!(root = ?entry.target().path, "workspace change hub lost a root while restoring it after dropping a watch above it: {error}");
-                        // And the registration goes with the record (github#185) — under
-                        // the twin guard the same drop carries in `apply_rearm`: a path
-                        // with another record's watch beneath it is left alone.
-                        staying.retain(|path| path != &entry.target().path);
-                        if !an_unwatch_would_strip_a_record(
-                            staying.iter().map(PathBuf::as_path),
-                            &entry.target().path,
-                        ) {
-                            if let Err(error) = watcher.disarm(&entry.target().path) {
-                                tracing::debug!(root = ?entry.target().path, "workspace change hub unwatch of a root lost while restoring: {error}");
-                            }
-                        }
+                        // And the registration goes with the record (github#185), once the
+                        // pass knows what it ends with — the twin of `apply_rearm`'s drop.
+                        lost.push(entry.target().path.clone());
                     }
                 }
             }
+            unwatch_the_lost(watcher, &lost, &restored);
             *armed = restored;
             // Republished because the set changed here: `ensure_roots` compares the live
             // list against what it is about to declare, and a root left in it after its
@@ -5377,6 +5365,22 @@ fn an_unwatch_would_strip_a_record<'a>(
         && records.into_iter().any(|other| other != path && other.starts_with(path))
 }
 
+/// Unwatch every path in `lost` — records a pass dropped after a refused arm — unless that
+/// would strip a registration one of `standing`, the records the pass ends with, still needs.
+fn unwatch_the_lost(watcher: &mut Watch, lost: &[PathBuf], standing: &[ArmedTarget]) {
+    for path in lost {
+        if an_unwatch_would_strip_a_record(
+            standing.iter().map(|entry| entry.target().path.as_path()),
+            path,
+        ) {
+            continue;
+        }
+        if let Err(error) = watcher.disarm(path) {
+            tracing::debug!(root = ?path, "workspace change hub unwatch of a lost root: {error}");
+        }
+    }
+}
+
 /// Re-point the watch set at `new_targets`, on the hub thread. Additions are armed
 /// BEFORE obsolete targets are unwatched, so a subtree present in both sets has no
 /// unwatched window; every surviving target is then defensively re-armed, because a
@@ -5549,11 +5553,7 @@ fn apply_rearm(
     // there would make the next request for the same set find coverage equal and answer
     // yes over a subtree nothing is watching. Dropping a target whose watch may in fact
     // still stand costs one retry; keeping one that does not costs the events.
-    // The records this pass ends with, as far as it knows yet: the guard on a dropped record's
-    // unwatch asks about them, and a record this very pass has unwatched or dropped already
-    // has no registration left to spare.
-    let mut staying: Vec<PathBuf> =
-        next_armed.iter().chain(doors.iter()).map(|entry| entry.target().path.clone()).collect();
+    let mut lost: Vec<PathBuf> = Vec::new();
     let mut kept: Vec<ArmedTarget> = Vec::with_capacity(next_armed.len() + doors.len());
     for entry in next_armed {
         if !a_kept_target_must_be_re_armed() && !needs_placing.contains(&entry.target().path) {
@@ -5564,29 +5564,9 @@ fn apply_rearm(
             Ok(()) => kept.push(entry),
             Err(error) => {
                 tracing::warn!(root = ?entry.target().path, "workspace change hub lost a kept root on re-arm: {error}");
-                // The record is being dropped, so the registration goes with it: a refused
-                // arm of an ALREADY watched path does not take the old registration away,
-                // and left behind it would outlive every name that could ever unwatch it,
-                // feeding events from a root the declaration no longer holds (github#185).
-                // The pass's own comment above already allows that the watch may still
-                // stand — this is what makes the drop complete either way.
-                //
-                // Except where a staying record names a path BENEATH this one: an unwatch
-                // strips by spelling on inotify, and the registrations it would take away
-                // are claimed by records that are staying. The spellings of THIS pass count
-                // — a declared root can be spelled under this one while resolving elsewhere —
-                // and only those still standing: an obsolete record unwatched above, or a
-                // target whose arm failed, holds nothing to spare. See
-                // [`an_unwatch_would_strip_a_record`].
-                staying.retain(|path| path != &entry.target().path);
-                if !an_unwatch_would_strip_a_record(
-                    staying.iter().map(PathBuf::as_path),
-                    &entry.target().path,
-                ) {
-                    if let Err(error) = watcher.disarm(&entry.target().path) {
-                        tracing::debug!(root = ?entry.target().path, "workspace change hub unwatch of a lost kept root on re-arm: {error}");
-                    }
-                }
+                // The record is being dropped, so the registration goes with it once the
+                // pass knows what it ends with ([`unwatch_the_lost`], below).
+                lost.push(entry.target().path.clone());
                 full_coverage = false;
             }
         }
@@ -5630,6 +5610,14 @@ fn apply_rearm(
         }
         kept.push(entry);
     }
+    // A refused arm of an ALREADY watched path does not take the old registration away, and
+    // left behind a dropped record it would outlive every name that could ever unwatch it,
+    // feeding events from a root the declaration no longer holds (github#185). Decided only
+    // now, against the records the pass ends with: a record beneath a lost root spares its
+    // unwatch only while it stands, and one this pass lost later, or unwatched as obsolete
+    // earlier, holds nothing to spare. A declared root spelled under the lost one while
+    // resolving elsewhere is among them, which is why the spellings are what is compared.
+    unwatch_the_lost(watcher, &lost, &kept);
     *armed = kept;
     inner.publish_watched_roots(armed);
 
@@ -8308,6 +8296,59 @@ mod tests {
         assert!(
             asked.contains(&kept),
             "the lost root's registration was spared for a record already gone: {asked:?}",
+        );
+        hub.shutdown();
+    }
+
+    /// A record beneath a lost root spares its unwatch only if it is still standing when the
+    /// pass ENDS: one the same pass loses a moment later held nothing to spare, and the root's
+    /// registration would be left with no record able to name it, through every later
+    /// declaration (github#185).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_record_lost_later_in_the_same_pass_does_not_spare_a_lost_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (parent, child, other) = (root.join("a"), root.join("a").join("b"), root.join("c"));
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let refusals = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disarms: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let (refuse, unwatches, keys) =
+            (Arc::clone(&refusals), Arc::clone(&disarms), [parent.clone(), child.clone()]);
+        let seams = Arc::new(WatchSeams {
+            refuses: Box::new(move |path: &Path| {
+                refuse.load(std::sync::atomic::Ordering::SeqCst) && keys.iter().any(|k| k == path)
+            }),
+            disarmed: Box::new(move |path: &Path| {
+                unwatches.lock().unwrap_or_else(PoisonError::into_inner).push(path.to_path_buf());
+            }),
+        });
+        // Flat, so the root beneath it stands as a record of its own instead of being absorbed.
+        let flat = WatchTarget { path: parent.clone(), recursive: false };
+        let hub = WorkspaceChangeHub::start_seamed(
+            vec![flat.clone(), WatchTarget::recursive(child.clone())],
+            DEFAULT_CAPACITY,
+            Duration::from_secs(3600),
+            false,
+            None,
+            Some(seams),
+            Vec::new(),
+            PollConfig::PRODUCTION,
+            BlindPollSeam::default(),
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        refusals.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!hub.rearm(
+            vec![flat, WatchTarget::recursive(child.clone()), WatchTarget::recursive(other)],
+            Duration::from_secs(10),
+        ));
+
+        let asked = disarms.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            asked.contains(&parent),
+            "the lost root was spared for a record the same pass lost: {asked:?}",
         );
         hub.shutdown();
     }
