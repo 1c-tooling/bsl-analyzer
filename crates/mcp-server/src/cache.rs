@@ -120,13 +120,18 @@ impl WorkspaceCacheLayout {
     pub fn exclusions(&self, workspace_root: &Path) -> Vec<PathBuf> {
         let mut exclusions: Vec<PathBuf> =
             self.spellings().iter().map(|path| path.to_path_buf()).collect();
-        for name in [".git", "target", "node_modules"] {
-            let service = workspace_root.join(name);
+        for service in service_directories(workspace_root) {
             if !exclusions.iter().any(|exclusion| exclusion == &service) {
                 exclusions.push(service);
             }
         }
         exclusions
+    }
+
+    /// Whether `path` is one of the service directories of `workspace_root` — the part of
+    /// [`Self::exclusions`] that is not the cache, even where the cache was placed onto one.
+    pub fn is_service_directory(workspace_root: &Path, path: &Path) -> bool {
+        service_directories(workspace_root).any(|service| service == path)
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {
@@ -174,6 +179,10 @@ impl WorkspaceCacheLayout {
     pub fn daemon_log_path(&self) -> PathBuf {
         self.root.join("bsl-analyzer-daemon.log")
     }
+}
+
+fn service_directories(workspace_root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    [".git", "target", "node_modules"].into_iter().map(|name| workspace_root.join(name))
 }
 
 /// The per-workspace derived-cache directory (`<workspace>/.build`).

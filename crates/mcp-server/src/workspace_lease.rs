@@ -199,9 +199,16 @@ pub(crate) fn new_token() -> u64 {
 /// Canonicalization folds `..`, a trailing `.`, symlinks and the Windows `\\?\` prefix. It
 /// does NOT fold bind-mounts: one tree reached through two mount points stays two identities,
 /// and the claim check errs by refusing a cache it cannot prove is ours.
+///
+/// A root that is not valid UTF-8 is spelled by its escaped debug form rather than lossily: a
+/// lossy spelling would fold two distinct roots into one identity. The escaped form opens with a
+/// quote, which no absolute path does, so it never meets a plain spelling either.
 fn workspace_identity(workspace: &Path) -> String {
     let canonical = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
-    canonical.to_string_lossy().into_owned()
+    match canonical.to_str() {
+        Some(spelling) => spelling.to_owned(),
+        None => format!("{canonical:?}"),
+    }
 }
 
 /// A daemon's claim on one workspace's derived caches. Cheap to clone (every holder shares one
@@ -1655,6 +1662,25 @@ mod tests {
         let through_dot = workspace.path().join(".");
 
         assert_eq!(workspace_identity(workspace.path()), workspace_identity(&through_dot));
+    }
+
+    /// Two roots whose names differ only in bytes that are not UTF-8 are two workspaces: a
+    /// lossy spelling would fold both into one identity and let one claim the other's cache.
+    #[cfg(unix)]
+    #[test]
+    fn roots_differing_in_non_utf8_bytes_are_distinct_identities() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let first = base.path().join(OsStr::from_bytes(b"ws-\xff"));
+        let second = base.path().join(OsStr::from_bytes(b"ws-\xfe"));
+        if std::fs::create_dir_all(&first).is_err() || std::fs::create_dir_all(&second).is_err() {
+            // A filesystem that enforces UTF-8 names cannot hold the pair at all.
+            return;
+        }
+
+        assert_ne!(workspace_identity(&first), workspace_identity(&second));
     }
 
     fn checkpoint_test<T>(

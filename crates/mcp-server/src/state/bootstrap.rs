@@ -656,12 +656,14 @@ impl SharedState {
         {
             // The list holds two kinds of hole, and the advice differs: a cache above a root
             // is moved by pointing --cache-dir elsewhere, while a service directory above a
-            // root is not the user's to move — the root is.
-            let is_the_cache = cache.spellings().iter().any(|spelling| *spelling == hole);
-            return Err(if is_the_cache {
-                WorkspaceInitError::CacheCoversScanRoot { cache: hole, root }
-            } else {
+            // root is not the user's to move — the root is. A cache placed onto a service
+            // directory is the service directory first: moving the cache would not free the root.
+            let is_a_service_directory =
+                crate::cache::WorkspaceCacheLayout::is_service_directory(&project.root, &hole);
+            return Err(if is_a_service_directory {
                 WorkspaceInitError::ScanRootInsideServiceDirectory { service: hole, root }
+            } else {
+                WorkspaceInitError::CacheCoversScanRoot { cache: hole, root }
             });
         }
 
@@ -3674,6 +3676,33 @@ mod tests {
             .unwrap();
 
         let refused = SharedState::workspace(workspace.path().to_path_buf());
+        let Err(error) = refused else {
+            panic!("a source root inside `target` must be refused");
+        };
+        assert!(
+            matches!(error, crate::WorkspaceInitError::ScanRootInsideServiceDirectory { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A `--cache-dir` that names the very service directory holding the source root is still
+    /// refused as the service directory: moving the cache would not free the root.
+    #[test]
+    fn a_cache_placed_at_the_service_directory_holding_the_root_is_refused_as_service() {
+        let workspace = tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Configuration.xml"),
+            "<Configuration><Name>Conf</Name></Configuration>",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path().join("target")).unwrap();
+        fs::write(workspace.path().join("target").join("Configuration.xml"), "<Configuration/>")
+            .unwrap();
+        fs::write(workspace.path().join("bsl-analyzer.toml"), "[source]\nroot = \"target\"\n")
+            .unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::from_root(workspace.path().join("target"));
+
+        let refused = SharedState::workspace_with_cache(workspace.path().to_path_buf(), cache);
         let Err(error) = refused else {
             panic!("a source root inside `target` must be refused");
         };
