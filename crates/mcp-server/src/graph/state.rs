@@ -1314,6 +1314,15 @@ impl GraphState {
             ));
         }
         self.lease.busy_owner().map(|owner| {
+            if let Some((mine, theirs)) = self.lease.foreign_workspace() {
+                return format!(
+                    "graph unavailable: the cache directory {} serves workspace {} — this \
+                     process analyzes {}; give this process a separate --cache-dir",
+                    cache_dir(),
+                    theirs,
+                    mine
+                );
+            }
             format!(
                 "graph busy: the cache directory {} is used by another live process (pid {}, \
                  version {}); give this process a separate --cache-dir",

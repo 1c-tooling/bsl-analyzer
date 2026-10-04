@@ -35,6 +35,13 @@ pub struct WorkspaceCacheLayout {
     /// that has to tell "is this event inside my own cache" needs both, and keeping
     /// only the canonical one is a filter that silently matches nothing.
     declared: PathBuf,
+    /// The workspace whose derived state this cache holds, when the caller named one.
+    ///
+    /// The lease records it and refuses a claim of a cache whose record names ANOTHER
+    /// workspace (github#272): one directory must not serve two configurations. It lives
+    /// here rather than beside each claim so every claiming path keeps one signature — the
+    /// layout already travels to all of them.
+    workspace: Option<PathBuf>,
 }
 
 impl WorkspaceCacheLayout {
@@ -42,12 +49,12 @@ impl WorkspaceCacheLayout {
     pub fn for_workspace(workspace_root: &Path) -> Self {
         let declared = workspace_root.join(".build");
         let root = std::fs::canonicalize(&declared).unwrap_or_else(|_| declared.clone());
-        Self { root, declared }
+        Self { root, declared, workspace: Some(workspace_root.to_path_buf()) }
     }
 
     /// A layout whose root has already been resolved by the caller.
     pub fn from_root(root: PathBuf) -> Self {
-        Self { declared: root.clone(), root }
+        Self { declared: root.clone(), root, workspace: None }
     }
 
     /// Resolve, create, and canonicalize an explicit `--cache-dir` value.
@@ -66,11 +73,26 @@ impl WorkspaceCacheLayout {
                 format!("failed to canonicalize --cache-dir {}: {error}", requested.display()),
             )
         })?;
-        Ok(Self { root, declared: requested })
+        Ok(Self { root, declared: requested, workspace: None })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Name the workspace whose derived state this cache holds. See [`Self::workspace`].
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    /// The workspace whose derived state this cache holds, when the caller named one.
+    ///
+    /// `None` on a layout built from a bare directory: the identity then stays unstated, and
+    /// the lease's claim check has nothing to compare (an older program's records carry none
+    /// either — see [`crate::workspace_lease`]).
+    pub fn workspace(&self) -> Option<&Path> {
+        self.workspace.as_deref()
     }
 
     /// Every spelling this cache root can appear under in a file-watcher event.
@@ -216,6 +238,23 @@ mod tests {
         assert_eq!(layout.lease_lock_path(), root.join("writer.lease.lock"));
         assert_eq!(layout.stall_report_path(), root.join("bsl-graph-stall-report.txt"));
         assert_eq!(layout.daemon_log_path(), root.join("bsl-analyzer-daemon.log"));
+    }
+
+    /// The default layout names the workspace it serves; the other two leave the identity to
+    /// the caller, who states it with `with_workspace`.
+    #[test]
+    fn the_layout_names_the_workspace_it_serves() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let default = WorkspaceCacheLayout::for_workspace(workspace.path());
+        assert_eq!(default.workspace(), Some(workspace.path()));
+
+        let explicit = WorkspaceCacheLayout::from_root(PathBuf::from("external-cache"));
+        assert_eq!(explicit.workspace(), None);
+        assert_eq!(
+            explicit.with_workspace(workspace.path().to_path_buf()).workspace(),
+            Some(workspace.path())
+        );
     }
 
     /// The exclusion list is stated at the workspace root — and only there: the walk's

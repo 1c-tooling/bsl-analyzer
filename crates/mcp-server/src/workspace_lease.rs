@@ -126,6 +126,14 @@ struct LeaseRecord {
     /// which proves nothing about who is newer.
     #[serde(default)]
     version: Option<String>,
+    /// The workspace this cache serves, canonicalized by the daemon that claimed it.
+    ///
+    /// A claim of a cache whose record names a DIFFERENT workspace is refused, stale or not
+    /// (github#272): one directory must not serve two configurations. Absent in a record of
+    /// an older program — such a record proves nothing about its owner and is adopted, and
+    /// the next write names this daemon's workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// What an ownership check of this lease found, as the graph needs to tell it apart: a lost
@@ -146,6 +154,9 @@ type OwnershipObserver = Arc<dyn Fn(OwnershipCheck) + Send + Sync>;
 pub(crate) struct BusyOwner {
     pub(crate) pid: u32,
     pub(crate) version: Option<String>,
+    /// The workspace the record names, when it names one: a refusal for a foreign workspace
+    /// says so instead of posing as a live owner of the same one.
+    pub(crate) workspace: Option<String>,
 }
 
 /// Whether a claim may take the workspace from the record found under the lock: a free
@@ -183,6 +194,16 @@ pub(crate) fn new_token() -> u64 {
     u64::from_le_bytes(hasher.finalize().as_bytes()[..8].try_into().expect("blake3 yields 32"))
 }
 
+/// The durable identity of the workspace a cache serves: the canonical spelling of its root.
+///
+/// Canonicalization folds `..`, a trailing `.`, symlinks and the Windows `\\?\` prefix. It
+/// does NOT fold bind-mounts: one tree reached through two mount points stays two identities,
+/// and the claim check errs by refusing a cache it cannot prove is ours.
+fn workspace_identity(workspace: &Path) -> String {
+    let canonical = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    canonical.to_string_lossy().into_owned()
+}
+
 /// A daemon's claim on one workspace's derived caches. Cheap to clone (every holder shares one
 /// verdict cache), and safe to consult from any thread.
 #[derive(Clone)]
@@ -198,6 +219,10 @@ struct Inner {
     generation: AtomicU64,
     /// The token this daemon last wrote into the record; `0` while unclaimed.
     token: AtomicU64,
+    /// This daemon's workspace identity, canonicalized once at claim time. `None` when the
+    /// caller named no workspace: the claim check then has nothing to compare and is decided
+    /// by the old rules.
+    workspace: Option<String>,
     owns: AtomicBool,
     /// Set permanently after this lease, having owned the workspace, observes a live foreign
     /// token. All clones share the verdict and never attempt to reclaim after it is set.
@@ -347,6 +372,7 @@ impl WorkspaceLease {
                 path: None,
                 generation: AtomicU64::new(0),
                 token: AtomicU64::new(0),
+                workspace: None,
                 owns: AtomicBool::new(true),
                 superseded: AtomicBool::new(false),
                 released: AtomicBool::new(false),
@@ -383,6 +409,7 @@ impl WorkspaceLease {
             path: Some(path),
             generation: AtomicU64::new(UNCLAIMED),
             token: AtomicU64::new(0),
+            workspace: cache.workspace().map(workspace_identity),
             owns: AtomicBool::new(false),
             superseded: AtomicBool::new(false),
             released: AtomicBool::new(false),
@@ -408,19 +435,29 @@ impl WorkspaceLease {
         });
         let lease = Self { inner };
         if !lease.take_generation(claimable) {
-            match lock_recover(&lease.inner.busy).clone() {
-                Some(owner) => tracing::warn!(
+            match lease.foreign_workspace() {
+                Some((mine, theirs)) => tracing::warn!(
                     cache_dir = %cache.root().display(),
-                    owner_pid = owner.pid,
-                    owner_version = owner.version.as_deref().unwrap_or("unknown"),
-                    "the graph is busy: another live process owns this cache directory and this \
-                     version does not take it over (same, newer or unknown version); give this \
-                     process a separate --cache-dir, or stop sharing the directory"
+                    ours = mine,
+                    theirs,
+                    "this cache directory serves another workspace; refusing to claim it — give \
+                     this process a separate --cache-dir, or remove the directory if it is no \
+                     longer needed"
                 ),
-                None => tracing::warn!(
-                    root = %cache.root().display(),
-                    "workspace cache lease is locked by a peer; retrying on the next check"
-                ),
+                None => match lock_recover(&lease.inner.busy).clone() {
+                    Some(owner) => tracing::warn!(
+                        cache_dir = %cache.root().display(),
+                        owner_pid = owner.pid,
+                        owner_version = owner.version.as_deref().unwrap_or("unknown"),
+                        "the graph is busy: another live process owns this cache directory and \
+                         this version does not take it over (same, newer or unknown version); \
+                         give this process a separate --cache-dir, or stop sharing the directory"
+                    ),
+                    None => tracing::warn!(
+                        root = %cache.root().display(),
+                        "workspace cache lease is locked by a peer; retrying on the next check"
+                    ),
+                },
             }
         }
         spawn_heartbeat(Arc::downgrade(&lease.inner));
@@ -491,16 +528,39 @@ impl WorkspaceLease {
                 return false;
             }
         };
+        // A cache directory belongs to ONE workspace, and the check sits under the same lock
+        // that serializes claims: of two workspaces racing for a fresh directory the loser
+        // reads the winner's name and refuses, with no window where both claim it. Staleness
+        // is not consulted — a dead owner's cache is still that workspace's derived state,
+        // and adopting it would serve this one from another one's graph (github#272).
+        if let (Some(mine), Some(theirs)) =
+            (self.inner.workspace.as_deref(), found.as_ref().and_then(|r| r.workspace.as_deref()))
+        {
+            if mine != theirs {
+                *lock_recover(&self.inner.busy) = found.as_ref().map(|record| BusyOwner {
+                    pid: record.pid,
+                    version: record.version.clone(),
+                    workspace: record.workspace.clone(),
+                });
+                // The answer IS given — this process does not own the cache — so publish it
+                // instead of leaving the status surface to answer "unknown" forever.
+                self.establish(false);
+                return false;
+            }
+        }
         if !claimable(found.as_ref()) {
-            *lock_recover(&self.inner.busy) = found
-                .filter(|record| !is_stale(record))
-                .map(|record| BusyOwner { pid: record.pid, version: record.version });
+            *lock_recover(&self.inner.busy) =
+                found.filter(|record| !is_stale(record)).map(|record| BusyOwner {
+                    pid: record.pid,
+                    version: record.version,
+                    workspace: record.workspace,
+                });
             return false;
         }
         *lock_recover(&self.inner.busy) = None;
         let generation = found.map(|r| r.generation).unwrap_or(0) + 1;
         let token = new_token();
-        if write_record(path, generation, token).is_err() {
+        if write_record(path, generation, token, self.inner.workspace.as_deref()).is_err() {
             return false;
         }
         self.inner.generation.store(generation, Ordering::SeqCst);
@@ -892,6 +952,7 @@ impl WorkspaceLease {
             path,
             self.inner.generation.load(Ordering::SeqCst),
             self.inner.token.load(Ordering::SeqCst),
+            self.inner.workspace.as_deref(),
         )?;
         *stamped = Some(now);
         Ok(())
@@ -900,6 +961,14 @@ impl WorkspaceLease {
     /// The live owner that kept this lease from claiming the workspace, while it does.
     pub(crate) fn busy_owner(&self) -> Option<BusyOwner> {
         lock_recover(&self.inner.busy).clone()
+    }
+
+    /// The refused claim's workspace pair when the cache belongs to ANOTHER workspace:
+    /// `(ours, theirs)`. `None` for every other refusal, which the busy-owner message covers.
+    pub(crate) fn foreign_workspace(&self) -> Option<(String, String)> {
+        let mine = self.inner.workspace.clone()?;
+        let theirs = lock_recover(&self.inner.busy).as_ref()?.workspace.clone()?;
+        (mine != theirs).then_some((mine, theirs))
     }
 
     /// Whether this lease coordinates through a directory at all.
@@ -1139,13 +1208,19 @@ fn read_record(path: &Path) -> Option<LeaseRecord> {
 
 /// Replace the record atomically: a reader takes no lock, so it must never observe a
 /// half-written file. The temp name carries the pid so two writers cannot share one.
-fn write_record(path: &Path, generation: u64, token: u64) -> io::Result<()> {
+fn write_record(
+    path: &Path,
+    generation: u64,
+    token: u64,
+    workspace: Option<&str>,
+) -> io::Result<()> {
     let record = LeaseRecord {
         generation,
         token,
         pid: std::process::id(),
         heartbeat_secs: now_secs(),
         version: Some(PROGRAM_VERSION.to_owned()),
+        workspace: workspace.map(str::to_owned),
     };
     let body = serde_json::to_string(&record)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1456,6 +1531,132 @@ mod tests {
         assert!(lease.owns_caches_cached());
     }
 
+    /// The cache of one workspace, built the way the CLI builds an explicit one: the root is
+    /// stated by the caller, and so is the workspace the root serves.
+    fn explicit_cache(
+        cache_dir: &std::path::Path,
+        workspace: &std::path::Path,
+    ) -> crate::cache::WorkspaceCacheLayout {
+        crate::cache::WorkspaceCacheLayout::prepare_explicit(cache_dir, std::path::Path::new(""))
+            .expect("an explicit cache root is creatable")
+            .with_workspace(workspace.to_path_buf())
+    }
+
+    /// A cache directory belongs to ONE workspace, and the refusal happens on a FRESH one —
+    /// before any graph or search index exists. The reverted attempt checked for
+    /// `bsl-graph.db`, which a daemon does not write until long after it claims the lease;
+    /// that window is exactly what this input holds open (github#272).
+    #[test]
+    fn a_second_workspace_does_not_take_a_foreign_cache() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let first_ws = tempfile::tempdir().unwrap();
+        let second_ws = tempfile::tempdir().unwrap();
+
+        let first = WorkspaceLease::claim_cache(&explicit_cache(cache_dir.path(), first_ws.path()));
+        assert!(first.owns_caches(), "the first workspace claims a fresh cache");
+
+        let second =
+            WorkspaceLease::claim_cache(&explicit_cache(cache_dir.path(), second_ws.path()));
+        assert!(!second.owns_caches_now(), "a foreign workspace claimed the cache");
+        assert!(!second.owns_caches_now(), "the refusal did not survive a retry");
+        assert!(first.owns_caches_now(), "the refusal cost the first owner its cache");
+        let (mine, theirs) = second.foreign_workspace().expect("the refusal names both workspaces");
+        assert_ne!(mine, theirs);
+        assert!(second.busy_owner().is_some(), "the status answer can say who holds it");
+        assert!(second.ownership_was_checked(), "the refusal is an answer, not a silence");
+        assert!(
+            !second.owns_caches_cached(),
+            "and the published verdict says this process owns nothing",
+        );
+    }
+
+    /// Staleness does not make a foreign cache adoptable: the dead owner's derived state
+    /// still belongs to ITS workspace, and serving this one from it would answer from
+    /// another configuration's graph.
+    #[test]
+    fn a_stale_foreign_record_still_refuses() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let ours = tempfile::tempdir().unwrap();
+        let layout = explicit_cache(cache_dir.path(), ours.path());
+
+        let stale_foreign = LeaseRecord {
+            generation: 7,
+            token: 99,
+            pid: 424242,
+            heartbeat_secs: 0,
+            version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: Some("/elsewhere/a-foreign-project".to_owned()),
+        };
+        std::fs::write(layout.lease_path(), serde_json::to_vec(&stale_foreign).unwrap()).unwrap();
+
+        let lease = WorkspaceLease::claim_cache(&layout);
+
+        assert!(!lease.owns_caches_now(), "a stale foreign record was adopted");
+    }
+
+    /// A record of an older program names no workspace: it proves nothing, so it is adopted —
+    /// and the claim's own write names this daemon's workspace, closing the migration window
+    /// for every writing path that follows.
+    #[test]
+    fn a_record_without_an_owner_is_adopted_and_named() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let ours = tempfile::tempdir().unwrap();
+        let layout = explicit_cache(cache_dir.path(), ours.path());
+        let nameless = LeaseRecord {
+            generation: 3,
+            token: 7,
+            pid: 424242,
+            heartbeat_secs: 0,
+            version: None,
+            workspace: None,
+        };
+        std::fs::write(layout.lease_path(), serde_json::to_vec(&nameless).unwrap()).unwrap();
+
+        let lease = WorkspaceLease::claim_cache(&layout);
+
+        assert!(lease.owns_caches_now(), "a nameless old record was not adopted");
+        let record = read_record(&layout.lease_path()).expect("the claim wrote a record");
+        assert_eq!(
+            record.workspace.as_deref(),
+            Some(workspace_identity(ours.path()).as_str()),
+            "the adopted record still names no workspace",
+        );
+    }
+
+    /// The owner survives every rewrite of the record: a restamp that dropped it would reopen
+    /// the cache to the next foreign claim, so this pins the field across a checkpointed
+    /// publish rather than only across the first claim.
+    #[test]
+    fn the_workspace_owner_survives_a_restamp() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let ours = tempfile::tempdir().unwrap();
+        let third_ws = tempfile::tempdir().unwrap();
+        let layout = explicit_cache(cache_dir.path(), ours.path());
+        let lease = WorkspaceLease::claim_cache(&layout);
+        assert!(lease.owns_caches());
+
+        let outcome = lease.publish_short(&mut (), |_| Ok::<(), ()>(()));
+        assert!(matches!(outcome, LeaseOperationOutcome::Applied(())), "{outcome:?}");
+
+        let record = read_record(&layout.lease_path()).expect("the restamp kept a record");
+        assert_eq!(record.workspace.as_deref(), Some(workspace_identity(ours.path()).as_str()));
+
+        // And the surviving field still refuses the foreign workspace.
+        let foreign =
+            WorkspaceLease::claim_cache(&explicit_cache(cache_dir.path(), third_ws.path()));
+        assert!(!foreign.owns_caches_now());
+    }
+
+    /// The identity folds path spellings — `..`, a trailing `.` — while bind-mounts stay out
+    /// of canonicalization's reach; the check then errs by refusing, never by serving.
+    #[test]
+    fn the_identity_folds_path_spellings() {
+        let workspace = tempfile::tempdir().unwrap();
+        let through_dot = workspace.path().join(".");
+
+        assert_eq!(workspace_identity(workspace.path()), workspace_identity(&through_dot));
+    }
+
     fn checkpoint_test<T>(
         lease: &WorkspaceLease,
         write: impl FnOnce(&mut dyn FnMut() -> ControlFlow<()>) -> ControlFlow<(), T>,
@@ -1495,6 +1696,7 @@ mod tests {
                 path: Some(cache.lease_path()),
                 generation: AtomicU64::new(UNCLAIMED),
                 token: AtomicU64::new(0),
+                workspace: None,
                 owns: AtomicBool::new(false),
                 superseded: AtomicBool::new(false),
                 released: AtomicBool::new(false),
@@ -1625,6 +1827,7 @@ mod tests {
             pid: 424242,
             heartbeat_secs: now_secs(),
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(lease_path(dir.path()), serde_json::to_string(&foreign).unwrap()).unwrap();
         let mut prepared = ();
@@ -1753,6 +1956,7 @@ mod tests {
             pid: std::process::id(),
             heartbeat_secs: now_secs() - STALE_AFTER.as_secs() - 1,
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(lease_path(dir.path()), serde_json::to_string(&stale_mine).unwrap())
             .unwrap();
@@ -1803,6 +2007,7 @@ mod tests {
             pid: 424242,
             heartbeat_secs: now_secs(),
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(lease_path(dir.path()), serde_json::to_string(&newer).unwrap()).unwrap();
 
@@ -1835,6 +2040,7 @@ mod tests {
                 path: Some(cache.lease_path()),
                 generation: AtomicU64::new(UNCLAIMED),
                 token: AtomicU64::new(0),
+                workspace: None,
                 owns: AtomicBool::new(false),
                 superseded: AtomicBool::new(false),
                 released: AtomicBool::new(false),
@@ -1868,6 +2074,7 @@ mod tests {
             pid: 424242,
             heartbeat_secs: now_secs(),
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(lease_path(foreign_dir.path()), serde_json::to_string(&newer).unwrap())
             .unwrap();
@@ -1891,6 +2098,7 @@ mod tests {
             pid: std::process::id(),
             heartbeat_secs: 0,
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
 
@@ -2254,6 +2462,7 @@ mod tests {
             pid: 424242,
             heartbeat_secs: now_secs(),
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(&path, serde_json::to_string(&newer).unwrap()).unwrap();
 
@@ -2290,6 +2499,7 @@ mod tests {
             pid: 424242,
             heartbeat_secs: now_secs() - STALE_AFTER.as_secs() - 1,
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(&path, serde_json::to_string(&ghost).unwrap()).unwrap();
 
@@ -2332,6 +2542,7 @@ mod tests {
             pid: 424242,
             heartbeat_secs: now_secs(),
             version: Some(PROGRAM_VERSION.to_owned()),
+            workspace: None,
         };
         std::fs::write(&path, serde_json::to_string(&owner).unwrap()).unwrap();
 
@@ -2476,6 +2687,7 @@ mod tests {
             pid: 424242,
             heartbeat_secs,
             version: version.map(str::to_owned),
+            workspace: None,
         };
         std::fs::write(lease_path(root), serde_json::to_string(&record).unwrap()).unwrap();
         record
@@ -2493,7 +2705,11 @@ mod tests {
         assert!(!second.is_superseded(), "refused, not superseded: it never owned anything");
         assert_eq!(
             second.busy_owner(),
-            Some(BusyOwner { pid: 424242, version: Some(PROGRAM_VERSION.to_owned()) })
+            Some(BusyOwner {
+                pid: 424242,
+                version: Some(PROGRAM_VERSION.to_owned()),
+                workspace: None,
+            })
         );
         assert_eq!(record_at(&lease_path(dir.path())).token, owner.token, "the record stands");
 
