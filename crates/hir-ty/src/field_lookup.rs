@@ -316,9 +316,11 @@ fn lookup_field_in_query_projection(
     receiver: TypeId,
     field_name: &Name,
 ) -> Option<FieldInfo> {
-    let projection = match db.lookup_type(receiver) {
-        TypeKind::QueryResultSelection(facet) => facet.projection.clone()?,
-        TypeKind::ValueTableRow(facet) => facet.projection.clone()?,
+    // Same split as `enumerate_projection_fields`: a selection cursor is read-only, the
+    // columns of an unloaded value-table row are not.
+    let (projection, is_readonly) = match db.lookup_type(receiver) {
+        TypeKind::QueryResultSelection(facet) => (facet.projection.clone()?, true),
+        TypeKind::ValueTableRow(facet) => (facet.projection.clone()?, false),
         _ => return None,
     };
     let needle = field_name.as_str();
@@ -328,7 +330,7 @@ fn lookup_field_in_query_projection(
             name_en: None,
             ty: f.ty,
             value_ty: None,
-            is_readonly: true,
+            is_readonly,
             origin: crate::field_enum::FieldOrigin::UserAttribute,
         },
     )
@@ -1731,6 +1733,20 @@ mod tests {
                 .expect("projection field must resolve");
         assert_eq!(info.ty, db.string(None, false));
         assert!(info.is_readonly, "SDBL projection fields are read-only");
+    }
+
+    #[test]
+    fn value_table_row_projection_field_is_writable() {
+        let db = InMemoryDb::new();
+        let receiver = db.value_table_row(
+            Some(projection_with_two_fields(&db)),
+            bsl_types::facet::TableSource::SdblUnload,
+        );
+        let info =
+            super::lookup_field(&db, &ConfigsObjectResolver(&[]), receiver, &Name::new("КодТов"))
+                .expect("value-table row column must resolve");
+        assert_eq!(info.ty, db.string(None, false));
+        assert!(!info.is_readonly, "value-table row columns accept assignment");
     }
 
     #[test]
