@@ -8739,6 +8739,55 @@ mod tests {
         assert!(hub.materialize(cursor).entries.is_empty(), "a lazily-created cache was watched");
     }
 
+    /// The service directories of the workspace root are stated as exclusions, and the hub
+    /// drops their events the same way it drops the cache's: `git fetch`, a build or a
+    /// package-manager run can produce thousands of events in one burst, and every event
+    /// that reaches the accumulator is a step toward the overflow that forces a full
+    /// rescan — while the files it names were never workspace inputs. Stated as PATHS, not
+    /// by name: a `target` deeper in the tree is nobody's to exclude, and stays in the
+    /// universe.
+    #[test]
+    fn writes_inside_service_directories_are_not_workspace_changes() {
+        let dir = tempdir().unwrap();
+        for service in [".git", "target", "node_modules"] {
+            std::fs::create_dir_all(dir.path().join(service)).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("sub").join("target")).unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        let hub = WorkspaceChangeHub::start_targets_excluding(
+            vec![WatchTarget::recursive(dir.path().to_path_buf())],
+            cache.exclusions(dir.path()),
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let cursor = hub.subscribe();
+
+        for path in [
+            dir.path().join(".git").join("objects").join("ab").join("cdef"),
+            dir.path().join("target").join("debug").join("build").join("x.out"),
+            dir.path().join("node_modules").join("pkg").join("index.js"),
+        ] {
+            hub.ingest_for_test(change_event(EventKind::Create(CreateKind::Any), path));
+        }
+        assert!(
+            hub.materialize(cursor).entries.is_empty(),
+            "a service-directory write was recorded",
+        );
+
+        // Positive controls: the exclusion is a stated path, not a name — a nested
+        // `target` is still a workspace directory — and a source file must survive.
+        for path in [
+            dir.path().join("sub").join("target").join("deep").join("file.o"),
+            dir.path().join("M.bsl"),
+        ] {
+            hub.ingest_for_test(change_event(EventKind::Create(CreateKind::Any), path));
+        }
+        assert_eq!(
+            hub.materialize(cursor).entries.len(),
+            2,
+            "a stated-path exclusion swallowed a nested directory by name",
+        );
+    }
+
     /// The exclusion must survive a real re-arm. `Scope` is rebuilt from the targets
     /// every time the watch is re-pointed, and `ensure_roots` is called by consumers
     /// that know the scan roots but nothing about the cache — so the gate has to force

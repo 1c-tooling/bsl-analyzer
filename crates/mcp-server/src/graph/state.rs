@@ -1452,11 +1452,16 @@ impl GraphState {
     /// Subtrees every pass driven from this graph must not read as sources.
     ///
     /// Derived from the one layout this state was built with, so the walk sees exactly
-    /// the hole the watch does. Empty when this state governs no cache.
+    /// the holes the watch does: the cache directory and the service directories of the
+    /// workspace root. Empty when this state governs no cache.
     pub(crate) fn cache_exclusions(&self) -> Vec<std::path::PathBuf> {
-        self.cache()
-            .map(|cache| cache.spellings().iter().map(|path| path.to_path_buf()).collect())
-            .unwrap_or_default()
+        match (self.cache(), self.workspace_root.as_deref()) {
+            (Some(cache), Some(root)) => cache.exclusions(root),
+            (Some(cache), None) => {
+                cache.spellings().iter().map(|path| path.to_path_buf()).collect()
+            }
+            (None, _) => Vec::new(),
+        }
     }
 
     pub(crate) fn cache(&self) -> Option<&crate::cache::WorkspaceCacheLayout> {

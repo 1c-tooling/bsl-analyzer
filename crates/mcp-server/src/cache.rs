@@ -82,6 +82,31 @@ impl WorkspaceCacheLayout {
         [self.declared.as_path(), self.root.as_path()]
     }
 
+    /// Every subtree of `workspace_root` that no pass may read as a source: this cache
+    /// under both its spellings, plus the service directories that hold a version-control
+    /// store, build output, or package-manager state — never BSL sources.
+    ///
+    /// Stated as PATHS, at the one place that knows the workspace root: narrowing a file
+    /// universe by name is forbidden to every walk (`no_directory_is_excluded_from_the_walk`
+    /// in `project_model`), so a caller states the subtrees it owns and the walks treat them
+    /// as holes like any other. A root declared inside one of them still wins (`PathScope`).
+    ///
+    /// Stated whether or not they exist yet: under a flat layout the workspace root IS the
+    /// watched scan root, and `.git` may be created — or re-created by `git init` — while
+    /// the daemon runs; a hole added only for directories present at boot would miss exactly
+    /// the burst the exclusion exists for.
+    pub fn exclusions(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        let mut exclusions: Vec<PathBuf> =
+            self.spellings().iter().map(|path| path.to_path_buf()).collect();
+        for name in [".git", "target", "node_modules"] {
+            let service = workspace_root.join(name);
+            if !exclusions.iter().any(|exclusion| exclusion == &service) {
+                exclusions.push(service);
+            }
+        }
+        exclusions
+    }
+
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)
     }
@@ -191,5 +216,34 @@ mod tests {
         assert_eq!(layout.lease_lock_path(), root.join("writer.lease.lock"));
         assert_eq!(layout.stall_report_path(), root.join("bsl-graph-stall-report.txt"));
         assert_eq!(layout.daemon_log_path(), root.join("bsl-analyzer-daemon.log"));
+    }
+
+    /// The exclusion list is stated at the workspace root — and only there: the walk's
+    /// policy keeps narrowing by name out, so a `target` deeper in the tree is nobody's
+    /// to exclude.
+    #[test]
+    fn exclusions_state_the_cache_and_the_service_directories_of_the_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let layout = WorkspaceCacheLayout::for_workspace(workspace.path());
+
+        let exclusions = layout.exclusions(workspace.path());
+
+        for name in [".git", "target", "node_modules"] {
+            assert!(
+                exclusions.contains(&workspace.path().join(name)),
+                "`{name}` of the workspace root is not stated"
+            );
+        }
+        for spelling in layout.spellings() {
+            assert!(
+                exclusions.contains(&spelling.to_path_buf()),
+                "the cache spelling {} is not stated",
+                spelling.display()
+            );
+        }
+        assert!(
+            !exclusions.contains(&workspace.path().join("sub").join("target")),
+            "a nested directory was excluded by name"
+        );
     }
 }
