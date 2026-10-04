@@ -70,7 +70,8 @@ fn bare_fn_cascade_two_step_chain() {
 }
 
 #[test]
-fn bare_fn_cascade_respects_param_shadow() {
+fn bare_fn_cascade_reaches_the_method_past_a_parameter() {
+    // `Foo(...)` looks among methods only: the parameter `Foo` does not take the call.
     let (db, fid) = setup(
         r#"
 //- /test.bsl
@@ -83,7 +84,7 @@ fn bare_fn_cascade_respects_param_shadow() {
 КонецПроцедуры
 "#,
     );
-    assert_eq!(var_ty(&db, fid, "Х"), db.unknown());
+    assert_eq!(var_ty(&db, fid, "Х"), db.string(None, false));
 }
 
 #[test]

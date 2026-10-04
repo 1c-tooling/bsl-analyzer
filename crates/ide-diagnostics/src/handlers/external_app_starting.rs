@@ -396,6 +396,31 @@ mod tests {
         check_diagnostics_snapshot_for(code, DiagnosticCode::ExternalAppStarting, expect![[r#""#]]);
     }
 
+    /// A variable is not a method: `КомандаСистемы(...)` looks among methods only, so a
+    /// parameter or a module `Перем` of that name leaves the call to the platform.
+    #[test]
+    fn test_variable_named_like_the_global_still_detected() {
+        let code = r#"
+Перем КомандаСистемы;
+
+Процедура Тест(ЗапуститьПриложение)
+    КомандаСистемы("cmd.exe");
+    ЗапуститьПриложение("calc.exe");
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::ExternalAppStarting,
+            expect![[r#"
+                ExternalAppStarting @ 5:5..5:19
+                  message: External application launch detected
+                  severity: Warning
+                ExternalAppStarting @ 6:5..6:24
+                  message: External application launch detected
+                  severity: Warning"#]],
+        );
+    }
+
     /// Owners are per method: a module that does not export the method cannot
     /// be the one being called.
     #[test]
