@@ -1502,6 +1502,49 @@ impl<'db> InferenceContext<'db> {
         return_ty
     }
 
+    /// Narrows the declared return of a first-argument-typed builtin (see
+    /// [`builtin::returns_first_argument_type`]) to that argument's type. A first argument
+    /// inside the comparable family narrows; a foreign one says nothing about which variant
+    /// runs, so the declared union stays. An unknown one leaves the result unknown: the
+    /// declared union would claim `Строка` for `Макс(Параметр, 1)` and accuse the next
+    /// number-only consumer (`Формат(..., "ЧГ=0")`) on the strength of nothing.
+    /// The rule is the platform function's: a module method, module variable or global
+    /// export that owns the name answers for its own result.
+    fn refine_first_argument_return(
+        &mut self,
+        name: &hir_def::Name,
+        args: &[ExprId],
+        declared: TypeId,
+    ) -> TypeId {
+        if !builtin::returns_first_argument_type(name.as_str())
+            || self.bare_module_method_exists(name)
+            || self.is_call_name_shadowed(name)
+        {
+            return declared;
+        }
+        let Some(first) = args.first().and_then(|arg| self.expr_types.get(arg)).copied() else {
+            return declared;
+        };
+        if self.is_unknown(first) {
+            return first;
+        }
+        let comparable = |ty: TypeId| {
+            matches!(
+                self.db.lookup_type(ty),
+                TypeKind::Number(_) | TypeKind::String(_) | TypeKind::Date(_) | TypeKind::Boolean
+            )
+        };
+        let narrows = match self.db.lookup_type(first) {
+            TypeKind::Union(arms) => arms.iter().all(|arm| comparable(*arm)),
+            _ => comparable(first),
+        };
+        if narrows {
+            first
+        } else {
+            declared
+        }
+    }
+
     fn get_resolver(&self) -> Resolver {
         let module_id = hir_def::ModuleId { file_id: self.context_file_id };
         match &self.local_symbols {
@@ -3268,6 +3311,7 @@ impl<'db> InferenceContext<'db> {
                     }
                 }
                 let ret = self.record_candidate_call_arg_binding(callee, args, candidates);
+                let ret = self.refine_first_argument_return(&name, args, ret);
                 if is_proceed_with_call_name(&name) {
                     if let Some((required, total)) = self.proceed_arity {
                         if args.len() < required || args.len() > total {

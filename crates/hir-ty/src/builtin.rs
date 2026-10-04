@@ -93,6 +93,19 @@ impl BuiltinSignature {
     }
 }
 
+/// Whether the platform global `name` returns a value of its first argument's type.
+///
+/// `Макс` / `Мин` serve the whole comparable family with one HBK signature, so the
+/// declared return is `Число, Строка, Дата, Булево`. The platform picks the comparison
+/// variant by the first argument and converts (or, on 8.3.27, refuses) the rest, so the
+/// result always has the first argument's type. Trusting the declared union instead makes
+/// every `Макс(1, Х)` look like a possible `Строка` and trips the next number-only
+/// consumer (`Формат(..., "ЧГ=0")`) on valid code.
+pub(crate) fn returns_first_argument_type(name: &str) -> bool {
+    use stdx::case::CaseExt;
+    matches!(name.fold_lower().as_str(), "макс" | "мин" | "max" | "min")
+}
+
 fn descriptors_from_global_function(func: &bsl_platform::GlobalFunction) -> Vec<BuiltinSignature> {
     let ret = match &func.return_type {
         None => ReturnTypeSpec::Undefined,
