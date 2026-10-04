@@ -513,6 +513,10 @@ pub enum WorkspaceInitError {
     /// The derived-cache root contains a scan root, so following that root and treating
     /// the cache as the server's own output are mutually exclusive.
     CacheCoversScanRoot { cache: std::path::PathBuf, root: std::path::PathBuf },
+    /// A scan root lies inside a service directory (`.git`, `target`, `node_modules`): the
+    /// exclusion that keeps the directory out of the graph would swallow the root's sources,
+    /// exactly as a cache above a root would.
+    ScanRootInsideServiceDirectory { service: std::path::PathBuf, root: std::path::PathBuf },
 }
 
 impl std::fmt::Display for WorkspaceInitError {
@@ -526,6 +530,13 @@ impl std::fmt::Display for WorkspaceInitError {
                 cache.display(),
                 root.display()
             ),
+            WorkspaceInitError::ScanRootInsideServiceDirectory { service, root } => write!(
+                f,
+                "the scanned source root {} lies inside the service directory {}, which is \
+                 never read as sources; move the root out of it",
+                root.display(),
+                service.display()
+            ),
         }
     }
 }
@@ -534,7 +545,8 @@ impl std::error::Error for WorkspaceInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             WorkspaceInitError::Project(error) => Some(error),
-            WorkspaceInitError::CacheCoversScanRoot { .. } => None,
+            WorkspaceInitError::CacheCoversScanRoot { .. }
+            | WorkspaceInitError::ScanRootInsideServiceDirectory { .. } => None,
         }
     }
 }
@@ -613,8 +625,12 @@ impl SharedState {
         // feeds the graph and the search index, and the roots the engine registers. Two
         // derivations of "where my cache is" would be two chances to disagree, and a
         // disagreement here reads as a file that is indexed but never updated.
-        let cache_exclusions: Vec<PathBuf> =
-            cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+        // Besides the cache's own directory the list states the service directories of the
+        // workspace root (`.git`, `target`, `node_modules`): a flat layout makes the
+        // workspace root the watched scan root, and a fetch, a build or a package-manager
+        // run inside them would otherwise arrive as a burst of workspace events, be
+        // classified as sources, and walk the graph over files that are not sources.
+        let source_exclusions: Vec<PathBuf> = cache.exclusions(&project.root);
 
         // A cache that contains a watched root would exclude that whole root from the
         // watch (see the hub below), leaving the server serving a tree it silently
@@ -635,10 +651,20 @@ impl SharedState {
                 .into_iter()
                 .map(|target| target.path)
                 .collect();
-        if let Some((cache_root, root)) =
-            project_model::PathScope::new(&watched, &cache_exclusions).hole_covering_a_root()
+        if let Some((hole, root)) =
+            project_model::PathScope::new(&watched, &source_exclusions).hole_covering_a_root()
         {
-            return Err(WorkspaceInitError::CacheCoversScanRoot { cache: cache_root, root });
+            // The list holds two kinds of hole, and the advice differs: a cache above a root
+            // is moved by pointing --cache-dir elsewhere, while a service directory above a
+            // root is not the user's to move — the root is. A cache placed onto a service
+            // directory is the service directory first: moving the cache would not free the root.
+            let is_a_service_directory =
+                crate::cache::WorkspaceCacheLayout::is_service_directory(&project.root, &hole);
+            return Err(if is_a_service_directory {
+                WorkspaceInitError::ScanRootInsideServiceDirectory { service: hole, root }
+            } else {
+                WorkspaceInitError::CacheCoversScanRoot { cache: hole, root }
+            });
         }
 
         // Claimed before any background pass starts, so the graph's very first build already
@@ -653,7 +679,7 @@ impl SharedState {
         // the same table on every config drift and deliberately says nothing: a line repeated
         // per rebuild buries the one that is new.
         crate::project::warn_about_rejected_roots(
-            &crate::project::workspace_roots(&project, &cache_exclusions).1,
+            &crate::project::workspace_roots(&project, &source_exclusions).1,
         );
 
         let search_engine: SharedSearchEngine = super::shared_engine(None);
@@ -698,13 +724,13 @@ impl SharedState {
         // one path that declares nothing. The window belongs to that test rather than to a
         // session: a serving daemon calls `warm_start` right after this constructor, and the
         // resident's publish re-declares the roots too.
-        // The derived cache is excluded here and nowhere else. It is the server's own
-        // output, so a change inside it is never a workspace change — and by default it
-        // lives at `<workspace>/.build`, inside the recursive watch, where every index
-        // write would otherwise come back as an event about the tree being analyzed.
+        // The hub takes the same exclusion list every walk takes: the derived cache — the
+        // server's own output, which by default lives at `<workspace>/.build` inside the
+        // recursive watch, where every index write would otherwise come back as an event
+        // about the tree being analyzed — and the service directories of the workspace root.
         let change_hub = WorkspaceChangeHub::start_targets_excluding(
             crate::change_hub::watch_targets_for(&project.root, &scan_roots),
-            cache.spellings().iter().map(|p| p.to_path_buf()).collect(),
+            source_exclusions.clone(),
         );
 
         // Subscribed here, synchronously, before the thread that reads disk even exists —
@@ -812,7 +838,7 @@ impl SharedState {
         // snapshot is loaded here. The same resident serves the search overlay's incremental
         // reindex through the snapshot-source adapter.
         let diagnostics = DiagnosticsState::for_workspace(source_dir.clone())
-            .with_excluded(cache_exclusions.clone())
+            .with_excluded(source_exclusions.clone())
             .with_change_hub(change_hub.clone());
         let snapshot_source: Arc<dyn bsl_search::ModuleSnapshotSource> = Arc::new(
             crate::diagnostics_state::ResidentModuleSnapshotSource::new(diagnostics.clone()),
@@ -1857,11 +1883,10 @@ impl SharedState {
         embedding_prefixes: &super::types::EmbeddingPrefixes,
     ) -> Result<Option<WorkspaceSearchInit>, bsl_search::SearchError> {
         // The graph carries the resolved cache layout, so this pass reads the tree
-        // through the same hole the watch does instead of re-deriving where the cache is.
-        let excluded: Vec<PathBuf> = graph
-            .cache()
-            .map(|cache| cache.spellings().iter().map(|path| path.to_path_buf()).collect())
-            .unwrap_or_default();
+        // through the same holes the watch does — the cache and the service directories
+        // of the workspace root — instead of re-deriving where the cache is.
+        let excluded: Vec<PathBuf> =
+            graph.cache().map(|cache| cache.exclusions(workspace_root)).unwrap_or_default();
         // Every read below is a baseline, so it waits for the watch first: from then on the
         // stream covers everything after it. A hub that cannot watch polls instead, and its
         // consumers reconcile once — either way the consumer below runs.
@@ -3631,6 +3656,60 @@ mod tests {
         let ok = crate::cache::WorkspaceCacheLayout::from_root(beside.path().to_path_buf());
         SharedState::workspace_with_cache(workspace.path().to_path_buf(), ok)
             .expect("a cache outside every source root must be accepted");
+    }
+
+    /// A scan root inside a service directory is refused by the same rule, and named as the
+    /// service directory it is: the advice for a cache misplacement ("choose another
+    /// --cache-dir") would be wrong — the root is what moves.
+    #[test]
+    fn a_source_root_inside_a_service_directory_is_refused_as_such() {
+        let workspace = tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Configuration.xml"),
+            "<Configuration><Name>Conf</Name></Configuration>",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path().join("target")).unwrap();
+        fs::write(workspace.path().join("target").join("Configuration.xml"), "<Configuration/>")
+            .unwrap();
+        fs::write(workspace.path().join("bsl-analyzer.toml"), "[source]\nroot = \"target\"\n")
+            .unwrap();
+
+        let refused = SharedState::workspace(workspace.path().to_path_buf());
+        let Err(error) = refused else {
+            panic!("a source root inside `target` must be refused");
+        };
+        assert!(
+            matches!(error, crate::WorkspaceInitError::ScanRootInsideServiceDirectory { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A `--cache-dir` that names the very service directory holding the source root is still
+    /// refused as the service directory: moving the cache would not free the root.
+    #[test]
+    fn a_cache_placed_at_the_service_directory_holding_the_root_is_refused_as_service() {
+        let workspace = tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Configuration.xml"),
+            "<Configuration><Name>Conf</Name></Configuration>",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path().join("target")).unwrap();
+        fs::write(workspace.path().join("target").join("Configuration.xml"), "<Configuration/>")
+            .unwrap();
+        fs::write(workspace.path().join("bsl-analyzer.toml"), "[source]\nroot = \"target\"\n")
+            .unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::from_root(workspace.path().join("target"));
+
+        let refused = SharedState::workspace_with_cache(workspace.path().to_path_buf(), cache);
+        let Err(error) = refused else {
+            panic!("a source root inside `target` must be refused");
+        };
+        assert!(
+            matches!(error, crate::WorkspaceInitError::ScanRootInsideServiceDirectory { .. }),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

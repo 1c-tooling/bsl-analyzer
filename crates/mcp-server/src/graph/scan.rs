@@ -182,7 +182,7 @@ pub(crate) fn scan_stats_over_roots_excluding(
 pub(super) fn workspace_fingerprint(workspace_root: &Path) -> crate::graph_db::GraphFp {
     let cache = crate::cache::WorkspaceCacheLayout::for_workspace(workspace_root);
     cache.ensure().expect("test cache directory is creatable");
-    let excluded: Vec<PathBuf> = cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+    let excluded: Vec<PathBuf> = cache.exclusions(workspace_root);
     workspace_fingerprint_over(&super::input::ProjectSnapshot::load_excluding(
         workspace_root,
         &excluded,

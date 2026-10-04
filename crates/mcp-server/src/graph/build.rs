@@ -4440,11 +4440,8 @@ mod tests {
         symlink(&configuration, root.join("alias-b")).unwrap();
         fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \"alias-a\"\n").unwrap();
 
-        let excluded: Vec<_> = crate::cache::WorkspaceCacheLayout::for_workspace(root)
-            .spellings()
-            .iter()
-            .map(|path| path.to_path_buf())
-            .collect();
+        let excluded: Vec<_> =
+            crate::cache::WorkspaceCacheLayout::for_workspace(root).exclusions(root);
         let project = crate::graph::ProjectSnapshot::load_excluding(root, &excluded);
         let pre = crate::graph::universe::ScannedUniverse::scan_excluding(
             &project.scan_roots,
@@ -4480,11 +4477,8 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
 
         let before = project_model::source_set::scans_performed_on_thread();
-        let excluded: Vec<_> = crate::cache::WorkspaceCacheLayout::for_workspace(root)
-            .spellings()
-            .iter()
-            .map(|path| path.to_path_buf())
-            .collect();
+        let excluded: Vec<_> =
+            crate::cache::WorkspaceCacheLayout::for_workspace(root).exclusions(root);
         let project = crate::graph::ProjectSnapshot::load_excluding(root, &excluded);
         let pre = crate::graph::universe::ScannedUniverse::scan_excluding(
             &project.scan_roots,
@@ -4506,11 +4500,8 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
         build_and_publish_graph_file(root, 1, &graph, None).expect("the graph builds");
         let graph_path = graph.graph_db_path().expect("workspace graph has a cache path");
-        let excluded: Vec<_> = crate::cache::WorkspaceCacheLayout::for_workspace(root)
-            .spellings()
-            .iter()
-            .map(|path| path.to_path_buf())
-            .collect();
+        let excluded: Vec<_> =
+            crate::cache::WorkspaceCacheLayout::for_workspace(root).exclusions(root);
         let project = crate::graph::ProjectSnapshot::load_excluding(root, &excluded);
         let graph_db = crate::graph_query::GraphDb::open(&graph_path).expect("graph opens");
         assert!(
@@ -4709,11 +4700,8 @@ mod tests {
         sample_workspace(root);
 
         let walk = workspace_fingerprint(root);
-        let excluded: Vec<_> = crate::cache::WorkspaceCacheLayout::for_workspace(root)
-            .spellings()
-            .iter()
-            .map(|path| path.to_path_buf())
-            .collect();
+        let excluded: Vec<_> =
+            crate::cache::WorkspaceCacheLayout::for_workspace(root).exclusions(root);
         let project = crate::graph::ProjectSnapshot::load_excluding(root, &excluded);
         let stats = crate::graph::scan::scan_stats_over_roots_excluding(
             &project.scan_roots,

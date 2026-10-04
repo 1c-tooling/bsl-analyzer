@@ -517,8 +517,7 @@ fn moved_external_cache_reuses_graph_without_a_full_build() {
         old_dir.path(),
     )
     .expect("prepare old external cache");
-    let old_excluded: Vec<_> =
-        old_cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+    let old_excluded = old_cache.exclusions(&old_root);
     let old_project = super::input::ProjectSnapshot::load_excluding(&old_root, &old_excluded);
     let old_universe = super::universe::ScannedUniverse::scan_excluding(
         &old_project.scan_roots,
@@ -539,8 +538,7 @@ fn moved_external_cache_reuses_graph_without_a_full_build() {
     copy_tree(old_cache.root(), new_cache.root());
     assert_ne!(old_cache.root(), new_cache.root(), "the external cache location moved");
 
-    let new_excluded: Vec<_> =
-        new_cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+    let new_excluded = new_cache.exclusions(&new_root);
     let new_project = super::input::ProjectSnapshot::load_excluding(&new_root, &new_excluded);
     assert_eq!(
         old_project.portable_topology, new_project.portable_topology,
@@ -898,7 +896,7 @@ fn age_tree(root: &Path) {
 
 fn scan_project(root: &Path) -> (super::input::ProjectSnapshot, bsl_search::WorkspaceRoots) {
     let cache = WorkspaceCacheLayout::for_workspace(root);
-    let excluded: Vec<_> = cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+    let excluded = cache.exclusions(root);
     let project = super::input::ProjectSnapshot::load_excluding(root, &excluded);
     let roots = project.search_roots.clone().expect("validated workspace roots");
     (project, roots)

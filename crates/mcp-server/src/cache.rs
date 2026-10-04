@@ -35,6 +35,13 @@ pub struct WorkspaceCacheLayout {
     /// that has to tell "is this event inside my own cache" needs both, and keeping
     /// only the canonical one is a filter that silently matches nothing.
     declared: PathBuf,
+    /// The workspace whose derived state this cache holds, when the caller named one.
+    ///
+    /// The lease records it and refuses a claim of a cache whose record names ANOTHER
+    /// workspace (github#272): one directory must not serve two configurations. It lives
+    /// here rather than beside each claim so every claiming path keeps one signature — the
+    /// layout already travels to all of them.
+    workspace: Option<PathBuf>,
 }
 
 impl WorkspaceCacheLayout {
@@ -42,12 +49,12 @@ impl WorkspaceCacheLayout {
     pub fn for_workspace(workspace_root: &Path) -> Self {
         let declared = workspace_root.join(".build");
         let root = std::fs::canonicalize(&declared).unwrap_or_else(|_| declared.clone());
-        Self { root, declared }
+        Self { root, declared, workspace: Some(workspace_root.to_path_buf()) }
     }
 
     /// A layout whose root has already been resolved by the caller.
     pub fn from_root(root: PathBuf) -> Self {
-        Self { declared: root.clone(), root }
+        Self { declared: root.clone(), root, workspace: None }
     }
 
     /// Resolve, create, and canonicalize an explicit `--cache-dir` value.
@@ -66,11 +73,26 @@ impl WorkspaceCacheLayout {
                 format!("failed to canonicalize --cache-dir {}: {error}", requested.display()),
             )
         })?;
-        Ok(Self { root, declared: requested })
+        Ok(Self { root, declared: requested, workspace: None })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Name the workspace whose derived state this cache holds. See [`Self::workspace`].
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    /// The workspace whose derived state this cache holds, when the caller named one.
+    ///
+    /// `None` on a layout built from a bare directory: the identity then stays unstated, and
+    /// the lease's claim check has nothing to compare (an older program's records carry none
+    /// either — see [`crate::workspace_lease`]).
+    pub fn workspace(&self) -> Option<&Path> {
+        self.workspace.as_deref()
     }
 
     /// Every spelling this cache root can appear under in a file-watcher event.
@@ -80,6 +102,36 @@ impl WorkspaceCacheLayout {
     /// gets wrong.
     pub fn spellings(&self) -> [&Path; 2] {
         [self.declared.as_path(), self.root.as_path()]
+    }
+
+    /// Every subtree of `workspace_root` that no pass may read as a source: this cache
+    /// under both its spellings, plus the service directories that hold a version-control
+    /// store, build output, or package-manager state — never BSL sources.
+    ///
+    /// Stated as PATHS, at the one place that knows the workspace root: narrowing a file
+    /// universe by name is forbidden to every walk (`no_directory_is_excluded_from_the_walk`
+    /// in `project_model`), so a caller states the subtrees it owns and the walks treat them
+    /// as holes like any other. A root declared inside one of them still wins (`PathScope`).
+    ///
+    /// Stated whether or not they exist yet: under a flat layout the workspace root IS the
+    /// watched scan root, and `.git` may be created — or re-created by `git init` — while
+    /// the daemon runs; a hole added only for directories present at boot would miss exactly
+    /// the burst the exclusion exists for.
+    pub fn exclusions(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        let mut exclusions: Vec<PathBuf> =
+            self.spellings().iter().map(|path| path.to_path_buf()).collect();
+        for service in service_directories(workspace_root) {
+            if !exclusions.iter().any(|exclusion| exclusion == &service) {
+                exclusions.push(service);
+            }
+        }
+        exclusions
+    }
+
+    /// Whether `path` is one of the service directories of `workspace_root` — the part of
+    /// [`Self::exclusions`] that is not the cache, even where the cache was placed onto one.
+    pub fn is_service_directory(workspace_root: &Path, path: &Path) -> bool {
+        service_directories(workspace_root).any(|service| service == path)
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {
@@ -127,6 +179,10 @@ impl WorkspaceCacheLayout {
     pub fn daemon_log_path(&self) -> PathBuf {
         self.root.join("bsl-analyzer-daemon.log")
     }
+}
+
+fn service_directories(workspace_root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    [".git", "target", "node_modules"].into_iter().map(|name| workspace_root.join(name))
 }
 
 /// The per-workspace derived-cache directory (`<workspace>/.build`).
@@ -191,5 +247,51 @@ mod tests {
         assert_eq!(layout.lease_lock_path(), root.join("writer.lease.lock"));
         assert_eq!(layout.stall_report_path(), root.join("bsl-graph-stall-report.txt"));
         assert_eq!(layout.daemon_log_path(), root.join("bsl-analyzer-daemon.log"));
+    }
+
+    /// The default layout names the workspace it serves; the other two leave the identity to
+    /// the caller, who states it with `with_workspace`.
+    #[test]
+    fn the_layout_names_the_workspace_it_serves() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let default = WorkspaceCacheLayout::for_workspace(workspace.path());
+        assert_eq!(default.workspace(), Some(workspace.path()));
+
+        let explicit = WorkspaceCacheLayout::from_root(PathBuf::from("external-cache"));
+        assert_eq!(explicit.workspace(), None);
+        assert_eq!(
+            explicit.with_workspace(workspace.path().to_path_buf()).workspace(),
+            Some(workspace.path())
+        );
+    }
+
+    /// The exclusion list is stated at the workspace root — and only there: the walk's
+    /// policy keeps narrowing by name out, so a `target` deeper in the tree is nobody's
+    /// to exclude.
+    #[test]
+    fn exclusions_state_the_cache_and_the_service_directories_of_the_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let layout = WorkspaceCacheLayout::for_workspace(workspace.path());
+
+        let exclusions = layout.exclusions(workspace.path());
+
+        for name in [".git", "target", "node_modules"] {
+            assert!(
+                exclusions.contains(&workspace.path().join(name)),
+                "`{name}` of the workspace root is not stated"
+            );
+        }
+        for spelling in layout.spellings() {
+            assert!(
+                exclusions.contains(&spelling.to_path_buf()),
+                "the cache spelling {} is not stated",
+                spelling.display()
+            );
+        }
+        assert!(
+            !exclusions.contains(&workspace.path().join("sub").join("target")),
+            "a nested directory was excluded by name"
+        );
     }
 }

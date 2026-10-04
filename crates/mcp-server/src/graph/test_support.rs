@@ -66,7 +66,7 @@ pub(crate) fn workspace_hub(root: &Path) -> crate::change_hub::WorkspaceChangeHu
     let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
     crate::change_hub::WorkspaceChangeHub::start_targets_excluding(
         vec![crate::change_hub::WatchTarget::recursive(root.to_path_buf())],
-        cache.spellings().iter().map(|path| path.to_path_buf()).collect(),
+        cache.exclusions(root),
     )
 }
 
@@ -238,7 +238,7 @@ pub(super) fn seed_cache_with_layout(
 ) {
     let out = cache.graph_db_path();
     fs::create_dir_all(out.parent().unwrap()).unwrap();
-    let excluded: Vec<_> = cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+    let excluded = cache.exclusions(root);
     let project = crate::graph::ProjectSnapshot::load_excluding(root, &excluded);
     let universe = crate::graph::universe::ScannedUniverse::scan_excluding(
         &project.scan_roots,

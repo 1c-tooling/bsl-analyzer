@@ -642,6 +642,7 @@ fn resolve_workspace_cache(
     // fail over a value it would not have used.
     let base = if path.is_absolute() { PathBuf::new() } else { env::current_dir()? };
     mcp_server::WorkspaceCacheLayout::prepare_explicit(path, &base)
+        .map(|layout| layout.with_workspace(canonical_source_dir.to_path_buf()))
 }
 
 fn resolve_workspace_inputs(
