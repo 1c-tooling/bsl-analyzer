@@ -10,8 +10,8 @@ pub use cyclomatic::cyclomatic_complexity;
 pub use edge::CfgEdgeType;
 pub use graph::ControlFlowGraph;
 pub use vertex::{
-    BasicBlockVertex, CfgVertex, ConditionalVertex, ForEachLoopVertex, ForLoopVertex, LabelVertex,
-    PreprocConditionVertex, TryExceptVertex, WhileLoopVertex,
+    BasicBlockVertex, CfgVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex,
+    PreprocConditionVertex, WhileHeaderVertex,
 };
 
 pub use petgraph::graph::NodeIndex;

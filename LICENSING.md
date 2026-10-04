@@ -21,42 +21,63 @@ rewrite is incomplete in identifiable places, listed in the audit.
 
 ## Tier A — `MIT OR Apache-2.0`
 
-SPDX: `MIT OR Apache-2.0`. Anyone may take any of these crates and
-redistribute it under either MIT or Apache-2.0.
+SPDX: `MIT OR Apache-2.0`. Anyone may take the code of any of these
+crates — the crate's own sources, in isolation — and redistribute it under
+either MIT or Apache-2.0. The permission does not extend to a build of the
+crate: what such a build may be redistributed under also depends on the
+tiers of the crates it pulls in.
 
 Two caveats apply to the phrase "in isolation", which earlier versions
 of this document used without qualification:
 
 - **A crate is only as reusable as its dependencies.** `hir-ty`, `hir`
   and `dataflow` depend on `cfg`; fourteen crates depend on
-  `bsl-metadata`; several depend on Tier B crates. Taking such a crate
-  means taking its dependency tree under whatever those crates are
-  licensed. The per-crate SPDX describes that crate's own code, not the
-  terms on which the resulting build can be redistributed.
-- **`cfg` and `bsl-metadata` are under review.** Both were written with
-  a copyleft-licensed project open as the working reference; see the
-  notice in `NOTICE`. Their tier may change.
+  `bsl-metadata`; the crates marked in the last column of the table
+  below pull in Tier B crates. Taking such a crate means taking its
+  dependency tree under whatever those crates are licensed. The
+  per-crate SPDX describes that crate's own code, not the terms on which
+  the resulting build can be redistributed.
+- **The identified `cfg` taxonomy/API slice has been independently
+  re-derived and verified.** The bounded derivation and analysis-preservation
+  checks are recorded in [the CFG attestation](docs/legal/cfg-clean-room-slice.md).
+  The history of its copyleft reference remains in `NOTICE`; closing this
+  slice changes neither the per-crate SPDX nor dependency restrictions.
+  **`bsl-metadata` remains under review** for its own reference-derived
+  ontology, and its tier may change.
 
-| Crate | Purpose |
-|---|---|
-| `syntax` | Rowan-based lossless CST wrapper |
-| `base-db` | Salsa foundation, VFS integration |
-| `vfs`, `vfs-notify` | Virtual file system and file watching |
-| `project-model` | Project configuration loader |
-| `intern`, `stdx`, `profile`, `line-index`, `paths` | Utility crates |
-| `cfg`, `cfg-types`, `dataflow` | Control-flow graph and dataflow analysis |
-| `hir-def`, `hir-ty`, `hir` | High-level IR: ItemTree, SymbolTree, type inference |
-| `ide-db`, `ide-assists`, `ide` | IDE database and high-level IDE API |
-| `bsl-metadata` | Configuration XML/Config parsing |
-| `bsl-platform` | Platform types and methods catalog |
-| `bsl-search`, `symbol-info` | Search and symbol indexing |
-| `test-fixture`, `test-utils` | Test infrastructure |
-| `mcp-server` | MCP protocol server |
-| `bsl-debug` | DAP protocol support |
-| `bsl-launcher` | Process launcher |
-| `naparnik` | AI completion integration layer |
-| `onec-client` | 1C integration client |
-| `xtask` | Workspace tooling |
+The last column lists the Tier B crates reachable from a crate through
+its normal and build dependencies, followed transitively inside this
+workspace; dev-dependencies are not counted. A dash means none is
+reachable. How the column is derived, the provenance walk of Tier A
+done under #151 and the additions made under #154 are recorded in
+`docs/legal/tier-a-provenance-audit.md`.
+
+| Crate | Purpose | Pulls in Tier B |
+|---|---|---|
+| `syntax` | Rowan-based lossless CST wrapper | `lexer` |
+| `base-db` | Salsa foundation, VFS integration | `parser`, `lexer` |
+| `vfs`, `vfs-notify` | Virtual file system and file watching | — |
+| `project-model` | Project configuration loader | `parser`, `lexer` |
+| `intern`, `stdx`, `profile`, `line-index`, `paths` | Utility crates | — |
+| `cfg`, `cfg-types`, `dataflow` | Control-flow graph and dataflow analysis | `cfg`, `dataflow`: `sdbl-hir`, `parser`, `lexer`; `cfg-types`: — |
+| `hir-def`, `hir-ty`, `hir` | High-level IR: ItemTree, SymbolTree, type inference | all three: `sdbl-hir`, `parser`, `lexer` |
+| `ide-db`, `ide-assists`, `ide` | IDE database and high-level IDE API | `ide-db`, `ide-assists`: `sdbl-hir`, `parser`, `lexer`; `ide`: also `ide-diagnostics` |
+| `bsl-metadata` | Configuration XML/Config parsing | — |
+| `bsl-platform` | Platform types and methods catalog | — |
+| `bsl-config` | Visible configurations and `ConfigId` | — |
+| `bsl-types` | Type kernel | — |
+| `bsl-search`, `symbol-info` | Search and symbol indexing | `bsl-search`: `parser`, `lexer`; `symbol-info`: `sdbl-hir`, `parser`, `lexer` |
+| `code-chunk` | Splitting sources into fragments | `parser`, `lexer` |
+| `parser-error` | Parse error types | `lexer` |
+| `ide-host-core` | Shared analysis host | `ide-diagnostics`, `sdbl-hir`, `parser`, `lexer` |
+| `vcs` | Git diff reports for analysis scoping | — |
+| `test-fixture`, `test-utils` | Test infrastructure | `test-fixture`: `sdbl-hir`, `parser`, `lexer`; `test-utils`: — |
+| `mcp-server` | MCP protocol server | `ide-diagnostics`, `sdbl-hir`, `parser`, `lexer` |
+| `bsl-debug` | DAP protocol support | — |
+| `bsl-launcher` | Process launcher | — |
+| `naparnik` | AI completion integration layer | — |
+| `onec-client` | 1C integration client | — |
+| `xtask` | Workspace tooling | — |
 
 ## Tier B — `LGPL-3.0-or-later`
 
@@ -147,7 +168,68 @@ inherits the obligations of the original sources.
 | `crates/bsl-metadata/fixtures/designer/InformationRegisters/РегистрСведений1/Ext/ManagerModule.bsl` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
 | `crates/bsl-metadata/fixtures/designer/InformationRegisters/РегистрСведений1/Ext/RecordSetModule.bsl` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
 | `crates/bsl-metadata/fixtures/designer/WebServices/WebСервис1/Ext/Module.bsl` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1/Forms/ФормаВыбора/Ext/Form.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1/Forms/ФормаВыбора.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1/Forms/ФормаСписка/Ext/Form.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1/Forms/ФормаСписка.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1/Forms/ФормаЭлемента/Ext/Form.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1/Forms/ФормаЭлемента.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1/Templates/Макет.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/Справочник1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Catalogs/СправочникСМенеджером.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/CommandGroups/ГруппаКоманд1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/CommonModules/ГлобальныйСерверныйМодуль.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/CommonModules/КлиентскийОбщийМодуль.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/CommonModules/ПервыйОбщийМодуль.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ConfigDumpInfo.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Configuration.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb`; extended afterwards in this repository, see below |
+| `crates/bsl-metadata/fixtures/designer/Documents/Документ1/Forms/ФормаВыбора/Ext/Form.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Documents/Документ1/Forms/ФормаВыбора.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Documents/Документ1/Forms/ФормаДокумента/Ext/Form.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Documents/Документ1/Forms/ФормаДокумента.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Documents/Документ1/Forms/ФормаСписка/Ext/Form.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Documents/Документ1/Forms/ФормаСписка.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Documents/Документ1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/EventSubscriptions/ВерсионированиеПриЗаписи.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/EventSubscriptions/ПередЗаписьюДокумента.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/EventSubscriptions/ПередЗаписьюКонстанты.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/EventSubscriptions/ПриЗаписиДокумента.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/EventSubscriptions/ПриЗаписиСправочника.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/EventSubscriptions/ПриУстановкеНовогоКода.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/EventSubscriptions/РегистрацияИзмененийПередУдалением.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ExternalDataSources/ВнешнийИсточникДанных1/Cubes/Куб1/DimensionTables/ТаблицаИзмерения1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ExternalDataSources/ВнешнийИсточникДанных1/Cubes/Куб1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ExternalDataSources/ВнешнийИсточникДанных1/Cubes/Куб3/DimensionTables/ТаблицаИзмерения2.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ExternalDataSources/ВнешнийИсточникДанных1/Cubes/Куб3.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ExternalDataSources/ВнешнийИсточникДанных1/Tables/Таблица1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ExternalDataSources/ВнешнийИсточникДанных1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/HTTPServices/HTTPСервис1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/InformationRegisters/РегистрСведений1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Languages/Русский.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Roles/ПолныеПрава/Ext/Rights.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Roles/ПолныеПрава.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Roles/Роль1/Ext/Rights.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Roles/Роль1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Roles/Роль2/Ext/Rights.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Roles/Роль2.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ScheduledJobs/РегламентноеЗадание1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ScheduledJobs/РегламентноеЗадание2.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ScheduledJobs/РегламентноеЗаданиеНесуществующийМетод.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ScheduledJobs/РегламентноеЗаданиеПредопределенноеНесколькоПараметров.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/ScheduledJobs/РегламентноеЗаданиеПриватныйМетод.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/Subsystems/Подсистема1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/bsl-metadata/fixtures/designer/WebServices/WebСервис1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
+| `crates/ide-diagnostics/test_data/metadata/designer/` (51 files, whole directory) | bsl-language-server (Java), by the message of `8591e553`; content identical to the `4601ffcb` fixtures | removed test fixture, added by `8591e553`, not referenced by any test; present in history only — see below |
+| `crates/ide-diagnostics/test_data/set_permissions_for_new_objects/Roles/` (6 XML files) | not named by its commit; content identical to the `designer/Roles/` files above | test fixture, first added by `0629d987`, moved by `4527ea15` — see below |
 | `crates/bsl-platform/data/platform_data.json` | ООО «1С-Софт» | 1C copyright, see `crates/bsl-platform/data/PROVENANCE.md` — not covered by MIT / Apache-2.0 / LGPL-3.0 |
+
+The preprocessor symbol list, formerly in
+`crates/ide-diagnostics/src/utils/preprocessor_symbols.rs` and now in
+`crates/syntax/src/preproc_symbols.rs`, was re-derived from section 4.8.1.2
+of the 1C Developer's Guide. Both lines of its provenance — the list and the
+test material of its diagnostic — are described in
+`docs/legal/bsl-clean-room-slice-b2.md`. This is a provenance record, not a
+change of licence: the file stays under the licence of its crate.
 
 Test material that came from `bsl-language-server` — the fixture of the
 unknown-preprocessor-symbol diagnostic — is **no longer present**. It was
@@ -166,6 +248,68 @@ the adaptation made before we received it. This repository changed two further
 lines in `f1fc00ff` (2026-05-13), correcting an event-handler statement to the
 syntax section 4.6.11.1 gives. The licence header itself has never been touched:
 `crates/parser/tests/fixture_licence.rs` fails if it is removed or altered.
+
+### XML metadata fixtures
+
+The `.bsl` rows above leave the XML beside them unrecorded. This section covers
+the 73 non-`.bsl` files under `crates/bsl-metadata/fixtures/designer/` (72 `.xml`
+and one `.bin`), checked on 2026-10-03 by the same walk used for the `.bsl` files:
+the commit that introduced each file, its content, and the markers `Source:`,
+`Ported`, `copied from`, `bsl-language-server`, `bsl-parser`, `1c-syntax`,
+`mdclasses` in the files and in the messages of every commit that touched them.
+
+- **51 files** were introduced by `4601ffcb`, whose message says "Comprehensive
+  test fixtures copied from bsl-language-server-rust". The commit lists them; the
+  list is not a similarity search. Seven of them (`Catalogs/Справочник1.xml`,
+  `Catalogs/СправочникСМенеджером.xml`, three `CommonModules/*.xml`,
+  `Documents/Документ1.xml`, `InformationRegisters/РегистрСведений1.xml`) were
+  moved up one directory by `a3f23d68` as pure renames. Fifty of the 51 are
+  byte-identical to the version `4601ffcb` introduced. `Configuration.xml` was
+  extended afterwards in this repository (three further commits adding the
+  objects that other fixtures need); the file as a whole is listed because its
+  base is the imported one, and the extensions are ours.
+- **22 files** were introduced by later commits (`1ded061e`, `35e7a03e`,
+  `595edb80`, `6194c691`, `799733cf`, `9575b32c`, `18cdcfa8`, `cc23cf16`,
+  `d03d8281`, `e949a468`), each as part of a change to this repository's own code.
+  Their messages name no external source and no file carries a marker. They are
+  **not** listed above and stay under the workspace licence. This is the absence
+  of a trace, not proof of independent authorship — the same limit as for the
+  `.bsl` files.
+- The word `MDClasses` inside the files is the 1C configuration-export XML
+  namespace, which every Designer export carries. It is not a reference to the
+  `mdclasses` project.
+
+The origin of the 51 files is the channel stated by the commit message,
+`bsl-language-server-rust`. Its own sources were not opened for this record, so
+what that project took from elsewhere is not established here. The commit
+establishes the channel only, not a copyright holder or licence for any file:
+none of them carries a licence header of its own, and the terms are those of
+whoever authored the material, which this repository's history does not show.
+That is the same standing as the `.bsl` rows above.
+
+`crates/ide-diagnostics/test_data/metadata/designer/` held 51 files before its
+removal, all introduced by `8591e553` and nothing else — checked against every tracked file in
+the directory, not only `.xml`. That commit added 72 files: the 51 XML and 21
+`.bsl`, the latter byte-identical to the 21 `.bsl` rows above and deleted by
+`07d2b977`. The commit says "Copy test configuration
+metadata/designer/ from Java project", so the stated channel here is
+`bsl-language-server`, not `bsl-language-server-rust`. Fifty of the 51 are
+byte-identical to the `bsl-metadata` files above; the 51st is `Configuration.xml`
+in the form `4601ffcb` introduced it, before this repository extended it. The two
+copies therefore carry one body of material under two stated channels, and both
+are recorded. A directory row was justified here only because the check above
+found no file in the directory from another commit. No code or test referenced
+this directory before its removal: every `ide-diagnostics` test that reads a designer configuration
+reads `crates/bsl-metadata/fixtures/designer`.
+
+`crates/ide-diagnostics/test_data/set_permissions_for_new_objects/Roles/` holds
+six XML files byte-identical to `designer/Roles/ПолныеПрава`, `Роль1` and `Роль2`
+above. The commits that placed them (`0629d987`, moved by `4527ea15`) name no
+source, so the row rests on content identity alone, not on a stated channel.
+
+The `.bsl`, `.xml` and `.bin` files elsewhere under `crates/bsl-metadata/fixtures/`
+(`cfe_dependencies/`, `extension_common_module/`, `extension_metadata/`) were not
+part of this check. This is a provenance record, not a change of licence.
 
 ### Test material embedded in Rust sources
 

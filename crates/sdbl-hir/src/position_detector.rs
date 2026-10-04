@@ -55,8 +55,15 @@ pub fn detect_sdbl_at_position(root: &SyntaxNode, offset: TextSize) -> Option<Sd
     }
 
     let offset_in_literal = offset - literal_node.text_range().start();
-    let query_text = extract_query_text(&literal_text);
-    let offset_in_query = map_offset_to_query(&literal_text, offset_in_literal);
+    let (query_text, offset_in_query) =
+        match syntax::sdbl_query::extract_torn_literal(&literal_node) {
+            // Text an extension removed, or a marker, is no part of the query.
+            Some((text, map)) => (text, map.map_offset_to_text(offset_in_literal)?),
+            None => (
+                extract_query_text(&literal_text),
+                map_offset_to_query(&literal_text, offset_in_literal),
+            ),
+        };
 
     tracing::debug!(
         literal_len = literal_text.len(),

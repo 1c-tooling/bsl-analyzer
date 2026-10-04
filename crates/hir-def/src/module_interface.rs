@@ -110,6 +110,7 @@ impl ModuleInterface {
             .filter(|n| n.kind() == syntax::SyntaxKind::VAR_DEF)
             .map(|n| (n.text_range(), n))
             .collect();
+        let comment_runs = syntax::comment_runs(&parse.syntax_node());
 
         let mut interface = ModuleInterface::empty(module_id);
         let items = item_tree.top_level_items();
@@ -121,8 +122,12 @@ impl ModuleInterface {
                 ModItem::Procedure(_) | ModItem::Function(_) => {
                     let method = item_tree.method_item(item).expect("a method item");
                     let method_id = MethodId { module: module_id, local_id: method.key() };
-                    let docs =
-                        crate::docs::compute_method_docs(parse, item_tree, method_id, source_text);
+                    let docs = crate::docs::compute_method_docs(
+                        &comment_runs,
+                        item_tree,
+                        method_id,
+                        source_text,
+                    );
                     let decl = Self::method_decl(
                         method_id,
                         method.name(),
@@ -139,12 +144,15 @@ impl ModuleInterface {
                     let var = item_tree.variable(*var_idx);
                     let variable_id = VariableId { module: module_id, local_id };
                     let docs = match var_def_nodes.get(&var.source_range) {
-                        Some(node) => compute_variable_docs_with_node(node, var, source_text),
+                        Some(node) => {
+                            compute_variable_docs_with_node(node, var, source_text, &comment_runs)
+                        }
                         None => crate::docs::compute_variable_docs(
                             parse,
                             item_tree,
                             variable_id,
                             source_text,
+                            &comment_runs,
                         ),
                     };
                     let decl = VariableDecl {
@@ -569,6 +577,7 @@ pub fn module_interface_query<'db>(
 mod tests {
     use super::*;
     use crate::MethodKey;
+    use expect_test::expect;
     use vfs::FileId;
 
     fn interface(code: &str) -> ModuleInterface {
@@ -582,6 +591,140 @@ mod tests {
             code,
             Some(&conditionals),
         )
+    }
+
+    #[test]
+    fn comment_run_documentation_matches_the_module_interface_contract() {
+        let i = interface(include_str!("fixtures/issue53_comment_runs.bsl"));
+
+        expect![[r#"
+            Some(
+                MethodDocs {
+                    raw: "\nВычисляет длину значения.\n\nПараметры:\n  Значение - Строка - исходное значение.\n\nВозвращаемое значение:\n  Число - длина значения.\n\nПример:\n  Посчитать(\"текст\")\n",
+                    purpose: Some(
+                        "Вычисляет длину значения.",
+                    ),
+                    parameters: [
+                        ParameterDoc {
+                            name: "Значение",
+                            types: [
+                                TypeDoc {
+                                    name: "Строка",
+                                    description: Some(
+                                        "исходное значение.",
+                                    ),
+                                    parameters: [],
+                                    is_hyperlink: false,
+                                },
+                            ],
+                        },
+                    ],
+                    returned_value: [
+                        TypeDoc {
+                            name: "Число",
+                            description: Some(
+                                "длина значения.",
+                            ),
+                            parameters: [],
+                            is_hyperlink: false,
+                        },
+                    ],
+                    examples: [
+                        "Посчитать(\"текст\")",
+                    ],
+                    call_options: [],
+                    deprecation: None,
+                    link: None,
+                },
+            )
+        "#]]
+        .assert_debug_eq(
+            &i.find_method(&Name::new("Посчитать")).expect("documented method").docs.as_deref(),
+        );
+        expect![[r#"
+            None
+        "#]]
+        .assert_debug_eq(
+            &i.find_method(&Name::new("БезДокументации"))
+                .expect("undocumented method")
+                .docs
+                .as_deref(),
+        );
+        expect![[r#"
+            Some(
+                VariableDocs {
+                    raw: [
+                        "Назначение переменной.",
+                        "Дополнение назначения.",
+                        "Заключительная строка.",
+                    ],
+                    purpose: Some(
+                        "Назначение переменной.\nДополнение назначения.\nЗаключительная строка.",
+                    ),
+                    types: [],
+                    deprecation: None,
+                    link: None,
+                },
+            )
+        "#]]
+        .assert_debug_eq(
+            &i.find_variable(&Name::new("Данные")).expect("documented variable").docs.as_deref(),
+        );
+        assert_eq!(
+            &*i.find_variable(&Name::new("Данные")).expect("documented variable").directives,
+            &[AnnotationKind::AtClient, AnnotationKind::AtServer]
+        );
+        expect![[r#"
+            None
+        "#]]
+        .assert_debug_eq(
+            &i.find_variable(&Name::new("БезОписания"))
+                .expect("undocumented variable")
+                .docs
+                .as_deref(),
+        );
+        expect![[r#"
+            Some(
+                MethodDocs {
+                    raw: "Поздняя документация.",
+                    purpose: Some(
+                        "Поздняя документация.",
+                    ),
+                    parameters: [],
+                    returned_value: [],
+                    examples: [],
+                    call_options: [],
+                    deprecation: None,
+                    link: None,
+                },
+            )
+        "#]]
+        .assert_debug_eq(
+            &i.find_method(&Name::new("Поздняя")).expect("later documented method").docs.as_deref(),
+        );
+    }
+
+    #[test]
+    fn module_interface_preserves_comment_boundaries_at_item_tree_offsets() {
+        for (label, code, expected) in [
+            (
+                "bom",
+                "\u{feff}// first\n// near\nПроцедура П()\nКонецПроцедуры",
+                Some("first\nnear"),
+            ),
+            ("unicode indentation", "\u{2003}// near\nПроцедура П()\nКонецПроцедуры", Some("near")),
+            ("crlf", "// near\r\nПроцедура П()\r\nКонецПроцедуры", Some("near")),
+            ("tail barrier", "// far\nX = 1; // tail\nПроцедура П()\nКонецПроцедуры", None),
+        ] {
+            let i = interface(code);
+            let raw = i
+                .find_method(&Name::new("П"))
+                .expect("method")
+                .docs
+                .as_deref()
+                .map(|docs| docs.raw.as_str());
+            assert_eq!(raw, expected, "{label}");
+        }
     }
 
     #[test]

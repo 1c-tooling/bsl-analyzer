@@ -190,6 +190,7 @@ fn call_hierarchy_index_overlay_keeps_root_kinds_and_closures() {
         closures: vec![vec![], vec![], vec![1]],
         topological_order: vec![0, 1, 2],
         fingerprint: Some("external".to_owned()),
+        source_exclusions: Default::default(),
     });
     let registered = db.workspace_configs_snapshot();
 

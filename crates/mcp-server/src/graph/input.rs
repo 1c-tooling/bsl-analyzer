@@ -33,6 +33,10 @@ pub(crate) struct ProjectSnapshot {
     /// enumeration of one project state must never be mixed with the registration of
     /// another, and "what is not mine to read" is part of that enumeration.
     pub excluded: Vec<PathBuf>,
+    /// The directories the user took out of the project (`[source].exclude`), from the
+    /// same validated project as `scan_roots`. Kept apart from `excluded`: nothing
+    /// declared inside one of these wins it back, a root included.
+    pub user_excluded: project_model::ExcludedPaths,
     /// Whether these roots are a VALIDATED declaration or the restricted fallback below.
     ///
     /// A fallback declares nothing. It is what the loader does when it cannot read the
@@ -69,6 +73,7 @@ impl ProjectSnapshot {
                     portable_topology: 0,
                     search_roots: None,
                     excluded: excluded.to_vec(),
+                    user_excluded: project_model::ExcludedPaths::default(),
                     validated: false,
                 }
             }
@@ -100,6 +105,7 @@ impl ProjectSnapshot {
             portable_topology,
             search_roots: Some(search_roots),
             excluded: excluded.to_vec(),
+            user_excluded: project.source_exclusions().clone(),
             validated: true,
         }
     }
@@ -117,6 +123,15 @@ fn portable_topology(
         .iter()
         .filter_map(|path| portable_exclusion_key(roots, &workspace, path))
         .collect();
+    // The user's exclusions change which files the roots hold, so a graph or corpus
+    // built under one list must not be reused under another — even with every root
+    // where it was.
+    exclusions.extend(
+        project
+            .source_exclusions()
+            .declared()
+            .map(|path| portable_user_exclusion_key(&project.root, path)),
+    );
     exclusions.sort();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bsl-analyzer-portable-topology-v1\0");
@@ -154,6 +169,18 @@ fn portable_exclusion_key(
         }
     }
     Some(encoded)
+}
+
+/// A user exclusion in the workspace's durable address space: its declared spelling,
+/// relative to the project root when it lies inside it, absolute otherwise. Never
+/// resolved through the file system — creating the excluded directory later must not
+/// make an unchanged configuration read as a moved topology. Tagged apart from the
+/// cache exclusions.
+fn portable_user_exclusion_key(project_root: &Path, path: &Path) -> Vec<u8> {
+    let spelling = path.strip_prefix(project_root).unwrap_or(path);
+    let mut encoded = vec![2];
+    append_len_prefixed(&mut encoded, spelling.as_os_str().as_encoded_bytes());
+    encoded
 }
 
 fn append_len_prefixed(target: &mut Vec<u8>, bytes: &[u8]) {
@@ -344,6 +371,75 @@ mod tests {
         assert!(
             files.iter().any(|(_, path)| path.ends_with("CommonModules/РасшМодуль/Ext/Module.bsl")),
             "the extension module must be enumerated: {files:?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_excluded_root_is_not_restored_by_the_graph_scanner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        workspace_with_an_extension(root);
+        let ordinary = project_model::Project::new(root).unwrap();
+        let ordinary_snapshot = ProjectSnapshot::from_project(&ordinary);
+        assert!(!super::enumerate_bsl_files(&ordinary_snapshot).is_empty());
+
+        let scoped = project_model::Project::with_config(
+            root,
+            project_model::ProjectConfig {
+                configuration_root: Some("src/cf".to_owned()),
+                extensions: Some(vec![project_model::ExtensionDecl::Path(
+                    "src/cfe/Расш".to_owned(),
+                )]),
+                source_exclude: vec!["src".to_owned()],
+                ..project_model::ProjectConfig::default()
+            },
+        )
+        .unwrap();
+        let snapshot = ProjectSnapshot::from_project(&scoped);
+        assert!(snapshot.scan_roots.is_empty());
+        assert!(super::enumerate_bsl_files(&snapshot).is_empty());
+        assert!(crate::graph::universe::ScannedUniverse::scan_project(&snapshot).files.is_empty());
+    }
+
+    #[test]
+    fn user_exclusions_change_portable_identity_and_the_scanned_universe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        workspace_with_an_extension(root);
+        let hidden = root.join("src/cf/CommonModules/Hidden/Ext/Module.bsl");
+        fs::create_dir_all(hidden.parent().unwrap()).unwrap();
+        fs::write(&hidden, "Процедура Скрытая()\nКонецПроцедуры").unwrap();
+
+        let ordinary = project_model::Project::with_config(
+            root,
+            project_model::ProjectConfig {
+                configuration_root: Some("src/cf".to_owned()),
+                ..project_model::ProjectConfig::default()
+            },
+        )
+        .unwrap();
+        let scoped = project_model::Project::with_config(
+            root,
+            project_model::ProjectConfig {
+                configuration_root: Some("src/cf".to_owned()),
+                source_exclude: vec!["src/cf/CommonModules/Hidden".to_owned()],
+                ..project_model::ProjectConfig::default()
+            },
+        )
+        .unwrap();
+        let ordinary = ProjectSnapshot::from_project(&ordinary);
+        let scoped = ProjectSnapshot::from_project(&scoped);
+
+        assert_ne!(ordinary.portable_topology, scoped.portable_topology);
+        let ordinary_files = crate::graph::universe::ScannedUniverse::scan_project(&ordinary).files;
+        let scoped_files = crate::graph::universe::ScannedUniverse::scan_project(&scoped).files;
+        assert!(ordinary_files.iter().any(|(_, path)| path == &hidden));
+        assert!(scoped_files.iter().all(|(_, path)| path != &hidden));
+        assert!(
+            scoped_files
+                .iter()
+                .any(|(_, path)| path.ends_with("CommonModules/Сервер/Ext/Module.bsl")),
+            "the allowed sibling disappeared"
         );
     }
 }

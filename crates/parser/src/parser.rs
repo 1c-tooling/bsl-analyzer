@@ -25,6 +25,8 @@ pub struct Parser<'a> {
     at_grammar_boundary: Option<fn(&Parser) -> bool>,
     enclosing_boundaries: Vec<fn(&Parser) -> bool>,
     names_are_fields: bool,
+    open_inline_inserts: u32,
+    closed_inserts: std::cell::OnceCell<Vec<usize>>,
 }
 
 impl<'a> Parser<'a> {
@@ -40,6 +42,8 @@ impl<'a> Parser<'a> {
             at_grammar_boundary: None,
             names_are_fields: false,
             enclosing_boundaries: Vec::new(),
+            open_inline_inserts: 0,
+            closed_inserts: std::cell::OnceCell::new(),
         }
     }
 
@@ -148,6 +152,93 @@ impl<'a> Parser<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Consumes an extension marker that tears an expression apart, keeping
+    /// count of the insertions it opens.
+    ///
+    /// The count is what lets the closer of such an insertion be taken where
+    /// the expression has already ended: in front of `Тогда` or `;` nothing
+    /// else says that the marker belongs to the construct and not to the
+    /// statements after it.
+    pub(crate) fn bump_inline_insert_marker(&mut self) {
+        match self.current() {
+            Some(T![PreInsert]) => self.open_inline_inserts += 1,
+            Some(T![PreEndInsert]) => {
+                self.open_inline_inserts = self.open_inline_inserts.saturating_sub(1)
+            }
+            _ => return,
+        }
+        self.bump();
+    }
+
+    /// Whether an insertion opened inside an expression still waits for its
+    /// closer.
+    pub(crate) fn inline_insert_open(&self) -> bool {
+        self.open_inline_inserts > 0
+    }
+
+    /// Drops the insertions an expression opened and never closed.
+    ///
+    /// A method is where such an insertion ends at the latest: without this,
+    /// one unclosed marker would make every stray closer to the end of the file
+    /// silently acceptable, and a method reparsed on its own would disagree
+    /// with the same method in the full parse.
+    pub(crate) fn forget_inline_inserts(&mut self) {
+        self.open_inline_inserts = 0;
+    }
+
+    /// Whether the `#Вставка` here has its `#КонецВставки` before its method
+    /// ends, counting neither marker inside text an extension removed.
+    ///
+    /// The pairs are matched once for the whole input: asked at every marker,
+    /// a search to the end of the method would make a method of unclosed
+    /// markers quadratic.
+    pub(crate) fn insert_here_is_closed(&self) -> bool {
+        self.closed_inserts.get_or_init(|| self.match_inserts()).binary_search(&self.pos).is_ok()
+    }
+
+    fn match_inserts(&self) -> Vec<usize> {
+        let mut open = Vec::new();
+        let mut closed = Vec::new();
+        let mut pos = 0;
+        while let Some(kind) = self.input.kind(pos) {
+            match kind {
+                T![PreInsert] => open.push(pos),
+                T![PreEndInsert] => closed.extend(open.pop()),
+                T![PreDelete] => {
+                    while !matches!(self.input.kind(pos + 1), Some(T![PreEndDelete]) | None) {
+                        pos += 1;
+                    }
+                    pos += 1;
+                }
+                T![KwEndProcedure] | T![KwEndFunction] => open.clear(),
+                _ => {}
+            }
+            pos += 1;
+        }
+        closed.sort_unstable();
+        closed
+    }
+
+    /// How many insertions opened inside an expression still wait for their
+    /// closers.
+    pub(crate) fn open_inline_inserts(&self) -> u32 {
+        self.open_inline_inserts
+    }
+
+    /// Consumes a token of text the extension removed.
+    ///
+    /// Group tracking does not see it: a bracket or separator that no longer
+    /// exists in the module says nothing about the expression it was cut out
+    /// of, and counting it would leave that expression with a group it never
+    /// opened or closed.
+    pub(crate) fn bump_removed(&mut self) {
+        let Some(kind) = self.current() else {
+            return;
+        };
+        self.events.push(Event::Token { kind: kind.kind() });
+        self.pos += 1;
     }
 
     /// How many groups are open at the current position.

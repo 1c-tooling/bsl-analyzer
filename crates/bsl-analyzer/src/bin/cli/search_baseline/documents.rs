@@ -90,6 +90,7 @@ pub(super) fn build_workspace_code(
         &extensions,
     );
     ensure_every_declared_root_is_accounted_for(&rejected)?;
+    let roots = roots.with_user_excluded(project.source_exclusions());
     // The REGISTERED roots, which is also what the daemon's own walk covers. Not the declared
     // list: a rejected root adds no file to it, since `InsideConfiguration` means the
     // configuration root already contains it and `IdentifierTaken` has just refused the
@@ -100,7 +101,7 @@ pub(super) fn build_workspace_code(
         roots.entries().map(|(_, path)| path.to_path_buf()).collect();
     engine.initialize_workspace_roots(roots.clone())?;
 
-    let walk = project_model::SourceSet::scan(&declared);
+    let walk = project_model::SourceSet::scan_in_scope(&declared, &[], project.source_exclusions());
     if let Some(config) = super::postgres::embedder_config(project)? {
         if config.token_policy.is_some() {
             let embedder = bsl_search::Embedder::new(config);
@@ -342,6 +343,31 @@ mod tests {
             "the extension's module must reach the corpus under ITS root, not merged into the \
              configuration's key; published: {published:?}"
         );
+    }
+
+    #[test]
+    fn workspace_code_baseline_uses_the_projects_source_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        write(&root.join("Configuration.xml"), "<MetaDataObject/>");
+        write(&root.join("Allowed.bsl"), &module("Разрешенная"));
+        write(&root.join(".tmp/Hidden.bsl"), &module("Скрытая"));
+        write(&root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\nexclude = [\".tmp\"]\n");
+
+        let corpus = build_workspace_code(&project_at(&root)).unwrap();
+        assert!(
+            corpus.documents.iter().any(|document| document.path.ends_with("Allowed.bsl")),
+            "the allowed positive control did not reach the local baseline"
+        );
+        assert!(
+            corpus.documents.iter().all(|document| !document.path.ends_with("Hidden.bsl")),
+            "the local baseline published a document from [source].exclude"
+        );
+
+        write(&root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\nexclude = [\".\"]\n");
+        let empty = build_workspace_code(&project_at(&root)).unwrap();
+        assert!(empty.documents.is_empty(), "an excluded root was restored as a baseline fallback");
+        assert_eq!(empty.indexed_files, 0);
     }
 
     /// The numbers in the refusal text tell the operator how many places to fix, so a place

@@ -39,10 +39,9 @@ pub(super) fn highlight_sdbl_in_literal<DB: RootDatabase>(
             line_starts,
         )
     } else {
-        ide_diagnostics::sdbl_utils::SdblPositionMapper::new_from_range(
-            query_info.bsl_literal_range,
+        ide_diagnostics::sdbl_utils::SdblPositionMapper::from_query_info_without_line_index(
+            query_info,
             &bsl_source,
-            query_info.quote_corrections.clone(),
         )
     };
 

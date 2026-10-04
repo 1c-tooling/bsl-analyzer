@@ -1,0 +1,35 @@
+complexity: 3
+live: {0, 1, 2, 4}
+dead: []
+evaluations: {"directive:Some(LocalRange(27..60))": {"condition=LocalRange(37..49); directive=Some(LocalRange(27..60)); full=Some(LocalRange(27..198))"}, "directive:Some(LocalRange(83..126))": {"condition=LocalRange(103..115); directive=Some(LocalRange(83..126)); full=None"}}
+expr ExprId(0): Some(LocalRange(62..66))
+expr ExprId(1): Some(LocalRange(69..81))
+expr ExprId(2): Some(LocalRange(128..132))
+expr ExprId(3): Some(LocalRange(135..143))
+expr ExprId(4): Some(LocalRange(158..162))
+expr ExprId(5): Some(LocalRange(165..177))
+expr ExprId(6): Some(LocalRange(199..200))
+expr ExprId(7): Some(LocalRange(203..207))
+transitions:
+  s0 -> s4
+  s1 -> s4
+  s2 -> s4
+  s4 -> exit
+definitions (limit 3):
+  s0: Some([])
+  s1: Some([])
+  s2: Some([])
+  s3: None
+  s4: Some([])
+definitions (limit 10000):
+  s0: Some([])
+  s1: Some([])
+  s2: Some([])
+  s3: None
+  s4: Some([])
+source states:
+  s0: range=Some(LocalRange(62..81)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(128..143)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s2: range=Some(LocalRange(158..177)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s4: range=Some(LocalRange(199..207)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

@@ -1,0 +1,9 @@
+complexity: 1
+live: {}
+dead: []
+evaluations: {}
+transitions:
+definitions (limit 3):
+definitions (limit 10000):
+source states:
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

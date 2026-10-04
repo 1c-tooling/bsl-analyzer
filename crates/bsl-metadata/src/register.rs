@@ -262,17 +262,17 @@ impl Register {
     pub fn apply_extension_overlay(&mut self, overlay: &Register) {
         for dimension in &overlay.dimensions {
             self.dimensions
-                .retain(|existing| !existing.name().eq_ignore_ascii_case(dimension.name()));
+                .retain(|existing| !stdx::case::eq_ignore_case(existing.name(), dimension.name()));
             self.dimensions.push(dimension.clone());
         }
         for resource in &overlay.resources {
             self.resources
-                .retain(|existing| !existing.name().eq_ignore_ascii_case(resource.name()));
+                .retain(|existing| !stdx::case::eq_ignore_case(existing.name(), resource.name()));
             self.resources.push(resource.clone());
         }
         for attribute in &overlay.attributes {
             self.attributes
-                .retain(|existing| !existing.name().eq_ignore_ascii_case(attribute.name()));
+                .retain(|existing| !stdx::case::eq_ignore_case(existing.name(), attribute.name()));
             self.attributes.push(attribute.clone());
         }
         if overlay.periodicity.is_some() {

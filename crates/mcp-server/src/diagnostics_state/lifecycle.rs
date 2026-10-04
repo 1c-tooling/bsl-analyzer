@@ -731,10 +731,7 @@ impl DiagnosticsState {
         // below: two walks here could disagree (a file deleted between them would
         // sit in the resident forever, invisible to every later drift scan,
         // because the baseline never contained it).
-        let universe = crate::graph::universe::ScannedUniverse::scan_excluding(
-            &snapshot.scan_roots,
-            &snapshot.excluded,
-        );
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&snapshot);
         let scan_clean = universe.clean();
         let files = &universe.files;
         // `ProjectSnapshot` already registers canonical roots, matching the
@@ -859,7 +856,10 @@ impl DiagnosticsState {
             tracing::info!("skipping hub re-arm: the built snapshot's topology is superseded");
             return;
         }
-        if !hub.ensure_roots(&crate::change_hub::watch_targets_for(root, scan_roots)) {
+        if !hub.ensure_scope(
+            &crate::change_hub::watch_targets_for(root, scan_roots),
+            &live.user_excluded,
+        ) {
             tracing::warn!("resident rebuild could not re-arm the change hub onto new roots");
         }
     }

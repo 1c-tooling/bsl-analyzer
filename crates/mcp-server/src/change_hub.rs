@@ -23,11 +23,11 @@
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
-use project_model::{PathScope, Spellings};
+use project_model::{ExcludedPaths, PathScope, Spellings};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
@@ -170,22 +170,143 @@ impl HubHold {
 struct Watch {
     backend: RecommendedWatcher,
     seams: Option<WatchRefusal>,
+    /// The user's `[source].exclude`, shared with [`HubInner`] so a rescope reaches the
+    /// backend door too.
+    user_excluded: Arc<RwLock<ExcludedPaths>>,
+    /// Directories armed non-recursively because an exclusion lies below them, each with
+    /// the children armed in its place.
+    narrowed: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Watch {
+    fn new(backend: RecommendedWatcher, seams: Option<WatchRefusal>, inner: &HubInner) -> Self {
+        Self {
+            backend,
+            seams,
+            user_excluded: Arc::clone(&inner.user_excluded),
+            narrowed: HashMap::new(),
+        }
+    }
+
+    /// Place a registration, never one that reaches into a user exclusion.
+    ///
+    /// Everything above decides coverage as if a recursive watch covered its whole tree;
+    /// this is the one door to the backend, so the exclusions are honoured here: an
+    /// excluded directory is not armed at all, and a recursive watch that would reach an
+    /// exclusion — existing or yet to be created — is placed non-recursively instead,
+    /// with each permitted child directory armed in turn. Only the branches leading to an
+    /// exclusion are listed; the excluded directory itself never is.
+    ///
+    /// Every child armed in a narrowed registration passes the same refusal check and
+    /// backend as the path itself, and a child that cannot be armed — or a directory
+    /// that cannot be listed — fails the whole registration: a narrowed watch with a
+    /// branch missing would claim coverage of a subtree nothing watches, so it is
+    /// reported the way any failed arm is, and retried from there.
     fn arm(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        let excluded = self.user_excluded.read().unwrap_or_else(PoisonError::into_inner).clone();
+        self.arm_within(path, mode, &excluded, &mut Vec::new())
+    }
+
+    /// `visited` holds the resolved directories a narrowed descent has entered, so a
+    /// symlink leading back into one of them — a loop — is not descended again.
+    fn arm_within(
+        &mut self,
+        path: &Path,
+        mode: RecursiveMode,
+        excluded: &ExcludedPaths,
+        visited: &mut Vec<PathBuf>,
+    ) -> notify::Result<()> {
         if self.seams.as_ref().is_some_and(|seams| (seams.refuses)(path)) {
             return Err(notify::Error::generic("the watch of this path is refused"));
+        }
+        if excluded.is_excluded_resolved(path) {
+            return Ok(());
+        }
+        if mode == RecursiveMode::Recursive && excluded.has_exclusion_below_resolved(path) {
+            let resolved = resolve_as_far_as_it_goes(path);
+            if visited.contains(&resolved) {
+                return Ok(());
+            }
+            visited.push(resolved);
+            self.backend.watch(path, RecursiveMode::NonRecursive)?;
+            let mut children = Vec::new();
+            let mut failure = None;
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let child = entry.path();
+                        if !std::fs::metadata(&child).is_ok_and(|meta| meta.is_dir())
+                            || excluded.is_excluded_resolved(&child)
+                        {
+                            continue;
+                        }
+                        match self.arm_within(&child, RecursiveMode::Recursive, excluded, visited) {
+                            Ok(()) => children.push(child),
+                            Err(error) => {
+                                tracing::warn!(dir = ?child, "workspace change hub could not watch a directory beside an exclusion: {error}");
+                                failure.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => failure = Some(notify::Error::io(error).add_path(path.to_path_buf())),
+            }
+            if let Some(error) = failure {
+                // All or nothing: the caller records no registration for a failed arm,
+                // so nothing placed here may outlive it unnamed.
+                let previous = self.narrowed.remove(path).unwrap_or_default();
+                for child in children.into_iter().chain(previous) {
+                    let _ = self.disarm(&child);
+                }
+                let _ = self.backend.unwatch(path);
+                return Err(error);
+            }
+            if let Some(previous) = self.narrowed.insert(path.to_path_buf(), children.clone()) {
+                for child in previous.into_iter().filter(|child| !children.contains(child)) {
+                    let _ = self.disarm(&child);
+                }
+            }
+            return Ok(());
+        }
+        if let Some(previous) = self.narrowed.remove(path) {
+            for child in previous {
+                let _ = self.disarm(&child);
+            }
         }
         self.backend.watch(path, mode)
     }
 
+    /// Whether `dir` lies directly in a directory armed non-recursively because of an
+    /// exclusion below it — where no recursive watch covers a newcomer, whatever the
+    /// records above say.
+    ///
+    /// Asked under the resolved spelling too, by the same rule the coverage check it
+    /// corrects uses: a backend may report a newcomer under another spelling than the
+    /// one its parent was armed with (a root declared through a link, `/tmp` reported
+    /// as `/private/tmp`).
+    fn is_in_narrowed(&self, dir: &Path) -> bool {
+        let Some(parent) = dir.parent() else { return false };
+        if self.narrowed.contains_key(parent) {
+            return true;
+        }
+        if self.narrowed.is_empty() {
+            return false;
+        }
+        let resolved = resolve_as_far_as_it_goes(parent);
+        self.narrowed.keys().any(|armed| resolve_as_far_as_it_goes(armed) == resolved)
+    }
+
     /// Drop a registration. Announced to the seam but never gated by it: a refusal makes a
     /// watch fail, and un-watching what was never armed is the backend's own no-op to
-    /// report.
+    /// report. A narrowed registration takes the children armed in its place with it.
     fn disarm(&mut self, path: &Path) -> notify::Result<()> {
         if let Some(seams) = self.seams.as_ref() {
             (seams.disarmed)(path);
+        }
+        if let Some(children) = self.narrowed.remove(path) {
+            for child in children {
+                let _ = self.disarm(&child);
+            }
         }
         self.backend.unwatch(path)
     }
@@ -1034,7 +1155,18 @@ impl Scope {
     /// [`watch_targets_for`]). Built from the DESIRED targets, not the armed ones:
     /// a root that failed to arm is still part of the scope, and its events —
     /// arriving through a covering target — must not be dropped.
+    #[cfg(test)]
     fn from_targets(targets: &ResolvedTargets, excluded: &[PathBuf]) -> Self {
+        Self::from_targets_scoped(targets, excluded, &ExcludedPaths::default())
+    }
+
+    /// [`Self::from_targets`] with the user's `[source].exclude`, which wins over every
+    /// root and is never carved back out.
+    fn from_targets_scoped(
+        targets: &ResolvedTargets,
+        excluded: &[PathBuf],
+        user_excluded: &ExcludedPaths,
+    ) -> Self {
         let targets = targets.as_slice();
         let scan_roots: Vec<PathBuf> =
             targets.iter().filter(|t| t.recursive).map(|t| t.path.clone()).collect();
@@ -1043,7 +1175,7 @@ impl Scope {
             // and the roots are what changed: a root declared under the cache after the
             // hub came up is carved back out of it, instead of being dropped in silence
             // for the rest of the process.
-            paths: PathScope::new(&scan_roots, excluded),
+            paths: PathScope::with_exclusions(&scan_roots, excluded, user_excluded),
             config_dirs: targets
                 .iter()
                 .filter(|t| !t.recursive)
@@ -1107,6 +1239,10 @@ struct HubInner {
     /// lifecycle). Carrying the exclusions in the target list would let any of them
     /// drop the exclusions by simply not knowing to pass them.
     excluded: Vec<PathBuf>,
+    /// The user's `[source].exclude`. Unlike `excluded`, it follows the project: a
+    /// consumer that re-declares the roots re-declares these with them
+    /// ([`WorkspaceChangeHub::ensure_scope`]), and the backend door reads it on every arm.
+    user_excluded: Arc<RwLock<ExcludedPaths>>,
     /// Events dropped because they landed in an excluded subtree. Diagnostic only:
     /// a workspace whose cache is being written constantly is otherwise
     /// indistinguishable from a quiet one.
@@ -1213,7 +1349,11 @@ impl HubInner {
     /// The only way a `Scope` is built after construction: it carries the hub's own
     /// exclusions, so a caller that re-arms with a new root set cannot drop them.
     fn scope_from(&self, targets: &ResolvedTargets) -> Scope {
-        Scope::from_targets(targets, &self.excluded)
+        Scope::from_targets_scoped(targets, &self.excluded, &self.user_excluded())
+    }
+
+    fn user_excluded(&self) -> ExcludedPaths {
+        self.user_excluded.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// Note an event dropped for landing in an excluded subtree.
@@ -1334,7 +1474,11 @@ impl HubInner {
                         if let Ok(meta) = std::fs::metadata(path) {
                             if meta.is_dir() {
                                 rewatch.push(path.clone());
-                                collect_subtree(path, &mut records);
+                                collect_subtree_within(
+                                    path,
+                                    &mut records,
+                                    scope.paths.exclusions(),
+                                );
                                 continue;
                             }
                         }
@@ -1478,8 +1622,18 @@ thread_local! {
 /// The cache is keyed by the WALKED directory, not the resolved one, for the same reason
 /// it is there: two links to one tree are two ways to reach the same files, and each file
 /// keeps the spelling the walk actually used to get to it.
+#[cfg(test)]
 fn collect_subtree(dir: &Path, records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>) {
-    collect_subtree_noting(dir, records, None);
+    collect_subtree_within(dir, records, &ExcludedPaths::default());
+}
+
+/// [`collect_subtree`] that never enters a directory the user excluded.
+fn collect_subtree_within(
+    dir: &Path,
+    records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>,
+    user_excluded: &ExcludedPaths,
+) {
+    collect_subtree_noting(dir, records, None, user_excluded);
 }
 
 /// [`collect_subtree`], naming in `unreadable` every path the walk could not read for another
@@ -1488,11 +1642,19 @@ fn collect_subtree_noting(
     dir: &Path,
     records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>,
     mut unreadable: Option<&mut Vec<PathBuf>>,
+    user_excluded: &ExcludedPaths,
 ) {
     #[cfg(test)]
     SUBTREE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut resolved_dirs: HashMap<PathBuf, PathBuf> = HashMap::new();
-    for entry in WalkDir::new(dir).follow_links(true) {
+    // The user's exclusions are pruned before the walk enters them — a directory arriving
+    // already full of files must not be read inside an exclusion, under any spelling.
+    let mut pruned = project_model::ResolvedDirs::default();
+    let walk = WalkDir::new(dir).follow_links(true).into_iter().filter_entry(|entry| {
+        !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
+            || !user_excluded.prunes_walked_dir(entry.path(), entry.path_is_symlink(), &mut pruned)
+    });
+    for entry in walk {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -1597,6 +1759,12 @@ enum HubMsg {
     /// it — is decided by the thread in [`apply_declaration`], never by the sender.
     Rearm {
         targets: Vec<WatchTarget>,
+        ack: std::sync::mpsc::SyncSender<bool>,
+    },
+    /// Replace the user's `[source].exclude` and re-place every registration under it.
+    /// `ack` carries whether every declared target is armed afterwards.
+    Rescope {
+        user_excluded: ExcludedPaths,
         ack: std::sync::mpsc::SyncSender<bool>,
     },
     /// Run one coverage tick now. A test seam: production drives ticks by the
@@ -1729,13 +1897,24 @@ impl WorkspaceChangeHub {
     /// re-arm must not be able to change it. Each path is taken in both the spelling
     /// given and its canonical form, because an event names whichever of the two the
     /// watch was armed with.
+    #[cfg(test)]
     pub(crate) fn start_targets_excluding(
         targets: Vec<WatchTarget>,
         excluded: Vec<PathBuf>,
     ) -> Self {
+        Self::start_targets_scoped(targets, excluded, ExcludedPaths::default())
+    }
+
+    /// [`Self::start_targets_excluding`] over a project with a `[source].exclude`: no
+    /// registration reaches into those directories, and events from them are dropped.
+    pub(crate) fn start_targets_scoped(
+        targets: Vec<WatchTarget>,
+        excluded: Vec<PathBuf>,
+        user_excluded: ExcludedPaths,
+    ) -> Self {
         #[cfg(test)]
         if let Some(poll) = POLL_INSTEAD_OF_WATCHING.with(std::cell::Cell::get) {
-            return Self::start_seamed(
+            return Self::start_seamed_scoped(
                 targets,
                 DEFAULT_CAPACITY,
                 COVERAGE_TICK_PERIOD,
@@ -1743,11 +1922,12 @@ impl WorkspaceChangeHub {
                 None,
                 Some(refuse_every_watch()),
                 excluded,
+                user_excluded,
                 poll,
                 BlindPollSeam::default(),
             );
         }
-        Self::start_seamed(
+        Self::start_seamed_scoped(
             targets,
             DEFAULT_CAPACITY,
             COVERAGE_TICK_PERIOD,
@@ -1755,6 +1935,7 @@ impl WorkspaceChangeHub {
             None,
             None,
             excluded,
+            user_excluded,
             PollConfig::PRODUCTION,
             #[cfg(test)]
             BlindPollSeam::default(),
@@ -1917,6 +2098,34 @@ impl WorkspaceChangeHub {
         )
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn start_seamed(
+        targets: Vec<WatchTarget>,
+        cap: usize,
+        tick_period: Duration,
+        refuse_spawn: bool,
+        before_arm: Option<BeforeArm>,
+        watch_refusal: Option<WatchRefusal>,
+        excluded: Vec<PathBuf>,
+        poll: PollConfig,
+        #[cfg(test)] blind_poll_seam: BlindPollSeam,
+    ) -> Self {
+        Self::start_seamed_scoped(
+            targets,
+            cap,
+            tick_period,
+            refuse_spawn,
+            before_arm,
+            watch_refusal,
+            excluded,
+            ExcludedPaths::default(),
+            poll,
+            #[cfg(test)]
+            blind_poll_seam,
+        )
+    }
+
     /// The hub with its startup seams exposed. Production passes `false`, two `None`s and
     /// [`PollConfig::PRODUCTION`].
     ///
@@ -1932,7 +2141,7 @@ impl WorkspaceChangeHub {
     // Each seam is a state no other door leads to, and a bag struct would carry exactly these
     // same arguments under one more name.
     #[allow(clippy::too_many_arguments)]
-    fn start_seamed(
+    fn start_seamed_scoped(
         targets: Vec<WatchTarget>,
         cap: usize,
         tick_period: Duration,
@@ -1940,6 +2149,7 @@ impl WorkspaceChangeHub {
         before_arm: Option<BeforeArm>,
         watch_refusal: Option<WatchRefusal>,
         excluded: Vec<PathBuf>,
+        user_excluded: ExcludedPaths,
         poll: PollConfig,
         #[cfg(test)] blind_poll_seam: BlindPollSeam,
     ) -> Self {
@@ -1955,8 +2165,9 @@ impl WorkspaceChangeHub {
             // A starting value only; the hub thread re-derives it right before
             // arming, so the relative spellings are resolved against the same
             // current directory the backend will use.
-            scope: Mutex::new(Scope::from_targets(&placed, &excluded)),
+            scope: Mutex::new(Scope::from_targets_scoped(&placed, &excluded, &user_excluded)),
             excluded,
+            user_excluded: Arc::new(RwLock::new(user_excluded)),
             excluded_events: AtomicU64::new(0),
             tick_period,
             ticks: AtomicU64::new(0),
@@ -2021,9 +2232,19 @@ impl WorkspaceChangeHub {
     /// for a timeout, a dead hub thread, or partial coverage (an unwatchable
     /// target) — the caller must not treat any of those as covered.
     pub(crate) fn rearm(&self, targets: Vec<WatchTarget>, timeout: Duration) -> bool {
+        self.handshake(|ack| HubMsg::Rearm { targets, ack }, timeout)
+    }
+
+    /// Send the message `build` makes around an acknowledgement channel and wait for the
+    /// hub thread's answer; `timeout` bounds the enqueue and the wait together.
+    fn handshake(
+        &self,
+        build: impl FnOnce(std::sync::mpsc::SyncSender<bool>) -> HubMsg,
+        timeout: Duration,
+    ) -> bool {
         let deadline = Instant::now() + timeout;
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-        let mut msg = HubMsg::Rearm { targets, ack: ack_tx };
+        let mut msg = build(ack_tx);
         loop {
             match self.control().try_send(msg) {
                 Ok(()) => break,
@@ -2071,6 +2292,29 @@ impl WorkspaceChangeHub {
         }
         tracing::info!(?targets, "workspace change hub declaring new scan roots");
         self.rearm(targets.to_vec(), REARM_ACK_TIMEOUT)
+    }
+
+    /// [`Self::ensure_roots`] together with the user's `[source].exclude` the roots were
+    /// resolved under. Unchanged exclusions cost what `ensure_roots` costs; changed ones
+    /// re-place every registration, because the same roots no longer mean the same
+    /// coverage, and owe consumers the reconcile any re-arm owes.
+    pub(crate) fn ensure_scope(
+        &self,
+        targets: &[WatchTarget],
+        user_excluded: &ExcludedPaths,
+    ) -> bool {
+        // The roots are declared whatever the rescope answered: a hub that polls answers
+        // "not covered" to everything, and the new roots must reach it all the same.
+        let rescoped = self.inner.user_excluded() == *user_excluded || {
+            tracing::info!("workspace change hub re-scoping to a new [source].exclude");
+            self.rescope(user_excluded.clone(), REARM_ACK_TIMEOUT)
+        };
+        let covered = self.ensure_roots(targets);
+        rescoped && covered
+    }
+
+    fn rescope(&self, user_excluded: ExcludedPaths, timeout: Duration) -> bool {
+        self.handshake(|ack| HubMsg::Rescope { user_excluded, ack }, timeout)
     }
 
     /// Whether every declared target is placed and armed right now. A verdict read off what
@@ -3260,7 +3504,12 @@ impl Poller {
         let mut unreadable = Vec::new();
         for target in targets {
             if target.recursive {
-                collect_subtree_noting(&target.path, &mut found, Some(&mut unreadable));
+                collect_subtree_noting(
+                    &target.path,
+                    &mut found,
+                    Some(&mut unreadable),
+                    scope.paths.exclusions(),
+                );
             } else {
                 match std::fs::read_dir(&target.path) {
                     Ok(entries) => {
@@ -3962,6 +4211,14 @@ fn run_polling(
                 // Never "covered": polling is what the hub does when it could not watch.
                 let _ = ack.try_send(false);
             }
+            Ok(HubMsg::Rescope { user_excluded, ack }) => {
+                *inner.user_excluded.write().unwrap_or_else(PoisonError::into_inner) =
+                    user_excluded;
+                declared = repoint_polling(inner, ResolvedTargets::here(declared));
+                poller = Poller::default();
+                map(&mut poller, &declared, DegradeReason::Rearmed);
+                let _ = ack.try_send(false);
+            }
             #[cfg(test)]
             Ok(HubMsg::Tick) => {
                 poll_once(inner, &mut poller, &declared);
@@ -4016,7 +4273,7 @@ fn run_hub_thread(
     );
 
     let mut watcher = match watcher {
-        Ok(backend) => Watch { backend, seams: watch_refusal },
+        Ok(backend) => Watch::new(backend, watch_refusal, &inner),
         Err(error) => {
             tracing::warn!("workspace change hub failed to create watcher: {error}");
             let targets = ResolvedTargets::here(targets);
@@ -4167,7 +4424,10 @@ fn run_hub_thread(
                         inner.note_arming_window(&dir);
                     }
 
-                    let covered = an_armed_recursive_watch_reaches(&armed, candidate.resolved());
+                    // A recursive record over a directory armed narrowly does not cover a
+                    // newcomer placed right in it: the backend watch there is non-recursive.
+                    let covered = an_armed_recursive_watch_reaches(&armed, candidate.resolved())
+                        && !watcher.is_in_narrowed(&dir);
                     if !watch_is_additive_and_needed(covered) {
                         continue;
                     }
@@ -4200,6 +4460,17 @@ fn run_hub_thread(
                         }
                     }
                 }
+            }
+            HubMsg::Rescope { user_excluded, ack } => {
+                let covered = apply_rescope(
+                    &inner,
+                    &mut watcher,
+                    &mut armed,
+                    &declared,
+                    &snapshot,
+                    user_excluded,
+                );
+                let _ = ack.try_send(covered);
             }
             HubMsg::Rearm { targets, ack } => {
                 // One path for every declaration the thread receives. `apply_declaration`
@@ -4449,6 +4720,55 @@ fn apply_declaration(
     // Read off the declaration as it now stands: `apply_rearm` consumed the resolved set, and
     // re-resolving here would answer about a tree that may have moved since.
     declared_coverage(declared, resolved_complete, armed)
+}
+
+/// Take a new `[source].exclude` and re-place every registration under it.
+///
+/// The declared set does not move, so nothing in [`apply_declaration`] would re-arm it,
+/// yet the coverage it stands for has: a recursive watch that was fine may now reach
+/// an exclusion, and a narrowed one may no longer need to be. Every standing registration
+/// is dropped and placed again through the backend door, which narrows by the new list;
+/// a watch no declaration names is kept only while the new scope still walks it. The
+/// window between the two is owed to the listeners like any re-arm.
+fn apply_rescope(
+    inner: &Arc<HubInner>,
+    watcher: &mut Watch,
+    armed: &mut Vec<ArmedTarget>,
+    declared: &[WatchTarget],
+    snapshot: &Snapshot,
+    user_excluded: ExcludedPaths,
+) -> bool {
+    *inner.user_excluded.write().unwrap_or_else(PoisonError::into_inner) = user_excluded;
+    let resolved = ResolvedTargets::here(declared.to_vec());
+    let placed = resolved.is_complete();
+    let scope = inner.scope_from(&resolved);
+    inner.set_scope(scope.clone());
+    for entry in armed.iter() {
+        if let Err(error) = watcher.disarm(&entry.target().path) {
+            tracing::debug!(root = ?entry.target().path, "workspace change hub unwatch on rescope: {error}");
+        }
+    }
+    let mut kept: Vec<ArmedTarget> = Vec::with_capacity(armed.len());
+    for entry in armed.drain(..) {
+        if !entry.is_declared() && !the_scope_still_reaches(&scope, &entry) {
+            continue;
+        }
+        match watcher.arm(&entry.target().path, entry.target().mode()) {
+            Ok(()) => kept.push(entry),
+            Err(error) => {
+                tracing::warn!(root = ?entry.target().path, "workspace change hub lost a watch on rescope: {error}");
+                if !entry.is_declared() {
+                    inner.note_rewatch_failed(&entry.target().path, &error);
+                }
+            }
+        }
+    }
+    *armed = kept;
+    inner.publish_watched_roots(armed);
+    refresh_blind_targets(inner, declared, snapshot, armed);
+    inner.lock_acc().enter_rescan_for_listeners(DegradeReason::Rearmed);
+    inner.notify();
+    declared_coverage(declared, placed, armed)
 }
 
 /// Whether every declared target is placed and armed. The same question `ensure_roots` asks
@@ -8714,6 +9034,34 @@ mod tests {
         std::fs::write(&sibling, "").unwrap();
         hub.ingest_for_test(change_event(EventKind::Create(CreateKind::Any), sibling));
         assert_eq!(hub.materialize(cursor).entries.len(), 1, "a sibling directory was excluded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_subtree_is_pruned_before_entering_its_excluded_child() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("runtime");
+        let blocked = root.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(root.join("Allowed.bsl"), "").unwrap();
+        std::fs::write(blocked.join("Hidden.bsl"), "").unwrap();
+        std::os::unix::fs::symlink(&root, blocked.join("cycle")).unwrap();
+
+        let mut records = Vec::new();
+        let mut unreadable = Vec::new();
+        collect_subtree_noting(
+            &root,
+            &mut records,
+            Some(&mut unreadable),
+            &ExcludedPaths::new([blocked.clone()]),
+        );
+
+        assert!(unreadable.is_empty(), "the runtime walk entered the excluded cycle");
+        assert!(records.iter().any(|(_, path, _)| path == &root.join("Allowed.bsl")));
+        assert!(
+            records.iter().all(|(_, path, _)| !path.starts_with(&blocked)),
+            "an excluded runtime descendant was collected: {records:?}"
+        );
     }
 
     /// The default cache is lazy: it does not exist when the hub starts. The exclusion

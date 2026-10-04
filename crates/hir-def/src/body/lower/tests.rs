@@ -655,3 +655,233 @@ fn recovery_does_not_kick_in_for_well_formed_call_stmt() {
     let any_recovered = result.body.exprs_iter().any(|(id, _)| result.body.is_recovered(id));
     assert!(!any_recovered, "well-formed call must not be flagged as recovered");
 }
+
+#[test]
+fn inline_directives_leave_only_active_condition_in_hir() {
+    let method = parse_method(
+        r#"Функция Проверка(Данные)
+    Если Не ЗначениеЗаполнено(Данные.Процент)
+        #Вставка
+        И Не Данные.Флаг
+        #КонецВставки
+        И Данные.Сумма > 0 Тогда
+        Возврат Ложь;
+    КонецЕсли;
+    Возврат Истина;
+КонецФункции"#,
+    );
+    let result = lower_method(&method, true);
+    let if_stmt = match result.body.stmt_idx(result.body.body_stmts[0]) {
+        Stmt::If(stmt) => stmt,
+        other => panic!("expected If, got {other:?}"),
+    };
+
+    let mut fields = Vec::new();
+    let mut and_count = 0;
+    fn visit(
+        body: &crate::body::Body,
+        id: crate::hir::ExprIdx,
+        fields: &mut Vec<String>,
+        and_count: &mut usize,
+    ) {
+        match body.expr_idx(id) {
+            Expr::BinaryOp { lhs, rhs, op } => {
+                if *op == crate::hir::BinaryOp::And {
+                    *and_count += 1;
+                }
+                visit(body, *lhs, fields, and_count);
+                visit(body, *rhs, fields, and_count);
+            }
+            Expr::UnaryOp { expr, .. } => visit(body, *expr, fields, and_count),
+            Expr::Call { callee, args } => {
+                visit(body, *callee, fields, and_count);
+                for &arg in args.iter() {
+                    visit(body, arg, fields, and_count);
+                }
+            }
+            Expr::Field { base, field } => {
+                fields.push(field.as_str().to_string());
+                visit(body, *base, fields, and_count);
+            }
+            _ => {}
+        }
+    }
+    visit(&result.body, if_stmt.condition, &mut fields, &mut and_count);
+    assert_eq!(and_count, 2, "the inserted conjunction must participate in the condition");
+    assert_eq!(fields, ["Процент", "Флаг", "Сумма"]);
+    assert!(!result.body.exprs_iter().any(|(_, expr)| matches!(expr, Expr::Missing)));
+}
+
+#[test]
+fn inline_deleted_argument_is_absent_and_inserted_argument_is_present() {
+    let method = parse_method(
+        r#"Функция Собрать(Данные)
+    Возврат Новый Структура(
+        "Ссылка, Дата",
+        #Удаление
+        Данные.Ссылка,
+        #КонецУдаления
+        #Вставка
+        Данные.НоваяСсылка,
+        #КонецВставки
+        Данные.Дата);
+КонецФункции"#,
+    );
+    let result = lower_method(&method, true);
+    let value = match result.body.stmt_idx(result.body.body_stmts[0]) {
+        Stmt::Return { value: Some(value) } => *value,
+        other => panic!("expected return value, got {other:?}"),
+    };
+    let args = match result.body.expr_idx(value) {
+        Expr::New { type_name, args } => {
+            assert_eq!(type_name.as_ref().map(|name| name.as_str()), Some("Структура"));
+            args
+        }
+        other => panic!("expected New, got {other:?}"),
+    };
+    assert_eq!(args.len(), 3, "removed argument must not create an HIR slot");
+    assert!(matches!(
+        result.body.expr_idx(args[0]),
+        Expr::Literal(Literal::String(text)) if text == "Ссылка, Дата"
+    ));
+    for (arg, expected) in [(args[1], "НоваяСсылка"), (args[2], "Дата")] {
+        match result.body.expr_idx(arg) {
+            Expr::Field { base, field } => {
+                assert_eq!(field.as_str(), expected);
+                assert!(matches!(
+                    result.body.expr_idx(*base),
+                    Expr::Path(name) if name.as_str() == "Данные"
+                ));
+            }
+            other => panic!("expected active field argument, got {other:?}"),
+        }
+    }
+    assert!(!result.body.exprs_iter().any(|(_, expr)| {
+        matches!(expr, Expr::Field { field, .. } if field.as_str() == "Ссылка")
+            || matches!(expr, Expr::Missing)
+    }));
+}
+
+#[test]
+fn torn_query_text_in_hir_matches_its_canonical_literal() {
+    let with_directives = parse_method(
+        r#"Функция ТекстЗапроса()
+    Возврат "
+    |ВЫБРАТЬ
+    |    Т.Ссылка КАК Ссылка,
+    #Удаление
+    |    Т.Старое КАК Старое,
+    #КонецУдаления
+    #Вставка
+    |    Т.Договор КАК Договор,
+    #КонецВставки
+    |    Т.Дата КАК Дата
+    |ИЗ Справочник.Товары КАК Т";
+КонецФункции"#,
+    );
+    let canonical = parse_method(
+        r#"Функция ТекстЗапроса()
+    Возврат "
+    |ВЫБРАТЬ
+    |    Т.Ссылка КАК Ссылка,
+    |    Т.Договор КАК Договор,
+    |    Т.Дата КАК Дата
+    |ИЗ Справочник.Товары КАК Т";
+КонецФункции"#,
+    );
+    let actual = lower_method(&with_directives, true);
+    let expected = lower_method(&canonical, true);
+    assert_eq!(actual.body.sdbl_exprs.len(), 1);
+    assert_eq!(expected.body.sdbl_exprs.len(), 1);
+    let actual_query = &actual.body.sdbl_exprs[0].2;
+    let expected_query = &expected.body.sdbl_exprs[0].2;
+    assert_eq!(actual_query.query_text, expected_query.query_text);
+    assert!(actual_query.query_text.contains("Т.Договор"));
+    assert!(!actual_query.query_text.contains("Старое"));
+    assert!(!actual_query.query_text.contains("#Вставка"));
+    assert!(actual_query.is_valid(), "active query must parse: {actual_query:?}");
+    assert!(actual_query.literal_map.is_some(), "torn literal must carry its coordinate map");
+}
+
+fn detached_size_lines(code: &str) -> u32 {
+    let method = crate::method_syntax::detach(&parse_method(code));
+    crate::method_body::lower_detached_method(&method, method.kind() == SyntaxKind::FUNCTION_DEF)
+        .size_lines
+}
+
+#[test]
+fn method_size_is_line_difference_of_method_range() {
+    assert_eq!(detached_size_lines("Процедура Тест() КонецПроцедуры"), 0);
+    assert_eq!(detached_size_lines("Процедура Тест()\nКонецПроцедуры"), 1);
+    assert_eq!(detached_size_lines("Процедура Тест()\n    А = 1;\nКонецПроцедуры"), 2);
+}
+
+#[test]
+fn method_size_of_long_method_counts_padding_lines() {
+    let mut code = String::from("Процедура Тест()\n\n");
+    for _ in 0..202 {
+        code.push_str("    А = 0;\n");
+    }
+    code.push_str("\nКонецПроцедуры");
+    assert_eq!(detached_size_lines(&code), 205);
+}
+
+#[test]
+fn method_size_without_line_index_is_zero() {
+    let method = parse_method("Процедура Тест()\n    А = 1;\nКонецПроцедуры");
+    assert_eq!(lower_method(&method, false).size_lines, 0);
+}
+
+#[test]
+fn method_size_small_spans_in_both_languages_and_method_kinds() {
+    for (start, end) in [
+        ("Процедура", "КонецПроцедуры"),
+        ("Функция", "КонецФункции"),
+        ("Procedure", "EndProcedure"),
+        ("Function", "EndFunction"),
+    ] {
+        for size in 0..=4 {
+            let separator = if size == 0 { " ".to_owned() } else { "\n".repeat(size) };
+            let code = format!("{start} Test(){separator}{end}");
+            assert_eq!(detached_size_lines(&code), size as u32, "{code:?}");
+        }
+    }
+}
+
+#[test]
+fn method_size_counts_node_lines_not_statements() {
+    for (code, expected) in [
+        ("Procedure Test()\n    A = 1; B = 2;\nEndProcedure", 2),
+        ("Procedure Test()\n\n    A = 1;\nEndProcedure", 3),
+        ("Procedure Test()\n    // comment\n    A = 1;\nEndProcedure", 3),
+        ("&AtServer\nProcedure Test()\n    A = 1;\nEndProcedure", 3),
+        ("&НаСервере\nПроцедура Тест()\n    // комментарий\n\nКонецПроцедуры", 4),
+    ] {
+        assert_eq!(detached_size_lines(code), expected, "{code:?}");
+    }
+}
+
+#[test]
+fn method_size_ignores_file_padding_and_line_ending_width() {
+    for code in [
+        "Procedure Test()\n    A = 1;\nEndProcedure",
+        "Function Test()\n    Return 1;\nEndFunction",
+    ] {
+        for prefix in ["", "// outside\n\n\n"] {
+            for suffix in ["", "\n\n// outside\n"] {
+                for newline in ["\n", "\r\n"] {
+                    let file = format!("{prefix}{code}{suffix}").replace('\n', newline);
+                    assert_eq!(detached_size_lines(&file), 2, "{file:?}");
+                    let method = parse_method(&file);
+                    let index = std::sync::Arc::new(line_index::LineIndex::new(&file));
+                    let result = super::lower_method_with_externals(
+                        &method,
+                        method.kind() == SyntaxKind::FUNCTION_DEF,
+                        Some(index),
+                    );
+                    assert_eq!(result.size_lines, 2, "file-relative index: {file:?}");
+                }
+            }
+        }
+    }
+}

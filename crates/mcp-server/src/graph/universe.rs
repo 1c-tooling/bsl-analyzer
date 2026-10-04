@@ -110,8 +110,24 @@ impl ScannedUniverse {
     }
 
     /// [`Self::scan`] without descending into `excluded`.
+    #[cfg(test)]
     pub(crate) fn scan_excluding(roots: &[PathBuf], excluded: &[PathBuf]) -> ScannedUniverse {
-        let set = SourceSet::scan_excluding(roots, excluded);
+        Self::scan_in_scope(roots, excluded, &project_model::ExcludedPaths::default())
+    }
+
+    /// The universe of one project snapshot: its roots, less both its cache holes and
+    /// the directories its user excluded — the scope that snapshot was taken under,
+    /// never a newer one.
+    pub(crate) fn scan_project(project: &super::input::ProjectSnapshot) -> ScannedUniverse {
+        Self::scan_in_scope(&project.scan_roots, &project.excluded, &project.user_excluded)
+    }
+
+    fn scan_in_scope(
+        roots: &[PathBuf],
+        excluded: &[PathBuf],
+        user_excluded: &project_model::ExcludedPaths,
+    ) -> ScannedUniverse {
+        let set = SourceSet::scan_in_scope(roots, excluded, user_excluded);
         let ContentScan { stats, content_unreadable: unreadable, hashed } =
             file_stats_with_content_errors(&set, roots);
         let walked_by_canonical =

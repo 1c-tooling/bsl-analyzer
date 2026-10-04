@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
+use stdx::path_exclusion::ExcludedPaths;
 
 use crate::workspace_walk::{
     classify_walk_error, process_file_entry, walk_tree, WalkOutcome, WalkedFile,
@@ -69,9 +70,20 @@ impl SourceSet {
     /// narrows by nothing: an exclusion is always something a caller states, never
     /// something the walk decides by name.
     pub fn scan_excluding(roots: &[PathBuf], excluded: &[PathBuf]) -> SourceSet {
+        Self::scan_in_scope(roots, excluded, &ExcludedPaths::default())
+    }
+
+    /// [`Self::scan_excluding`] that also never enters a directory the user took out of
+    /// the project — including a root itself, which then contributes nothing. Kept apart
+    /// from `excluded`, whose roots-inside-a-hole carve-out the user's list must not get.
+    pub fn scan_in_scope(
+        roots: &[PathBuf],
+        excluded: &[PathBuf],
+        user_excluded: &ExcludedPaths,
+    ) -> SourceSet {
         SCANS_ON_THREAD.with(|c| c.set(c.get() + 1));
         let _span = tracing::info_span!("workspace_scan", roots = roots.len()).entered();
-        let scope = crate::path_scope::PathScope::new(roots, excluded);
+        let scope = crate::path_scope::PathScope::with_exclusions(roots, excluded, user_excluded);
         let mut outcome = WalkOutcome::default();
         let mut slots: Vec<Slot> = Vec::new();
         for root in roots {
@@ -157,12 +169,16 @@ fn partition_root(
     slots: &mut Vec<Slot>,
 ) {
     let mut dir_cache: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut resolved = crate::path_scope::ResolvedDirs::default();
     let shallow = walkdir::WalkDir::new(root)
         .follow_links(true)
         .max_depth(1)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|entry| !entry.file_type().is_dir() || !scope.is_hole(entry.path()));
+        .filter_entry(|entry| {
+            !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
+                || !scope.prunes_dir(entry.path(), entry.path_is_symlink(), &mut resolved)
+        });
     for entry in shallow {
         let entry = match entry {
             Ok(entry) => entry,
@@ -405,5 +421,91 @@ mod tests {
         assert_eq!(canonicals.len(), 1, "one physical file, one canonical spelling");
         assert_eq!(set.unreadable, 0);
         assert!(set.clean());
+    }
+
+    #[test]
+    fn hard_exclusions_prune_both_scan_phases_and_may_remove_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&root.join("Allowed.bsl"), "");
+        write(&root.join(".tmp/Hidden.bsl"), "");
+        write(&root.join(".tmp/deep/HiddenToo.xml"), "");
+        write(&root.join(".tmp2/Visible.bsl"), "");
+        let excluded = ExcludedPaths::new([root.join("a/../.tmp"), root.join("future")]);
+
+        let set = SourceSet::scan_in_scope(std::slice::from_ref(&root), &[], &excluded);
+        let paths = walked_paths(&set);
+        assert!(paths.iter().any(|path| path.ends_with("Allowed.bsl")));
+        assert!(paths.iter().any(|path| path.ends_with(".tmp2/Visible.bsl")));
+        assert!(paths.iter().all(|path| !path.starts_with(root.join(".tmp"))), "{paths:?}");
+        assert!(set.clean(), "an intentional prune is still a complete scoped scan");
+
+        let empty = SourceSet::scan_in_scope(
+            std::slice::from_ref(&root),
+            &[],
+            &ExcludedPaths::new([root.clone()]),
+        );
+        assert!(empty.files.is_empty(), "an excluded walk root was restored");
+        assert!(empty.clean(), "an intentionally empty source universe is valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_excluded_unreadable_subtree_is_pruned_before_descent() {
+        if running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&root.join("Allowed.bsl"), "");
+        let hidden = root.join("hidden");
+        write(&hidden.join("deep/Hidden.bsl"), "");
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let set = SourceSet::scan_in_scope(
+            std::slice::from_ref(&root),
+            &[],
+            &ExcludedPaths::new([hidden.clone()]),
+        );
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(set.unreadable, 0, "the walker entered the excluded directory");
+        assert!(set.clean());
+        assert!(walked_paths(&set).iter().any(|path| path.ends_with("Allowed.bsl")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_through_a_symlink_cannot_reenter_an_excluded_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        write(&real.join("Visible.bsl"), "");
+        write(&real.join(".tmp/Hidden.bsl"), "");
+        write(&real.join(".tmp2/VisibleToo.bsl"), "");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let set = SourceSet::scan_in_scope(
+            std::slice::from_ref(&alias),
+            &[],
+            &ExcludedPaths::new([real.join(".tmp")]),
+        );
+        let paths = walked_paths(&set);
+
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.iter().all(|path| !path.ends_with(".tmp/Hidden.bsl")));
+        assert!(paths.iter().any(|path| path.ends_with(".tmp2/VisibleToo.bsl")));
+
+        let reverse = SourceSet::scan_in_scope(
+            std::slice::from_ref(&real),
+            &[],
+            &ExcludedPaths::new([alias.join(".tmp")]),
+        );
+        let reverse_paths = walked_paths(&reverse);
+        assert_eq!(reverse_paths.len(), 2, "{reverse_paths:?}");
+        assert!(reverse_paths.iter().all(|path| !path.ends_with(".tmp/Hidden.bsl")));
+        assert!(reverse_paths.iter().any(|path| path.ends_with(".tmp2/VisibleToo.bsl")));
     }
 }

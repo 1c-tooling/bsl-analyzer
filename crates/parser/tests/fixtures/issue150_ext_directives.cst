@@ -1,0 +1,301 @@
+SOURCE_FILE@0..1528
+  FUNCTION_DEF@0..115
+    KW_FUNCTION@0..14 "Функция"
+    WHITESPACE@14..15 " "
+    IDENT@15..43 "ЕстьТакойМе ..."
+    PARAM_LIST@43..45
+      L_PAREN@43..44 "("
+      R_PAREN@44..45 ")"
+    WHITESPACE@45..46 " "
+    KW_EXPORT@46..60 "Экспорт"
+    NEWLINE@60..61 "\n"
+    WHITESPACE@61..62 "\t"
+    STMT_LIST@62..90
+      RETURN_STMT@62..90
+        KW_RETURN@62..76 "Возврат"
+        WHITESPACE@76..77 " "
+        EXPR@77..89
+          EXPR@77..89
+            EXPR@77..89
+              EXPR@77..89
+                LITERAL@77..89
+                  KW_TRUE@77..89 "Истина"
+        SEMICOLON@89..90 ";"
+    NEWLINE@90..91 "\n"
+    KW_END_FUNCTION@91..115 "КонецФункции"
+  NEWLINE@115..116 "\n"
+  NEWLINE@116..117 "\n"
+  COMMENT@117..261 "// Случай 1: д ..."
+  NEWLINE@261..262 "\n"
+  FUNCTION_DEF@262..617
+    KW_FUNCTION@262..276 "Функция"
+    WHITESPACE@276..277 " "
+    IDENT@277..301 "ТекстЗапроса"
+    PARAM_LIST@301..303
+      L_PAREN@301..302 "("
+      R_PAREN@302..303 ")"
+    WHITESPACE@303..304 " "
+    KW_EXPORT@304..318 "Экспорт"
+    NEWLINE@318..319 "\n"
+    WHITESPACE@319..320 "\t"
+    STMT_LIST@320..592
+      ASSIGN_STMT@320..563
+        IDENT@320..330
+          IDENT@320..330 "Текст"
+        WHITESPACE@330..331 " "
+        EQ@331..332 "="
+        WHITESPACE@332..333 " "
+        EXPR@333..563
+          EXPR@333..563
+            EXPR@333..563
+              EXPR@333..563
+                LITERAL@333..563
+                  STRING_START@333..334 "\""
+                  NEWLINE@334..335 "\n"
+                  WHITESPACE@335..336 "\t"
+                  STRING_PART@336..351 "|ВЫБРАТЬ"
+                  NEWLINE@351..352 "\n"
+                  WHITESPACE@352..353 "\t"
+                  STRING_PART@353..391 "|\tТ.Ссылка КА ..."
+                  NEWLINE@391..392 "\n"
+                  PRE_INSERT@392..407 "#Вставка"
+                  NEWLINE@407..408 "\n"
+                  WHITESPACE@408..409 "\t"
+                  STRING_PART@409..451 "|\tТ.Договор К ..."
+                  NEWLINE@451..452 "\n"
+                  PRE_END_INSERT@452..477 "#КонецВстав ..."
+                  NEWLINE@477..478 "\n"
+                  WHITESPACE@478..479 "\t"
+                  STRING_PART@479..508 "|\tТ.Дата КАК  ..."
+                  NEWLINE@508..509 "\n"
+                  WHITESPACE@509..510 "\t"
+                  STRING_PART@510..515 "|ИЗ"
+                  NEWLINE@515..516 "\n"
+                  WHITESPACE@516..517 "\t"
+                  STRING_TAIL@517..563 "|\tСправочник ..."
+      SEMICOLON@563..564 ";"
+      NEWLINE@564..565 "\n"
+      WHITESPACE@565..566 "\t"
+      RETURN_STMT@566..592
+        KW_RETURN@566..580 "Возврат"
+        WHITESPACE@580..581 " "
+        EXPR@581..591
+          EXPR@581..591
+            EXPR@581..591
+              EXPR@581..591
+                IDENT@581..591
+                  IDENT@581..591 "Текст"
+        SEMICOLON@591..592 ";"
+    NEWLINE@592..593 "\n"
+    KW_END_FUNCTION@593..617 "КонецФункции"
+  NEWLINE@617..618 "\n"
+  NEWLINE@618..619 "\n"
+  COMMENT@619..714 "// Случай 2: д ..."
+  NEWLINE@714..715 "\n"
+  FUNCTION_DEF@715..1079
+    KW_FUNCTION@715..729 "Функция"
+    WHITESPACE@729..730 " "
+    IDENT@730..746 "Проверка"
+    PARAM_LIST@746..760
+      L_PAREN@746..747 "("
+      PARAM@747..759
+        IDENT@747..759 "Данные"
+      R_PAREN@759..760 ")"
+    WHITESPACE@760..761 " "
+    KW_EXPORT@761..775 "Экспорт"
+    NEWLINE@775..776 "\n"
+    WHITESPACE@776..777 "\t"
+    STMT_LIST@777..1054
+      IF_STMT@777..1024
+        KW_IF@777..785 "Если"
+        WHITESPACE@785..786 " "
+        EXPR@786..965
+          EXPR@786..965
+            BINARY_EXPR@786..965
+              EXPR@786..932
+                BINARY_EXPR@786..932
+                  EXPR@786..872
+                    UNARY_EXPR@786..872
+                      KW_NOT@786..790 "Не"
+                      WHITESPACE@790..791 " "
+                      EXPR@791..872
+                        EXPR@791..872
+                          CALL_EXPR@791..854
+                            IDENT@791..825
+                              IDENT@791..825 "ЗначениеЗап ..."
+                            ARG_LIST@825..854
+                              L_PAREN@825..826 "("
+                              EXPR@826..853
+                                EXPR@826..853
+                                  EXPR@826..853
+                                    EXPR@826..853
+                                      FIELD_EXPR@826..853
+                                        IDENT@826..838
+                                          IDENT@826..838 "Данные"
+                                        DOT@838..839 "."
+                                        IDENT@839..853 "Процент"
+                              R_PAREN@853..854 ")"
+                          NEWLINE@854..855 "\n"
+                          WHITESPACE@855..857 "\t\t"
+                          PRE_INSERT@857..872 "#Вставка"
+                  NEWLINE@872..873 "\n"
+                  WHITESPACE@873..875 "\t\t"
+                  KW_AND@875..877 "И"
+                  WHITESPACE@877..878 " "
+                  EXPR@878..932
+                    UNARY_EXPR@878..932
+                      KW_NOT@878..882 "Не"
+                      WHITESPACE@882..883 " "
+                      EXPR@883..932
+                        EXPR@883..932
+                          FIELD_EXPR@883..904
+                            IDENT@883..895
+                              IDENT@883..895 "Данные"
+                            DOT@895..896 "."
+                            IDENT@896..904 "Флаг"
+                          NEWLINE@904..905 "\n"
+                          WHITESPACE@905..907 "\t\t"
+                          PRE_END_INSERT@907..932 "#КонецВстав ..."
+              NEWLINE@932..933 "\n"
+              WHITESPACE@933..935 "\t\t"
+              KW_AND@935..937 "И"
+              WHITESPACE@937..938 " "
+              EXPR@938..965
+                EXPR@938..965
+                  BINARY_EXPR@938..965
+                    EXPR@938..961
+                      EXPR@938..961
+                        EXPR@938..961
+                          FIELD_EXPR@938..961
+                            IDENT@938..950
+                              IDENT@938..950 "Данные"
+                            DOT@950..951 "."
+                            IDENT@951..961 "Сумма"
+                    WHITESPACE@961..962 " "
+                    GT@962..963 ">"
+                    WHITESPACE@963..964 " "
+                    EXPR@964..965
+                      EXPR@964..965
+                        EXPR@964..965
+                          LITERAL@964..965
+                            DECIMAL@964..965 "0"
+        WHITESPACE@965..966 " "
+        KW_THEN@966..976 "Тогда"
+        NEWLINE@976..977 "\n"
+        WHITESPACE@977..979 "\t\t"
+        STMT_LIST@979..1003
+          RETURN_STMT@979..1003
+            KW_RETURN@979..993 "Возврат"
+            WHITESPACE@993..994 " "
+            EXPR@994..1002
+              EXPR@994..1002
+                EXPR@994..1002
+                  EXPR@994..1002
+                    LITERAL@994..1002
+                      KW_FALSE@994..1002 "Ложь"
+            SEMICOLON@1002..1003 ";"
+        NEWLINE@1003..1004 "\n"
+        WHITESPACE@1004..1005 "\t"
+        KW_END_IF@1005..1023 "КонецЕсли"
+        SEMICOLON@1023..1024 ";"
+      NEWLINE@1024..1025 "\n"
+      WHITESPACE@1025..1026 "\t"
+      RETURN_STMT@1026..1054
+        KW_RETURN@1026..1040 "Возврат"
+        WHITESPACE@1040..1041 " "
+        EXPR@1041..1053
+          EXPR@1041..1053
+            EXPR@1041..1053
+              EXPR@1041..1053
+                LITERAL@1041..1053
+                  KW_TRUE@1041..1053 "Истина"
+        SEMICOLON@1053..1054 ";"
+    NEWLINE@1054..1055 "\n"
+    KW_END_FUNCTION@1055..1079 "КонецФункции"
+  NEWLINE@1079..1080 "\n"
+  NEWLINE@1080..1081 "\n"
+  COMMENT@1081..1178 "// Случай 3: #У ..."
+  NEWLINE@1178..1179 "\n"
+  FUNCTION_DEF@1179..1527
+    KW_FUNCTION@1179..1193 "Функция"
+    WHITESPACE@1193..1194 " "
+    IDENT@1194..1208 "Собрать"
+    PARAM_LIST@1208..1222
+      L_PAREN@1208..1209 "("
+      PARAM@1209..1221
+        IDENT@1209..1221 "Данные"
+      R_PAREN@1221..1222 ")"
+    WHITESPACE@1222..1223 " "
+    KW_EXPORT@1223..1237 "Экспорт"
+    NEWLINE@1237..1238 "\n"
+    WHITESPACE@1238..1239 "\t"
+    STMT_LIST@1239..1502
+      RETURN_STMT@1239..1502
+        KW_RETURN@1239..1253 "Возврат"
+        WHITESPACE@1253..1254 " "
+        EXPR@1254..1501
+          EXPR@1254..1501
+            EXPR@1254..1501
+              EXPR@1254..1501
+                NEW_EXPR@1254..1501
+                  KW_NEW@1254..1264 "Новый"
+                  WHITESPACE@1264..1265 " "
+                  IDENT@1265..1283 "Структура"
+                  ARG_LIST@1283..1501
+                    L_PAREN@1283..1284 "("
+                    NEWLINE@1284..1285 "\n"
+                    WHITESPACE@1285..1287 "\t\t"
+                    EXPR@1287..1311
+                      EXPR@1287..1311
+                        EXPR@1287..1311
+                          EXPR@1287..1311
+                            LITERAL@1287..1311
+                              STRING@1287..1311 "\"Ссылка, Дата\""
+                    COMMA@1311..1312 ","
+                    NEWLINE@1312..1313 "\n"
+                    WHITESPACE@1313..1315 "\t\t"
+                    PRE_DELETE_DIR@1315..1391
+                      PRE_DELETE@1315..1332 "#Удаление"
+                      NEWLINE@1332..1333 "\n"
+                      WHITESPACE@1333..1335 "\t\t"
+                      IDENT@1335..1347 "Данные"
+                      DOT@1347..1348 "."
+                      IDENT@1348..1360 "Ссылка"
+                      COMMA@1360..1361 ","
+                      NEWLINE@1361..1362 "\n"
+                      WHITESPACE@1362..1364 "\t\t"
+                      PRE_END_DELETE@1364..1391 "#КонецУдале ..."
+                    NEWLINE@1391..1392 "\n"
+                    WHITESPACE@1392..1394 "\t\t"
+                    PRE_INSERT@1394..1409 "#Вставка"
+                    NEWLINE@1409..1410 "\n"
+                    WHITESPACE@1410..1412 "\t\t"
+                    EXPR@1412..1447
+                      EXPR@1412..1447
+                        EXPR@1412..1447
+                          EXPR@1412..1447
+                            FIELD_EXPR@1412..1447
+                              IDENT@1412..1424
+                                IDENT@1412..1424 "Данные"
+                              DOT@1424..1425 "."
+                              IDENT@1425..1447 "НоваяСсылка"
+                    COMMA@1447..1448 ","
+                    NEWLINE@1448..1449 "\n"
+                    WHITESPACE@1449..1451 "\t\t"
+                    PRE_END_INSERT@1451..1476 "#КонецВстав ..."
+                    NEWLINE@1476..1477 "\n"
+                    WHITESPACE@1477..1479 "\t\t"
+                    EXPR@1479..1500
+                      EXPR@1479..1500
+                        EXPR@1479..1500
+                          EXPR@1479..1500
+                            FIELD_EXPR@1479..1500
+                              IDENT@1479..1491
+                                IDENT@1479..1491 "Данные"
+                              DOT@1491..1492 "."
+                              IDENT@1492..1500 "Дата"
+                    R_PAREN@1500..1501 ")"
+        SEMICOLON@1501..1502 ";"
+    NEWLINE@1502..1503 "\n"
+    KW_END_FUNCTION@1503..1527 "КонецФункции"
+  NEWLINE@1527..1528 "\n"

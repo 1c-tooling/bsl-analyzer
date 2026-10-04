@@ -429,6 +429,31 @@ mod tests {
         assert!(!sidecar_tmp.exists());
     }
 
+    /// Windows `FlushFileBuffers` rejects a read-only handle with `ERROR_ACCESS_DENIED`, so the
+    /// index temp must be flushed through a writable handle that neither truncates nor rewrites
+    /// the bytes the sidecar digest was taken from.
+    #[test]
+    fn lifecycle_artifact_index_temp_fsync_keeps_saved_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.tmp");
+        fs::write(&path, b"saved index bytes").unwrap();
+        fsync_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"saved index bytes");
+
+        let store = seeded_store(dir.path(), 2);
+        let (generation, data) = store.load_all_embeddings_with_generation(DIM).unwrap();
+        let index = VectorIndex::build(DIM, &data).unwrap();
+        let mut prepared = prepare(&index, &key(&store), generation).unwrap();
+        let index_tmp = prepared.index_tmp.clone().unwrap();
+        let sidecar: Sidecar =
+            serde_json::from_slice(&fs::read(prepared.sidecar_tmp.as_ref().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(file_blake3(&index_tmp).ok().unwrap(), sidecar.index_sha);
+        prepared.install().unwrap();
+        prepared.finish();
+        assert_eq!(try_load(&store, &key(&store)).unwrap().len(), 2);
+    }
+
     #[test]
     fn persist_then_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();

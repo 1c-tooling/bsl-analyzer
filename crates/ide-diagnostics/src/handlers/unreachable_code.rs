@@ -28,10 +28,10 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     }
 
     let cfg = ctx.cfg();
-    let Some(entry) = cfg.entry_point() else {
+    let Some(entry) = cfg.start() else {
         return;
     };
-    let exit = cfg.exit_point();
+    let exit = cfg.exit();
 
     let dead_tail_vertices = compute_dead_tail_vertices(&cfg, entry);
 
@@ -139,8 +139,8 @@ fn compute_dead_tail_vertices(
 ) -> std::collections::HashSet<hir::cfg::NodeIndex> {
     let reachable_with_all_edges = compute_reachable_vertices(cfg, entry, |_| true);
     let reachable_without_dead_edges =
-        compute_reachable_vertices(cfg, entry, |edge_type| !edge_type.is_dead_code_edge());
-    let exit = cfg.exit_point();
+        compute_reachable_vertices(cfg, entry, |edge_type| edge_type.is_executable());
+    let exit = cfg.exit();
 
     reachable_with_all_edges
         .difference(&reachable_without_dead_edges)
@@ -206,20 +206,14 @@ fn get_vertex_range(
             )))
         }
         CfgVertex::Conditional(_) => None,
-        CfgVertex::WhileLoop(loop_vertex) => source_map.expr_range(loop_vertex.condition),
-        CfgVertex::ForLoop(loop_vertex) => loop_vertex
-            .stmt_id
-            .and_then(|id| source_map.stmt_range(id))
-            .or_else(|| source_map.binding_range(loop_vertex.loop_var)),
-        CfgVertex::ForEachLoop(loop_vertex) => loop_vertex
-            .stmt_id
-            .and_then(|id| source_map.stmt_range(id))
-            .or_else(|| source_map.binding_range(loop_vertex.loop_var)),
-        CfgVertex::TryExcept(_) => None,
+        CfgVertex::WhileHeader(loop_vertex) => source_map.expr_range(loop_vertex.condition),
+        CfgVertex::ForHeader(loop_vertex) => source_map.binding_range(loop_vertex.loop_var),
+        CfgVertex::ForEachHeader(loop_vertex) => source_map.binding_range(loop_vertex.loop_var),
+        CfgVertex::Try => None,
         CfgVertex::PreprocCondition(preproc) => {
             Some(preproc.full_range.or(preproc.directive_range).unwrap_or(preproc.condition_range))
         }
-        CfgVertex::Label(_) | CfgVertex::Exit => None,
+        CfgVertex::Exit => None,
     }
 }
 

@@ -100,12 +100,18 @@ pub(crate) fn walk_tree(start: &Path, root: &Path, scope: &PathScope, outcome: &
     // `filter_entry` rather than a check inside the loop: skipping a directory here
     // means the walk never descends into it, so an excluded subtree costs nothing at
     // all. Filtering entries instead would still pay for the whole tree and only drop
-    // its files. Non-directories pass through — they are decided by `process_file_entry`.
+    // its files. Non-directories below the start pass through — they are decided by
+    // `process_file_entry`; the start itself is decided here whatever it is, so a file
+    // root the user excluded is not taken either.
+    let mut resolved = crate::path_scope::ResolvedDirs::default();
     let walk = walkdir::WalkDir::new(start)
         .follow_links(true)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|entry| !entry.file_type().is_dir() || !scope.is_hole(entry.path()));
+        .filter_entry(|entry| {
+            !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
+                || !scope.prunes_dir(entry.path(), entry.path_is_symlink(), &mut resolved)
+        });
     for entry in walk {
         match entry {
             Ok(entry) => process_file_entry(&entry, root, &mut dir_cache, outcome),

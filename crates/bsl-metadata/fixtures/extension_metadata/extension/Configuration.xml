@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+  <Configuration uuid="15500000-0000-0000-0000-000000000002">
+    <Properties>
+      <Name>Расширение</Name>
+      <ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>
+      <DefaultRunMode>ManagedApplication</DefaultRunMode>
+    </Properties>
+    <ChildObjects>
+      <Document>Заказ</Document>
+      <CommonModule>Сервер</CommonModule>
+      <CommonModule>СерверЗапросов</CommonModule>
+      <CommonModule>СерверСеанса</CommonModule>
+      <CommonModule>СерверНеизвестный</CommonModule>
+      <CommonModule>СерверОтключаемый</CommonModule>
+      <CommonModule>СерверВключаемый</CommonModule>
+    </ChildObjects>
+  </Configuration>
+</MetaDataObject>

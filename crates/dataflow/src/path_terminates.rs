@@ -69,7 +69,7 @@ impl Transfer<MayFallthrough> for PathTerminatesTransfer {
 
     fn transfer_edge(&self, edge_kind: CfgEdgeType, state: &MayFallthrough) -> MayFallthrough {
         match edge_kind {
-            CfgEdgeType::AdjacentCode => MayFallthrough::BOTTOM,
+            CfgEdgeType::Unexecutable => MayFallthrough::BOTTOM,
             _ => *state,
         }
     }
@@ -163,8 +163,8 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(make_block(&[s1]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(r.may_fallthrough_at_block(entry), "linear body without Return must fallthrough");
@@ -177,8 +177,8 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(make_block(&[ret]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(!r.may_fallthrough_at_block(entry), "Return must kill fallthrough");
@@ -191,8 +191,8 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(make_block(&[raise]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(!r.may_fallthrough_at_block(entry), "Raise must kill fallthrough");
@@ -212,13 +212,13 @@ mod tests {
         let then_block = cfg.add_vertex(make_block(&[then_ret]));
         let else_block = cfg.add_vertex(make_block(&[else_noop]));
         let merge = cfg.add_vertex(make_block(&[]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, else_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(then_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(else_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(merge, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, else_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(then_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(else_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(merge, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(
@@ -246,13 +246,13 @@ mod tests {
         let then_block = cfg.add_vertex(make_block(&[then_ret]));
         let else_block = cfg.add_vertex(make_block(&[else_ret]));
         let merge = cfg.add_vertex(make_block(&[]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, else_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(then_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(else_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(merge, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, else_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(then_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(else_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(merge, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(
@@ -270,12 +270,15 @@ mod tests {
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(make_block(&[s1]));
         let dead = cfg.add_vertex(make_block(&[s2]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, dead, CfgEdgeType::AdjacentCode).unwrap();
-        cfg.add_edge(dead, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, dead, CfgEdgeType::Unexecutable);
+        cfg.add_edge(dead, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
-        assert!(!r.may_fallthrough_at_block(entry), "AdjacentCode must not propagate fallthrough");
+        assert!(
+            !r.may_fallthrough_at_block(entry),
+            "An unexecutable edge must not propagate fallthrough"
+        );
     }
 
     #[test]
@@ -289,16 +292,16 @@ mod tests {
         let entry = cfg.add_vertex(make_block(&[break_block_stmts]));
         let after_loop = cfg.add_vertex(make_block(&[after_loop_stmt]));
         let dead = cfg.add_vertex(make_block(&[dead_after_break]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, after_loop, CfgEdgeType::LoopBreak).unwrap();
-        cfg.add_edge(entry, dead, CfgEdgeType::AdjacentCode).unwrap();
-        cfg.add_edge(after_loop, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(dead, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, after_loop, CfgEdgeType::Unconditional);
+        cfg.add_edge(entry, dead, CfgEdgeType::Unexecutable);
+        cfg.add_edge(after_loop, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(dead, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(
             r.may_fallthrough_at_block(entry),
-            "LoopBreak is a live edge → fallthrough must reach entry through after_loop"
+            "`Прервать` is a live edge → fallthrough must reach entry through after_loop"
         );
         assert!(r.may_fallthrough_at_block(after_loop), "after_loop has a direct path to exit");
     }
@@ -311,17 +314,17 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(make_block(&[]));
-        let try_vertex = cfg.add_vertex(CfgVertex::TryExcept(cfg::TryExceptVertex::new()));
+        let try_vertex = cfg.add_vertex(CfgVertex::Try);
         let try_block = cfg.add_vertex(make_block(&[try_ret]));
         let except_block = cfg.add_vertex(make_block(&[except_ret]));
         let merge = cfg.add_vertex(make_block(&[]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, try_vertex, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_vertex, try_block, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_vertex, except_block, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(except_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(merge, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, try_vertex, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, try_block, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, except_block, CfgEdgeType::Exception);
+        cfg.add_edge(try_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(except_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(merge, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(
@@ -340,17 +343,17 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(make_block(&[]));
-        let try_vertex = cfg.add_vertex(CfgVertex::TryExcept(cfg::TryExceptVertex::new()));
+        let try_vertex = cfg.add_vertex(CfgVertex::Try);
         let try_block = cfg.add_vertex(make_block(&[try_noop]));
         let except_block = cfg.add_vertex(make_block(&[except_ret]));
         let merge = cfg.add_vertex(make_block(&[]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, try_vertex, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_vertex, try_block, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_vertex, except_block, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(except_block, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(merge, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, try_vertex, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, try_block, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, except_block, CfgEdgeType::Exception);
+        cfg.add_edge(try_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(except_block, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(merge, cfg.exit(), CfgEdgeType::Unconditional);
 
         let r = analyze_path_terminates_default(&body, &cfg).expect("converges");
         assert!(
@@ -367,8 +370,8 @@ mod tests {
         let body = Body::new();
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(make_block(&[]));
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, cfg.exit(), CfgEdgeType::Unconditional);
         let _ = analyze_path_terminates(
             &body,
             &cfg,

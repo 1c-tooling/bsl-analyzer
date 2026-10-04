@@ -111,13 +111,13 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
     }
 
     pub fn set_initial_state(&mut self, initial: L) {
-        if let Some(entry) = self.cfg.entry_point() {
+        if let Some(entry) = self.cfg.start() {
             self.block_in.insert(entry, initial);
         }
     }
 
     pub fn set_initial_state_at_exit(&mut self, initial: L) {
-        let exit = self.cfg.exit_point();
+        let exit = self.cfg.exit();
         debug_assert!(
             self.cfg
                 .vertices()
@@ -150,7 +150,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
     fn solve_forward(mut self) -> Option<DataflowResult<L>> {
         use std::collections::VecDeque;
 
-        let entry = self.cfg.entry_point();
+        let entry = self.cfg.start();
         assert!(
             self.cfg
                 .vertices()
@@ -232,7 +232,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
     fn solve_backward(mut self) -> Option<DataflowResult<L>> {
         use std::collections::VecDeque;
 
-        let exit = self.cfg.exit_point();
+        let exit = self.cfg.exit();
         let num_blocks = self.cfg.vertices().count();
 
         assert!(
@@ -373,7 +373,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                 state
             }
 
-            CfgVertex::WhileLoop(while_vertex) => {
+            CfgVertex::WhileHeader(while_vertex) => {
                 let mut state = in_state.clone();
                 self.transfer.transfer_expr_in_place(
                     while_vertex.condition,
@@ -393,7 +393,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                 state
             }
 
-            CfgVertex::ForLoop(for_vertex) => {
+            CfgVertex::ForHeader(for_vertex) => {
                 let mut state = in_state.clone();
                 self.transfer.transfer_expr_in_place(for_vertex.from, &mut state, &self.body);
                 self.transfer.transfer_expr_in_place(for_vertex.to, &mut state, &self.body);
@@ -401,7 +401,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                 state
             }
 
-            CfgVertex::ForEachLoop(foreach_vertex) => {
+            CfgVertex::ForEachHeader(foreach_vertex) => {
                 let mut state = in_state.clone();
                 self.transfer.transfer_expr_in_place(
                     foreach_vertex.collection,
@@ -539,11 +539,11 @@ mod tests {
         let s = IntSetLattice { values: vec![1, 2, 3] };
         let t = NoopTransfer;
         for edge in [
-            CfgEdgeType::Direct,
+            CfgEdgeType::Unconditional,
             CfgEdgeType::TrueBranch,
             CfgEdgeType::FalseBranch,
-            CfgEdgeType::LoopIteration,
-            CfgEdgeType::AdjacentCode,
+            CfgEdgeType::Exception,
+            CfgEdgeType::Unexecutable,
         ] {
             assert_eq!(t.transfer_edge(edge, &s), s, "edge {edge:?}");
         }
@@ -574,9 +574,9 @@ mod tests {
         let t = SignSplitTransfer;
         assert_eq!(t.transfer_edge(CfgEdgeType::TrueBranch, &s).values, vec![1, 2]);
         assert_eq!(t.transfer_edge(CfgEdgeType::FalseBranch, &s).values, vec![-2, -1, 0]);
-        assert_eq!(t.transfer_edge(CfgEdgeType::Direct, &s), s);
-        assert_eq!(t.transfer_edge(CfgEdgeType::LoopIteration, &s), s);
-        assert_eq!(t.transfer_edge(CfgEdgeType::AdjacentCode, &s), s);
+        assert_eq!(t.transfer_edge(CfgEdgeType::Unconditional, &s), s);
+        assert_eq!(t.transfer_edge(CfgEdgeType::Exception, &s), s);
+        assert_eq!(t.transfer_edge(CfgEdgeType::Unexecutable, &s), s);
     }
 
     #[test]
@@ -589,14 +589,14 @@ mod tests {
         let tside = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let fside = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let merge = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        let exit = cfg.exit_point();
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, tside, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, fside, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(tside, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(fside, merge, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(merge, exit, CfgEdgeType::Direct).unwrap();
+        let exit = cfg.exit();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, tside, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, fside, CfgEdgeType::FalseBranch);
+        cfg.add_edge(tside, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(fside, merge, CfgEdgeType::Unconditional);
+        cfg.add_edge(merge, exit, CfgEdgeType::Unconditional);
 
         let body = Body::default();
         let initial = IntSetLattice { values: vec![-2, -1, 0, 1, 2] };

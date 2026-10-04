@@ -45,6 +45,10 @@ pub fn check_node(node: &SyntaxNode, acc: &mut Vec<Diagnostic<LocalRange>>, ctx:
 }
 
 #[cfg(test)]
+#[path = "unknown_preprocessor_symbol_corpus.rs"]
+mod corpus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::check_diagnostics_snapshot_for;
@@ -117,22 +121,144 @@ mod tests {
         );
     }
 
-    /// ОС-символы источника не имеют и остаются неизвестными — тот же ответ,
-    /// что даёт реестр остальным потребителям.
+    /// Подчёркивание — допустимый идентификатор, но не символ таблицы, и
+    /// диагностируется точно по своему диапазону; известный сосед молчит.
+    #[test]
+    fn a_bare_underscore_is_reported() {
+        let code = "#Если _ Тогда\n#КонецЕсли\n\n#Если НаКлиенте Тогда\n#КонецЕсли\n";
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnknownPreprocessorSymbol,
+            expect![[r#"
+                UnknownPreprocessorSymbol @ 1:7..1:8
+                  message: Неизвестный символ препроцессора '_'
+                  severity: Critical"#]],
+        );
+    }
+
+    /// Неизвестный операнд виден с любой стороны `И`/`Или`, в русской и
+    /// английской записи, а известный операнд той же операции молчит.
+    #[test]
+    fn an_unknown_operand_is_reported_on_either_side() {
+        let code = r#"#Если B2Probe И Сервер Тогда
+#КонецЕсли
+#Если Клиент Или КонтурТеста Тогда
+#КонецЕсли
+#If B2Probe Or AtServer Then
+#EndIf
+#If ThinClient And КонтурТеста Then
+#EndIf
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnknownPreprocessorSymbol,
+            expect![[r#"
+                UnknownPreprocessorSymbol @ 1:7..1:14
+                  message: Неизвестный символ препроцессора 'B2Probe'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 3:18..3:29
+                  message: Неизвестный символ препроцессора 'КонтурТеста'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 5:5..5:12
+                  message: Неизвестный символ препроцессора 'B2Probe'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 7:20..7:31
+                  message: Неизвестный символ препроцессора 'КонтурТеста'
+                  severity: Critical"#]],
+        );
+    }
+
+    /// Отрицание не прячет неизвестный символ и не делает известный
+    /// неизвестным; `#ИначеЕсли`/`#ElsIf` проверяют своё выражение сами.
+    #[test]
+    fn negation_and_elsif_conditions_are_checked() {
+        let code = r#"#Если НЕ КонтурТеста Тогда
+#ИначеЕсли НЕ ВебКлиент Тогда
+#ИначеЕсли B2Probe Тогда
+#КонецЕсли
+#If Not B2Probe Then
+#ElsIf Not MobileClient Then
+#ElsIf КонтурТеста Then
+#EndIf
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnknownPreprocessorSymbol,
+            expect![[r#"
+                UnknownPreprocessorSymbol @ 1:10..1:21
+                  message: Неизвестный символ препроцессора 'КонтурТеста'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 3:12..3:19
+                  message: Неизвестный символ препроцессора 'B2Probe'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 5:9..5:16
+                  message: Неизвестный символ препроцессора 'B2Probe'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 7:8..7:19
+                  message: Неизвестный символ препроцессора 'КонтурТеста'
+                  severity: Critical"#]],
+        );
+    }
+
+    /// ОС-символы источник не определяет, и в условии они остаются
+    /// неизвестными в любом регистре — тот же ответ, что даёт реестр
+    /// остальным потребителям. Известный сосед в той же строке молчит.
     #[test]
     fn os_symbols_are_reported() {
-        for os in ["Linux", "Windows", "MacOS"] {
-            let code = format!("#Если {os} Тогда\n#КонецЕсли\n");
-            assert_eq!(
-                crate::test_utils::check_diagnostics_for(
-                    &code,
-                    DiagnosticCode::UnknownPreprocessorSymbol
-                )
-                .len(),
-                1,
-                "{os:?}: ОС-символ обязан остаться неизвестным"
-            );
-        }
+        let code = r#"#Если Linux Или Сервер Тогда
+#КонецЕсли
+#If WINDOWS Or Client Then
+#EndIf
+#Если НЕ macos И ТонкийКлиент Тогда
+#КонецЕсли
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnknownPreprocessorSymbol,
+            expect![[r#"
+                UnknownPreprocessorSymbol @ 1:7..1:12
+                  message: Неизвестный символ препроцессора 'Linux'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 3:5..3:12
+                  message: Неизвестный символ препроцессора 'WINDOWS'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 5:10..5:15
+                  message: Неизвестный символ препроцессора 'macos'
+                  severity: Critical"#]],
+        );
+    }
+
+    /// Продукция 4.8.1.2 перечисляет `Область`/`КонецОбласти` среди символов,
+    /// но тот же раздел называет их инструкциями свёртки текста, а не местом
+    /// исполнения. В условии они неизвестны во всех четырёх написаниях.
+    #[test]
+    fn region_words_in_a_condition_are_reported() {
+        let code = r#"#Если Область Или Сервер Тогда
+#КонецЕсли
+#Если КонецОбласти Тогда
+#КонецЕсли
+#If Region Or Client Then
+#EndIf
+#If ENDREGION Then
+#EndIf
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnknownPreprocessorSymbol,
+            expect![[r#"
+                UnknownPreprocessorSymbol @ 1:7..1:14
+                  message: Неизвестный символ препроцессора 'Область'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 3:7..3:19
+                  message: Неизвестный символ препроцессора 'КонецОбласти'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 5:5..5:11
+                  message: Неизвестный символ препроцессора 'Region'
+                  severity: Critical
+                UnknownPreprocessorSymbol @ 7:5..7:14
+                  message: Неизвестный символ препроцессора 'ENDREGION'
+                  severity: Critical"#]],
+        );
     }
 
     /// Написание, которого раздел 4.8.1.2 не определяет, диагностируется.

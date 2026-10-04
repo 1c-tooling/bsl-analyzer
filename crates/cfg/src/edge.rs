@@ -1,36 +1,31 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Why control may move along an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CfgEdgeType {
-    #[default]
-    Direct,
+    /// A transfer no value decides: sequence, `Перейти`, `Возврат`, `Прервать`,
+    /// `Продолжить` and the end of a loop body returning to its header.
+    Unconditional,
 
+    /// The tested condition holds: `Если`/`ИначеЕсли`, a loop continuation, or
+    /// a preprocessor directive whose expression holds.
     TrueBranch,
 
+    /// The tested condition does not hold.
     FalseBranch,
 
-    LoopIteration,
+    /// Control reaching an exception handler, or leaving the method when no
+    /// handler is active: from a `Попытка` to its handler, and from
+    /// `ВызватьИсключение`.
+    Exception,
 
-    LoopBreak,
-
-    LoopContinue,
-
-    AdjacentCode,
+    /// Links text that follows a statement which never falls through to that
+    /// text. No execution takes it: analyses use it to locate dead statements
+    /// and give the state carried over it the bottom value.
+    Unexecutable,
 }
 
 impl CfgEdgeType {
-    pub fn is_conditional_branch(&self) -> bool {
-        matches!(self, CfgEdgeType::TrueBranch | CfgEdgeType::FalseBranch)
-    }
-
-    pub fn is_loop_back_edge(&self) -> bool {
-        matches!(self, CfgEdgeType::LoopIteration | CfgEdgeType::LoopContinue)
-    }
-
-    pub fn is_dead_code_edge(&self) -> bool {
-        matches!(self, CfgEdgeType::AdjacentCode)
-    }
-
-    pub fn is_user_loop_jump(&self) -> bool {
-        matches!(self, CfgEdgeType::LoopBreak | CfgEdgeType::LoopContinue)
+    pub fn is_executable(&self) -> bool {
+        !matches!(self, CfgEdgeType::Unexecutable)
     }
 }
 
@@ -39,47 +34,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_edge_type() {
-        assert_eq!(CfgEdgeType::default(), CfgEdgeType::Direct);
-    }
-
-    #[test]
-    fn test_is_conditional_branch() {
-        assert!(CfgEdgeType::TrueBranch.is_conditional_branch());
-        assert!(CfgEdgeType::FalseBranch.is_conditional_branch());
-        assert!(!CfgEdgeType::Direct.is_conditional_branch());
-        assert!(!CfgEdgeType::LoopIteration.is_conditional_branch());
-        assert!(!CfgEdgeType::AdjacentCode.is_conditional_branch());
-        assert!(!CfgEdgeType::LoopBreak.is_conditional_branch());
-        assert!(!CfgEdgeType::LoopContinue.is_conditional_branch());
-    }
-
-    #[test]
-    fn test_is_loop_back_edge() {
-        assert!(CfgEdgeType::LoopIteration.is_loop_back_edge());
-        assert!(CfgEdgeType::LoopContinue.is_loop_back_edge());
-        assert!(!CfgEdgeType::Direct.is_loop_back_edge());
-        assert!(!CfgEdgeType::TrueBranch.is_loop_back_edge());
-        assert!(!CfgEdgeType::LoopBreak.is_loop_back_edge());
-    }
-
-    #[test]
-    fn test_is_dead_code_edge() {
-        assert!(CfgEdgeType::AdjacentCode.is_dead_code_edge());
-        assert!(!CfgEdgeType::Direct.is_dead_code_edge());
-        assert!(!CfgEdgeType::TrueBranch.is_dead_code_edge());
-        assert!(!CfgEdgeType::LoopBreak.is_dead_code_edge());
-        assert!(!CfgEdgeType::LoopContinue.is_dead_code_edge());
-    }
-
-    #[test]
-    fn test_is_user_loop_jump() {
-        assert!(CfgEdgeType::LoopBreak.is_user_loop_jump());
-        assert!(CfgEdgeType::LoopContinue.is_user_loop_jump());
-        assert!(!CfgEdgeType::LoopIteration.is_user_loop_jump());
-        assert!(!CfgEdgeType::Direct.is_user_loop_jump());
-        assert!(!CfgEdgeType::TrueBranch.is_user_loop_jump());
-        assert!(!CfgEdgeType::FalseBranch.is_user_loop_jump());
-        assert!(!CfgEdgeType::AdjacentCode.is_user_loop_jump());
+    fn only_the_unexecutable_link_is_not_executable() {
+        assert!(!CfgEdgeType::Unexecutable.is_executable());
+        assert!(CfgEdgeType::Unconditional.is_executable());
+        assert!(CfgEdgeType::TrueBranch.is_executable());
+        assert!(CfgEdgeType::FalseBranch.is_executable());
+        assert!(CfgEdgeType::Exception.is_executable());
     }
 }

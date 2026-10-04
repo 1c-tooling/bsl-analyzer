@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.20">
+  <Document uuid="15500000-0000-0000-0000-000000000010">
+    <Properties>
+      <Name>Заказ</Name>
+      <NumberType>String</NumberType>
+      <NumberLength>9</NumberLength>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="15500000-0000-0000-0000-000000000011">
+        <Properties>
+          <Name>БазовыйРеквизит</Name>
+          <Type><v8:Type>xs:string</v8:Type><v8:StringQualifiers><v8:Length>20</v8:Length></v8:StringQualifiers></Type>
+        </Properties>
+      </Attribute>
+      <TabularSection uuid="15500000-0000-0000-0000-000000000012">
+        <Properties>
+          <Name>Товары</Name>
+          <Synonym>Товары базы</Synonym>
+          <Use>ForItem</Use>
+        </Properties>
+        <ChildObjects>
+          <Attribute uuid="15500000-0000-0000-0000-000000000013">
+            <Properties>
+              <Name>Номенклатура</Name>
+              <Type><v8:Type>xs:string</v8:Type><v8:StringQualifiers><v8:Length>50</v8:Length></v8:StringQualifiers></Type>
+            </Properties>
+          </Attribute>
+          <Attribute uuid="15500000-0000-0000-0000-000000000014">
+            <Properties>
+              <Name>Количество</Name>
+              <Type><v8:Type>xs:decimal</v8:Type><v8:NumberQualifiers><v8:Digits>10</v8:Digits><v8:FractionDigits>0</v8:FractionDigits></v8:NumberQualifiers></Type>
+            </Properties>
+          </Attribute>
+        </ChildObjects>
+      </TabularSection>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>

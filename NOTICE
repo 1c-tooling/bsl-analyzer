@@ -16,6 +16,35 @@ incremental database, HIR and IDE layering — follows the design of
 rust-analyzer, which is distributed under MIT OR Apache-2.0.
 Upstream: https://github.com/rust-analyzer/rust-analyzer
 
+The source used to say where in particular. Those notes were removed in
+March 2026 together with the annotations naming copyleft sources, though
+nothing was wrong with them, so the attribution is restated here crate
+by crate:
+
+  * crates/syntax — the architecture of rust-analyzer's syntax crate.
+  * crates/base-db — source files kept in a concurrent map outside the
+    Salsa database, as rust-analyzer does.
+  * crates/stdx — the threading module: spawning threads by intent
+    (quality of service) and the worker pool follow rust-analyzer's
+    stdx thread module, whose documentation was carried over with it.
+  * crates/paths — the absolute and relative path wrapper types.
+  * crates/cfg — graph vertices that refer to HIR body ids rather than
+    to syntax, following rust-analyzer's HIR patterns. This is the
+    rust-analyzer share only; the separate notice on crates/cfg below
+    is not answered by it.
+  * crates/dataflow — rust-analyzer's MIR dataflow for constant
+    evaluation and its type-inference lattice, named as references.
+  * crates/hir-def — documentation as a first-class part of the HIR,
+    the owner of a body (rust-analyzer's DefWithBodyId), and
+    segment-by-segment path resolution.
+  * crates/hir-ty — type inference in a crate of its own, with
+    diagnostics collected as a by-product of inference.
+  * crates/hir — a single representation of definitions.
+  * crates/ide-db — LineIndex cached through Salsa.
+
+Each entry covers what the removed note named and no more of the crate.
+The record behind this list is in docs/legal/tier-a-provenance-audit.md.
+
 Language heritage
 -----------------
 BSL and the SDBL query language are part of the 1C:Enterprise platform.
@@ -66,7 +95,9 @@ introduced the diagnostic for unknown preprocessor symbols also recorded
 fixture file later moved that material into an inline test rather than
 retiring it. It has now been replaced with material derived from section
 4.8.1.2 of the 1C Developer's Guide, and a test in the crate fails if the
-retired material reappears.
+retired material reappears. The current re-verification of the list and
+of that replacement against section 4.8.1.2, with the corpus measurement
+behind it, is recorded in docs/legal/bsl-clean-room-slice-b2.md.
 
 A sweep of every BSL test input in the tree, done on 2026-08-21, found
 that the unknown-preprocessor-symbol fixture was one case of a class.
@@ -175,7 +206,12 @@ today carries no trace of this. It is therefore stated here.
     device. What follows the reference is the vertex and edge taxonomy,
     its granularity, the decomposition of loops, try/except and labels,
     and the part of the graph API that is not the underlying graph
-    library's own vocabulary.
+    library's own vocabulary. That identified taxonomy and API slice has
+    now been independently re-derived from Chapter 4 of the 1C Developer's
+    Guide and control-flow literature, then verified against the previous
+    analysis results. The derivation, removals and verification are recorded
+    in docs/legal/cfg-clean-room-slice.md. This closes that specific slice,
+    not the workspace's MIT-only programme or its dependency restrictions.
 
   * crates/bsl-metadata — the crate described itself as "a Rust port of
     the Java mdclasses library" (https://github.com/1c-syntax/mdclasses,
@@ -192,8 +228,9 @@ today carries no trace of this. It is therefore stated here.
     no code was copied. The behaviour was kept deliberately, so that the
     two tools report the same numbers on the same source.
 
-The licensing tier of crates/cfg and crates/bsl-metadata is under review
-in light of the above.
+The identified crates/cfg slice is closed as recorded above; the licensing
+tier of crates/bsl-metadata remains under review. Per-crate licenses and the
+restrictions arising from dependencies are unchanged.
 
 Compatibility with bsl-language-server
 --------------------------------------
@@ -225,7 +262,8 @@ the full statement.
 
 Upstream acknowledgements
 -------------------------
-  * rust-analyzer — architectural reference — MIT OR Apache-2.0
+  * rust-analyzer — architectural reference — MIT OR Apache-2.0; the
+    areas it shaped are listed under "Architecture heritage" above
   * bsl-parser — grammar reference used when the SDBL and BSL layers
     were first written — LGPL-3.0-or-later
   * bsl-language-server — deliberate compatibility target for the
@@ -253,6 +291,19 @@ Upstream acknowledgements
     Documents,Ext,HTTPServices,InformationRegisters,WebServices} —
     21 BSL files introduced by 4601ffcb, whose message records
     "Comprehensive test fixtures copied from bsl-language-server-rust".
+  * crates/bsl-metadata/fixtures/designer — 51 XML files introduced by the
+    same commit 4601ffcb (50 byte-identical to that import; Configuration.xml
+    was extended here afterwards). Listed file by file in LICENSING.md,
+    together with the method of the check. The other 22 non-BSL files in that
+    directory were added later, with this repository's own code; no external
+    source or marker was found for them.
+  * crates/ide-diagnostics/test_data/metadata/designer — 51 XML files,
+    a second copy of the same material, whose commit 8591e553 records
+    "Copy test configuration metadata/designer/ from Java project"
+    (bsl-language-server). No test used it; the directory has been removed
+    and remains only in history. Likewise
+    crates/ide-diagnostics/test_data/set_permissions_for_new_objects/Roles —
+    6 XML files identical in content, with no source named by their commit.
   * crates/bsl-platform/data/platform_data.json — © ООО «1С-Софт»,
     1C copyright, bundled for interoperability; see
     crates/bsl-platform/data/PROVENANCE.md

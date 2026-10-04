@@ -883,9 +883,10 @@ impl MetadataObject {
         self.register_records = records;
     }
 
-    /// Apply an extension overlay onto this object, replacing same-named members
-    /// and recursing into children. This is the single source of truth for
-    /// per-object extension merge semantics, shared by whole-configuration merge
+    /// Apply an extension overlay onto this object, replacing same-named members,
+    /// merging same-named tabular sections and recursing into children. Names
+    /// match case-insensitively, Cyrillic included. This is the single source of
+    /// truth for per-object extension merge semantics, shared by whole-configuration merge
     /// ([`crate::Configuration::merge_extension_overlay`]) and per-object
     /// resolution.
     pub fn apply_extension_overlay(&mut self, overlay: &MetadataObject) {
@@ -897,16 +898,15 @@ impl MetadataObject {
         }
 
         for attr in &overlay.attributes {
-            self.attributes.retain(|existing| !existing.name.eq_ignore_ascii_case(&attr.name));
+            self.attributes
+                .retain(|existing| !stdx::case::eq_ignore_case(&existing.name, &attr.name));
             self.attributes.push(attr.clone());
         }
 
         for tabular_section in &overlay.tabular_sections {
-            if let Some(base_section) = self
-                .tabular_sections
-                .iter_mut()
-                .find(|existing| existing.name().eq_ignore_ascii_case(tabular_section.name()))
-            {
+            if let Some(base_section) = self.tabular_sections.iter_mut().find(|existing| {
+                stdx::case::eq_ignore_case(existing.name(), tabular_section.name())
+            }) {
                 base_section.apply_extension_overlay(tabular_section);
             } else {
                 self.tabular_sections.push(tabular_section.clone());
@@ -916,7 +916,7 @@ impl MetadataObject {
         for child in &overlay.children {
             if let Some(base_child) = self.children.iter_mut().find(|existing| {
                 existing.mdo_type == child.mdo_type
-                    && existing.name.eq_ignore_ascii_case(&child.name)
+                    && stdx::case::eq_ignore_case(&existing.name, &child.name)
             }) {
                 base_child.apply_extension_overlay(child);
             } else {
@@ -926,13 +926,14 @@ impl MetadataObject {
 
         for enum_value in &overlay.enum_values {
             self.enum_values
-                .retain(|existing| !existing.name.eq_ignore_ascii_case(&enum_value.name));
+                .retain(|existing| !stdx::case::eq_ignore_case(&existing.name, &enum_value.name));
             self.enum_values.push(enum_value.clone());
         }
 
         for predefined_item in &overlay.predefined_items {
-            self.predefined_items
-                .retain(|existing| !existing.name.eq_ignore_ascii_case(&predefined_item.name));
+            self.predefined_items.retain(|existing| {
+                !stdx::case::eq_ignore_case(&existing.name, &predefined_item.name)
+            });
             self.predefined_items.push(predefined_item.clone());
         }
 
@@ -964,7 +965,7 @@ impl MetadataObject {
     pub fn adopts(&self, base: &MetadataObject) -> bool {
         self.object_belonging == crate::ObjectBelonging::Adopted
             && self.mdo_type == base.mdo_type
-            && self.name.eq_ignore_ascii_case(&base.name)
+            && stdx::case::eq_ignore_case(&self.name, &base.name)
             && base.uuid.as_ref().is_some_and(|uuid| Some(uuid) == self.extends_uuid())
     }
 

@@ -7,6 +7,7 @@ use bsl_types::builders::Builders;
 use bsl_types::facet::TableSource;
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{MetadataKind, Projection, TypeId, TypeKind};
+use bsl_types::testing::RootConfigCtx;
 use hir_def::Name;
 use smol_str::SmolStr;
 
@@ -21,7 +22,7 @@ pub(crate) fn resolve_iter_element_ty(db: &dyn TypeKernelDb, collection: TypeId)
 
 enum IterShape {
     Row { projection: Option<Arc<Projection>>, source: TableSource },
-    ArrayElement(TypeId),
+    Element(TypeId),
     Templates { templates: Vec<SmolStr>, context: Option<(MdoType, Name)> },
     Union(Vec<TypeId>),
     Unsupported,
@@ -38,16 +39,25 @@ fn resolve_iter_element_ty_inner(db: &dyn TypeKernelDb, collection: TypeId) -> O
             IterShape::Row { projection: f.projection.clone(), source: f.source }
         }
         TypeKind::PlatformObject(f) => from_name(f.name.as_str()),
-        TypeKind::MetadataRef(f) => match lookup_by_metadata_kind(f.kind) {
-            Some(templates) => {
-                let context = metadata_kind_to_prefix_and_mdo(f.kind)
-                    .map(|(_, mdo)| (mdo, Name::new(f.name.as_str())));
-                IterShape::Templates { templates, context }
-            }
-            None => IterShape::Unsupported,
+        // A tabular section iterates over its own rows: the same row facet that
+        // `Добавить()` returns, so both keep the section's column schema.
+        TypeKind::MetadataRef(f) => match f.kind {
+            MetadataKind::TabularSection { parent } => IterShape::Element(db.metadata_ref(
+                MetadataKind::TabularSectionRow { parent },
+                f.name.as_str().to_string(),
+                &RootConfigCtx,
+            )),
+            kind => match lookup_by_metadata_kind(kind) {
+                Some(templates) => {
+                    let context = metadata_kind_to_prefix_and_mdo(kind)
+                        .map(|(_, mdo)| (mdo, Name::new(f.name.as_str())));
+                    IterShape::Templates { templates, context }
+                }
+                None => IterShape::Unsupported,
+            },
         },
         TypeKind::Array(f) => match f.element {
-            Some(elem) => IterShape::ArrayElement(elem),
+            Some(elem) => IterShape::Element(elem),
             None => from_name("Массив"),
         },
         TypeKind::Map(_) => from_name("Соответствие"),
@@ -61,7 +71,7 @@ fn resolve_iter_element_ty_inner(db: &dyn TypeKernelDb, collection: TypeId) -> O
 
     match shape {
         IterShape::Row { projection, source } => Some(db.value_table_row(projection, source)),
-        IterShape::ArrayElement(elem) => Some(elem),
+        IterShape::Element(elem) => Some(elem),
         IterShape::Templates { templates, context } => resolve_templates(db, &templates, context),
         IterShape::Union(arms) => resolve_union(db, &arms),
         IterShape::Unsupported => None,

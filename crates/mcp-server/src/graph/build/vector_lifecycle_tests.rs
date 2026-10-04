@@ -73,29 +73,83 @@ fn emit(engine: &mut SearchEngine, source: &Path, rows: &[ide::ChunkRow]) {
     writer.finish(bsl_search::lifecycle::Outcome::Completed);
 }
 
-fn seed(source: &Path) -> (SearchEngine, Vec<ide::ChunkRow>) {
+fn row(path: &Path, symbol: &str) -> ide::ChunkRow {
+    ide::ChunkRow {
+        path: path.to_string_lossy().replace('\\', "/"),
+        symbol: symbol.into(),
+        kind: bsl_search::ChunkKind::Procedure,
+        is_export: false,
+        annotations: Vec::new(),
+        line_start: 1,
+        line_end: 2,
+        text: "canary source text must not enter lifecycle records".into(),
+        graph_context: None,
+    }
+}
+
+fn seed_with_roots(source: &Path, install_roots: bool) -> (SearchEngine, Vec<ide::ChunkRow>) {
     let file = source.join("Module.bsl");
     std::fs::write(&file, "Процедура Делать()\nКонецПроцедуры").unwrap();
-    let rows = ["A", "B"]
-        .into_iter()
-        .map(|name| ide::ChunkRow {
-            path: file.canonicalize().unwrap().to_string_lossy().replace('\\', "/"),
-            symbol: name.into(),
-            kind: bsl_search::ChunkKind::Procedure,
-            is_export: false,
-            annotations: Vec::new(),
-            line_start: 1,
-            line_end: 2,
-            text: "canary source text must not enter lifecycle records".into(),
-            graph_context: None,
-        })
-        .collect::<Vec<_>>();
+    let file = file.canonicalize().unwrap();
+    let rows = ["A", "B"].into_iter().map(|name| row(&file, name)).collect::<Vec<_>>();
     let mut engine = SearchEngine::fts_only(&source.join("search.db")).unwrap();
+    if install_roots {
+        let (roots, rejected) = bsl_search::WorkspaceRoots::build(source, source, &[]);
+        assert!(rejected.is_empty());
+        engine.set_workspace_roots(roots);
+        assert!(engine.workspace_roots().is_some(), "the root-table branch must be exercised");
+    }
     emit(&mut engine, source, &rows);
     let pending = engine.store().load_pending_embedding_documents("code").unwrap();
     assert_eq!(pending.len(), 2);
     engine.store().set_chunk_embedding(pending[0].0, &[0.1, 0.2]).unwrap();
     (engine, rows)
+}
+
+fn seed(source: &Path) -> (SearchEngine, Vec<ide::ChunkRow>) {
+    seed_with_roots(source, false)
+}
+
+fn rootless_source(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        let canonical = dir.path().join("canonical-cf");
+        let declared = dir.path().join("declared-cf");
+        std::fs::create_dir(&canonical).unwrap();
+        std::os::unix::fs::symlink(&canonical, &declared).unwrap();
+        assert_ne!(declared.canonicalize().unwrap(), declared);
+        declared
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().to_path_buf()
+    }
+}
+
+fn assert_read_error_preserves_rows_and_vectors(
+    source: &Path,
+    mut engine: SearchEngine,
+    rows: &[ide::ChunkRow],
+) {
+    let before_rows = engine.store().load_indexed_documents(Some("code")).unwrap();
+    let before_files = engine.store().all_files_in_collection("code").unwrap();
+    let before_vectors = engine.store().load_all_embeddings(2).unwrap();
+    let generation = engine.store().embedding_generation().unwrap();
+    std::fs::remove_file(source.join("Module.bsl")).unwrap();
+
+    let records = capture(|| emit(&mut engine, source, rows));
+    let decision = records
+        .iter()
+        .find(|record| record["kind"] == "decision")
+        .unwrap_or_else(|| panic!("missing decision in lifecycle records: {records:#?}"));
+    assert_eq!(decision["reason"], "read_error", "lifecycle records: {records:#?}");
+    assert_eq!(decision["examples"], serde_json::json!([":Module.bsl"]));
+    assert!(!records.iter().any(|record| record["kind"] == "mutation"));
+    assert_eq!(engine.store().load_indexed_documents(Some("code")).unwrap(), before_rows);
+    assert_eq!(engine.store().all_files_in_collection("code").unwrap(), before_files);
+    assert_eq!(engine.store().load_all_embeddings(2).unwrap(), before_vectors);
+    assert_eq!(engine.store().embedding_generation().unwrap(), generation);
+    assert_eq!(engine.store().chunk_count().unwrap(), 2);
 }
 
 fn assert_replacement(records: &[Value], reason: &str) {
@@ -193,42 +247,49 @@ fn vector_lifecycle_cleared_hash_and_missing_record_keep_distinct_causes() {
 
 #[test]
 fn vector_lifecycle_read_error_preserves_rows_and_vectors() {
-    for registered in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        assert_read_error_preserves_rows_and_vectors(dir.path(), registered);
-    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = rootless_source(&dir);
+    let (engine, rows) = seed(&source);
+    assert_read_error_preserves_rows_and_vectors(&source, engine, &rows);
+}
+
+#[test]
+fn vector_lifecycle_read_error_with_root_table_preserves_rows_and_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, rows) = seed_with_roots(dir.path(), true);
+    assert_read_error_preserves_rows_and_vectors(dir.path(), engine, &rows);
 }
 
 #[cfg(unix)]
 #[test]
-fn vector_lifecycle_read_error_through_symlinked_root_preserves_rows_and_vectors() {
-    for registered in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        let alias = dir.path().join("walked-root");
-        std::fs::create_dir(&source).unwrap();
-        std::os::unix::fs::symlink(&source, &alias).unwrap();
-        assert_read_error_preserves_rows_and_vectors(&alias, registered);
-    }
+fn vector_lifecycle_read_error_through_symlinked_root_with_root_table_preserves_rows_and_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = rootless_source(&dir);
+    let (engine, rows) = seed_with_roots(&source, true);
+    assert_read_error_preserves_rows_and_vectors(&source, engine, &rows);
 }
 
-fn assert_read_error_preserves_rows_and_vectors(source: &Path, registered: bool) {
-    let (mut engine, rows) = seed(source);
-    if registered {
-        let (roots, rejected) = bsl_search::WorkspaceRoots::build(source, source, &[]);
-        assert!(rejected.is_empty());
-        engine.set_workspace_roots(roots);
+#[test]
+fn vector_lifecycle_missing_prefix_neighbor_stays_outside_with_or_without_root_table() {
+    for install_roots in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cf");
+        let outsider_dir = dir.path().join("cf_ext");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outsider_dir).unwrap();
+        let (mut engine, rows) = seed_with_roots(&source, install_roots);
+        let before_rows = engine.store().load_indexed_documents(Some("code")).unwrap();
+        let outsider = row(&outsider_dir.join("Module.bsl"), "Outsider");
+
+        let records = capture(|| emit(&mut engine, &source, &[rows[0].clone(), outsider]));
+        let decisions =
+            records.iter().filter(|record| record["kind"] == "decision").collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 1, "lifecycle records: {records:#?}");
+        assert_eq!(decisions[0]["reason"], "unchanged");
+        assert_eq!(decisions[0]["examples"], serde_json::json!([":Module.bsl"]));
+        assert_eq!(engine.store().load_indexed_documents(Some("code")).unwrap(), before_rows);
+        assert_eq!(engine.store().chunk_count().unwrap(), 2);
     }
-    let before = engine.store().load_all_embeddings(2).unwrap();
-    let generation = engine.store().embedding_generation().unwrap();
-    std::fs::remove_file(source.join("Module.bsl")).unwrap();
-    let records = capture(|| emit(&mut engine, source, &rows));
-    let decision = records.iter().find(|r| r["kind"] == "decision").unwrap();
-    assert_eq!(decision["reason"], "read_error");
-    assert!(!records.iter().any(|r| r["kind"] == "mutation"));
-    assert_eq!(engine.store().load_all_embeddings(2).unwrap(), before);
-    assert_eq!(engine.store().embedding_generation().unwrap(), generation);
-    assert_eq!(engine.store().chunk_count().unwrap(), 2);
 }
 
 #[test]

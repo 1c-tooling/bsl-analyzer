@@ -23,8 +23,9 @@ pub use file_role::{
     file_role, is_bsl_source_path, is_common_module_body_path, is_metadata_path,
     is_substrate_listed_body_path, FileRole, METADATA_WATCHED_EXTENSIONS, SOURCE_EXTENSIONS,
 };
-pub use path_scope::{PathScope, Spellings};
+pub use path_scope::{PathScope, ResolvedDirs, Spellings};
 pub use source_set::SourceSet;
+pub use stdx::path_exclusion::ExcludedPaths;
 pub use workspace_walk::{
     path_crosses_a_link_cycle, walk_workspace_roots, WalkOutcome, WalkedFile,
 };
@@ -273,12 +274,20 @@ pub struct Project {
     extension_paths: Vec<(String, PathBuf)>,
     external_paths: Vec<(String, PathBuf)>,
     topology: ExtensionTopology,
+    /// `[source].exclude`, resolved. Wins over every root, declared or discovered.
+    exclusions: ExcludedPaths,
+    /// Whether the exclusions removed a root the project would otherwise have had.
+    /// Such a project must not fall back to the workspace root as an anonymous source
+    /// root: the user narrowed the project, and the fallback would widen it instead.
+    sources_cut: bool,
 }
 
 /// What discovery found at the places a main configuration is expected.
 struct DiscoveredSource {
     configuration: Option<PathBuf>,
     extension: Option<PathBuf>,
+    /// A configuration was declared or found, and the user excluded it.
+    excluded: bool,
 }
 
 impl Project {
@@ -296,15 +305,26 @@ impl Project {
         config: ProjectConfig,
     ) -> Result<Self, ProjectError> {
         let root = root.into();
+        let exclusions = config.source_exclusions(&root)?;
         let DiscoveredSource {
             configuration: source_path,
             extension: extension_in_config_location,
-        } = Self::discover_source_path(&root, &config)?;
-        let specs = Self::resolve_extension_specs(&root, &config)?;
+            excluded: base_excluded,
+        } = Self::discover_source_path(&root, &config, &exclusions)?;
+        let mut candidates_cut = false;
+        let specs =
+            Self::resolve_extension_specs(&root, &config, &exclusions, &mut candidates_cut)?;
         let base_path = source_path.as_deref().unwrap_or(&root);
         let canonical_base =
             std::fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
-        let topology = ExtensionTopology::build(&canonical_base, specs)?;
+        let mut topology = ExtensionTopology::build(&canonical_base, specs)?;
+        let node_excluded = |node: &extension_topology::ExtensionNode| {
+            exclusions.is_excluded(node.path()) || exclusions.is_excluded(node.canonical_path())
+        };
+        let nodes_cut = topology.nodes().iter().any(node_excluded);
+        if nodes_cut {
+            topology = topology.retain(&canonical_base, |node| !node_excluded(node));
+        }
         let paths_of_kind = |external: bool| -> Vec<(String, PathBuf)> {
             topology
                 .nodes()
@@ -323,7 +343,19 @@ impl Project {
             extension_paths,
             external_paths,
             topology,
+            exclusions,
+            sources_cut: base_excluded || candidates_cut || nodes_cut,
         })
+    }
+
+    /// The directories the user took out of the project with `[source].exclude`.
+    pub fn source_exclusions(&self) -> &ExcludedPaths {
+        &self.exclusions
+    }
+
+    /// Whether `path` lies in a directory the user took out of the project.
+    pub fn is_source_excluded(&self, path: &Path) -> bool {
+        self.exclusions.is_excluded_resolved(path)
     }
 
     pub fn source_path(&self) -> &Path {
@@ -334,6 +366,9 @@ impl Project {
     /// resolved extension root. Scoping a file walk to these (instead of the raw
     /// project root) excludes vendored/build copies like `.build/vendor` that would
     /// otherwise be analyzed as a duplicate configuration.
+    ///
+    /// Empty when the user excluded every root, the workspace root included: an empty
+    /// project is what was asked for, not a reason to fall back to a wider one.
     pub fn source_roots(&self) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         if let Some(source_path) = self.configuration_path() {
@@ -341,10 +376,17 @@ impl Project {
         }
         roots.extend(self.extension_paths.iter().map(|(_, path)| path.clone()));
         roots.extend(self.external_paths.iter().map(|(_, path)| path.clone()));
-        if roots.is_empty() {
+        if roots.is_empty() && self.anonymous_root_allowed() {
             roots.push(self.root.clone());
         }
         roots
+    }
+
+    /// Whether the workspace root may stand in as the anonymous source root of a project
+    /// that found nothing else — not when the user removed what it did find, and not
+    /// when the user excluded the workspace root itself.
+    fn anonymous_root_allowed(&self) -> bool {
+        !self.sources_cut && !self.exclusions.is_excluded_resolved(&self.root)
     }
 
     pub fn configuration_path(&self) -> Option<&Path> {
@@ -409,8 +451,10 @@ impl Project {
     /// anonymous source root.
     pub fn semantic_base_path(&self) -> Option<&Path> {
         self.configuration_path().or_else(|| {
-            (self.extension_paths.is_empty() && self.external_paths.is_empty())
-                .then_some(self.root.as_path())
+            (self.extension_paths.is_empty()
+                && self.external_paths.is_empty()
+                && self.anonymous_root_allowed())
+            .then_some(self.root.as_path())
         })
     }
 
@@ -780,8 +824,13 @@ impl Project {
     fn discover_source_path(
         root: &Path,
         config: &ProjectConfig,
+        exclusions: &ExcludedPaths,
     ) -> Result<DiscoveredSource, ConfigLoadError> {
-        let found = |path: PathBuf| DiscoveredSource { configuration: Some(path), extension: None };
+        let found = |path: PathBuf| DiscoveredSource {
+            configuration: Some(path),
+            extension: None,
+            excluded: false,
+        };
         // A directory that carries `Configuration.xml` where a MAIN configuration is
         // expected, but turned out to be an extension. It is not a base and does not
         // become a source root, yet it is what makes this project a base-less
@@ -791,6 +840,16 @@ impl Project {
             let path = config
                 .resolve_configuration_path(root)?
                 .expect("configured source resolves to a path");
+            // Decided before anything inside is read, and final: the user excluded the
+            // configuration they declared, so no other directory is searched in its place.
+            if exclusions.is_excluded_resolved(&path) {
+                tracing::info!(?path, "configured source root is excluded by [source].exclude");
+                return Ok(DiscoveredSource {
+                    configuration: None,
+                    extension: None,
+                    excluded: true,
+                });
+            }
             if configuration_xml_in(&path).is_some() {
                 tracing::info!(?path, "found explicitly configured 1C configuration");
                 return Ok(found(path));
@@ -805,7 +864,8 @@ impl Project {
             tracing::warn!(?path, "configuration root specified but Configuration.xml not found");
         }
 
-        match search_configuration(root, 2) {
+        let mut excluded = false;
+        match search_configuration(root, 2, exclusions, &mut excluded) {
             SearchOutcome::Configuration(path) => {
                 tracing::info!(?path, "found Configuration.xml by search");
                 return Ok(found(path));
@@ -816,6 +876,10 @@ impl Project {
 
         for pattern in &["src/cf", "Configuration"] {
             let path = root.join(pattern);
+            if exclusions.is_excluded_resolved(&path) {
+                excluded |= configuration_xml_in(&path).is_some();
+                continue;
+            }
             if configuration_xml_in(&path).is_none() {
                 continue;
             }
@@ -828,7 +892,7 @@ impl Project {
         }
 
         tracing::debug!(?root, "no 1C configuration found");
-        Ok(DiscoveredSource { configuration: None, extension })
+        Ok(DiscoveredSource { configuration: None, extension, excluded })
     }
 
     pub fn extension_paths(&self) -> &[(String, PathBuf)] {
@@ -854,7 +918,8 @@ impl Project {
         root: &Path,
         config: &ProjectConfig,
     ) -> Result<Vec<(String, PathBuf)>, TopologyError> {
-        let specs = Self::resolve_extension_specs(root, config)?;
+        let specs =
+            Self::resolve_extension_specs(root, config, &ExcludedPaths::default(), &mut false)?;
         Ok(specs.into_iter().map(|spec| (spec.name, spec.path)).collect())
     }
 
@@ -866,9 +931,16 @@ impl Project {
     /// non-extension path is skipped with a warning and textual path variants
     /// collapse silently. Structured entries carry a user-declared identity, so
     /// for them every such degradation is an error instead.
+    ///
+    /// Discovery — the conventional layouts and a declared glob — never looks inside a
+    /// directory the user excluded, and sets `cut` when it passed one over. A literally
+    /// declared entry is still resolved and validated as declared; the caller removes it
+    /// from the topology afterwards, so an excluded dependency stays a legal name.
     fn resolve_extension_specs(
         root: &Path,
         config: &ProjectConfig,
+        exclusions: &ExcludedPaths,
+        cut: &mut bool,
     ) -> Result<Vec<ExtensionNodeSpec>, TopologyError> {
         enum Candidate {
             Legacy(PathBuf),
@@ -881,7 +953,9 @@ impl Project {
             // (including an empty one, i.e. opt-out) is taken as authoritative.
             None => {
                 candidates.extend(
-                    Self::auto_discover_extensions(root).into_iter().map(Candidate::Legacy),
+                    Self::auto_discover_extensions(root, exclusions, cut)
+                        .into_iter()
+                        .map(Candidate::Legacy),
                 );
             }
             Some(list) => {
@@ -890,7 +964,7 @@ impl Project {
                         ExtensionDecl::Path(ext_path_str) => {
                             if ext_path_str.contains('*') {
                                 candidates.extend(
-                                    expand_extension_glob(root, ext_path_str)
+                                    expand_extension_glob(root, ext_path_str, exclusions, cut)
                                         .into_iter()
                                         .map(Candidate::Legacy),
                                 );
@@ -987,7 +1061,7 @@ impl Project {
         // and enters with a unique name so that it is indistinguishable from a
         // declared one afterwards.
         match &config.externals {
-            None => Self::discover_externals(root, &mut specs, &mut seen),
+            None => Self::discover_externals(root, exclusions, cut, &mut specs, &mut seen),
             Some(list) => Self::declare_externals(root, list, &mut specs, &mut seen)?,
         }
         Ok(specs)
@@ -1053,6 +1127,8 @@ impl Project {
     /// one. What remains has a unique name and is a structured node.
     fn discover_externals(
         root: &Path,
+        exclusions: &ExcludedPaths,
+        cut: &mut bool,
         specs: &mut Vec<ExtensionNodeSpec>,
         seen: &mut std::collections::HashMap<PathBuf, usize>,
     ) {
@@ -1063,7 +1139,7 @@ impl Project {
             .collect();
         let mut seen_objects: std::collections::HashMap<(ExternalObjectKind, String), usize> =
             std::collections::HashMap::new();
-        for path in Self::auto_discover_externals(root) {
+        for path in Self::auto_discover_externals(root, exclusions, cut) {
             let (kind, object) = match classify_external_root(&path) {
                 Ok(classified) => classified,
                 Err(problem) => {
@@ -1132,11 +1208,16 @@ impl Project {
     /// come back in path order across both families, because a name collision
     /// keeps the first by path: family order would otherwise decide it when a
     /// family fell back to its bare container.
-    fn auto_discover_externals(root: &Path) -> Vec<PathBuf> {
+    fn auto_discover_externals(
+        root: &Path,
+        exclusions: &ExcludedPaths,
+        cut: &mut bool,
+    ) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for family in [["src/epf", "epf"], ["src/erf", "erf"]] {
             if let Some(parent) = family.into_iter().find(|parent| root.join(parent).is_dir()) {
-                let candidates = expand_extension_glob(root, &format!("{parent}/*"));
+                let candidates =
+                    expand_extension_glob(root, &format!("{parent}/*"), exclusions, cut);
                 tracing::info!(
                     parent,
                     count = candidates.len(),
@@ -1152,10 +1233,14 @@ impl Project {
     /// Zero-config extension discovery: the first conventional extensions directory
     /// that exists wins, contributing each of its immediate child directories as a
     /// candidate (later validated for `Configuration.xml`).
-    fn auto_discover_extensions(root: &Path) -> Vec<PathBuf> {
+    fn auto_discover_extensions(
+        root: &Path,
+        exclusions: &ExcludedPaths,
+        cut: &mut bool,
+    ) -> Vec<PathBuf> {
         for parent in ["src/cfe", "cfe", "Расширения"] {
             if root.join(parent).is_dir() {
-                let found = expand_extension_glob(root, &format!("{parent}/*"));
+                let found = expand_extension_glob(root, &format!("{parent}/*"), exclusions, cut);
                 tracing::info!(parent, count = found.len(), "auto-discovered extension candidates");
                 return found;
             }
@@ -1373,7 +1458,20 @@ fn relative_baseline_path(
 /// (e.g. `src/cfe/*` or `src/cfe/БУС_*`) into every immediate child directory
 /// of the parent that matches the wildcard. The wildcard is only honoured in
 /// the last segment; results are sorted for deterministic source-root ordering.
-fn expand_extension_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
+///
+/// An excluded parent is not listed at all, and an excluded child is not returned.
+/// `cut` is set only for an excluded child that carries a root marker — the
+/// `Configuration.xml` of an extension or the object XML at the top of an external's
+/// directory — looked up by name and never descended into: a directory that merely
+/// matches the pattern was never going to be a root, and treating it as one would
+/// take the workspace fallback away from a project that never had another root. An
+/// excluded parent is not listed, so what it held is not known and nothing is cut.
+fn expand_extension_glob(
+    root: &Path,
+    pattern: &str,
+    exclusions: &ExcludedPaths,
+    cut: &mut bool,
+) -> Vec<PathBuf> {
     let normalized = pattern.replace('\\', "/");
     let (parent_rel, name_pattern) = match normalized.rsplit_once('/') {
         Some((parent, name)) => (parent, name),
@@ -1391,6 +1489,9 @@ fn expand_extension_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         return Vec::new();
     }
     let parent_dir = if parent_rel.is_empty() { root.to_path_buf() } else { root.join(parent_rel) };
+    if exclusions.is_excluded_resolved(&parent_dir) {
+        return Vec::new();
+    }
     let entries = match std::fs::read_dir(&parent_dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -1407,9 +1508,27 @@ fn expand_extension_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter(|entry| wildcard_matches(name_pattern, &entry.file_name().to_string_lossy()))
         .map(|entry| entry.path())
+        .filter(|path| {
+            let excluded = exclusions.is_excluded_resolved(path);
+            *cut |= excluded && carries_root_marker(path);
+            !excluded
+        })
         .collect();
     matched.sort();
     matched
+}
+
+/// Whether `dir` names a root by its own marker file: `Configuration.xml` inside it,
+/// or the object XML an exported external keeps at its top. Only the names directly
+/// in `dir` are listed; nothing below it is read.
+fn carries_root_marker(dir: &Path) -> bool {
+    configuration_xml_in(dir).is_some()
+        || std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_type().is_ok_and(|t| t.is_file())
+                    && bsl_conventions::has_extension(&entry.path(), bsl_conventions::XML_EXTENSION)
+            })
+        })
 }
 
 /// Case-insensitive single-segment wildcard match where `*` matches any run of
@@ -1554,9 +1673,17 @@ enum SearchOutcome {
     None,
 }
 
-fn search_configuration(root: &Path, max_depth: usize) -> SearchOutcome {
+/// `excluded` is set when the search passed over an excluded directory that carries a
+/// `Configuration.xml` — a configuration the user took out, which is looked at only as
+/// far as its presence and never descended into.
+fn search_configuration(
+    root: &Path,
+    max_depth: usize,
+    exclusions: &ExcludedPaths,
+    excluded: &mut bool,
+) -> SearchOutcome {
     let mut extension = None;
-    match search_configuration_recursive(root, max_depth, 0, &mut extension) {
+    match search_configuration_recursive(root, max_depth, 0, exclusions, excluded, &mut extension) {
         Some(path) => SearchOutcome::Configuration(path),
         None => match extension {
             Some(path) => SearchOutcome::Extension(path),
@@ -1573,9 +1700,15 @@ fn search_configuration_recursive(
     dir: &Path,
     max_depth: usize,
     current_depth: usize,
+    exclusions: &ExcludedPaths,
+    excluded: &mut bool,
     extension: &mut Option<PathBuf>,
 ) -> Option<PathBuf> {
     if current_depth > max_depth {
+        return None;
+    }
+    if exclusions.is_excluded_resolved(dir) {
+        *excluded |= configuration_xml_in(dir).is_some();
         return None;
     }
 
@@ -1599,6 +1732,8 @@ fn search_configuration_recursive(
                                 &entry.path(),
                                 max_depth,
                                 current_depth + 1,
+                                exclusions,
+                                excluded,
                                 extension,
                             ) {
                                 return Some(path);
@@ -2040,6 +2175,11 @@ pub struct ProjectConfig {
     #[serde(default, rename = "configuration")]
     pub configuration_dependency: Option<ConfigurationDependency>,
 
+    /// `[source].exclude`: directories taken out of the project, as literal paths
+    /// relative to the directory of the config file. Only the TOML config carries it.
+    #[serde(skip)]
+    pub source_exclude: Vec<String>,
+
     #[serde(default, alias = "target_platform_version")]
     pub target_platform_version: Option<String>,
 
@@ -2195,6 +2335,7 @@ impl ProjectConfig {
     }
 
     fn validate_configuration_source(&self) -> Result<(), ConfigLoadError> {
+        self.validate_source_exclude()?;
         if self.configuration_root.is_some() && self.configuration_dependency.is_some() {
             return Err(
                 self.config_error("[source] cannot define both root and configuration".to_owned())
@@ -2211,6 +2352,43 @@ impl ProjectConfig {
             }
         }
         Ok(())
+    }
+
+    /// Each `[source].exclude` value must name a directory relative to the config file.
+    /// An absolute path or an empty value is refused rather than ignored: a silently
+    /// dropped exclusion would put the very tree the user meant to hide back into
+    /// the project.
+    fn validate_source_exclude(&self) -> Result<(), ConfigLoadError> {
+        for value in &self.source_exclude {
+            if value.trim().is_empty() {
+                return Err(
+                    self.config_error("source.exclude entries must not be empty".to_owned())
+                );
+            }
+            let path = Path::new(value);
+            // A drive-relative Windows value (`C:tmp`) is neither absolute nor rooted,
+            // yet `join` would let it replace the config directory it must be read from.
+            let prefixed = path.components().any(|c| matches!(c, std::path::Component::Prefix(_)));
+            if path.is_absolute() || path.has_root() || prefixed {
+                return Err(self.config_error(format!(
+                    "source.exclude entry {value:?} must be a path relative to the config file"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[source].exclude` resolved against the directory of the config file — not the
+    /// source root and not the working directory — or against `project_root` for a
+    /// config that did not come from a file.
+    pub fn source_exclusions(
+        &self,
+        project_root: &Path,
+    ) -> Result<stdx::path_exclusion::ExcludedPaths, ConfigLoadError> {
+        self.validate_source_exclude()?;
+        Ok(stdx::path_exclusion::ExcludedPaths::new(
+            self.source_exclude.iter().map(|value| self.resolve_config_path(project_root, value)),
+        ))
     }
 
     pub fn resolve_configuration_path(
@@ -2292,7 +2470,10 @@ impl ProjectConfig {
         tracing::info!(path = ?cfg_path, "Loading 1C metadata");
         let start = std::time::Instant::now();
 
-        match bsl_metadata::load_from_directory(&cfg_path) {
+        // The same exclusions every other reader of this project honours: nothing inside
+        // them is listed or read, and an excluded root loads as an empty configuration.
+        let excluded = self.source_exclusions(workspace_root)?;
+        match bsl_metadata::load_from_directory_scoped(&cfg_path, &excluded) {
             Ok(config) => {
                 let elapsed = start.elapsed();
                 tracing::info!(
@@ -2956,6 +3137,8 @@ struct TomlSourceConfig {
     extensions: Option<Vec<ExtensionDecl>>,
     #[serde(default)]
     externals: Option<Vec<ExternalDecl>>,
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3021,6 +3204,7 @@ impl From<TomlConfig> for ProjectConfig {
             formatting: toml.formatting,
             configuration_root: toml.source.root,
             configuration_dependency: toml.source.configuration,
+            source_exclude: toml.source.exclude,
             target_platform_version: toml.target_platform_version,
             language: None,
             extensions: toml.source.extensions,
@@ -3489,7 +3673,8 @@ mod tests {
         FeaturesConfig, PostgresAccessMode, Project, ProjectConfig, ProjectDiagnosticsConfig,
         ProjectError, ResolvePostgresUrlError, SearchBaselineBackend, SearchBaselinePolicyConfig,
         SearchBaselineSupportState, SearchPostgresConfig, SearchPostgresCredentialHelperConfig,
-        SourceSetOverride, StructuredExtensionDecl, TopologyError, WorkspaceDiagnosticsScope,
+        SourceSet, SourceSetOverride, StructuredExtensionDecl, TopologyError,
+        WorkspaceDiagnosticsScope,
     };
     use super::{configuration_kind, ConfigurationKind};
     use super::{dotenv_value, parse_dotenv_value};
@@ -4849,6 +5034,295 @@ extensions = [{ name = "T" }]
         let empty: super::TomlConfig =
             toml::from_str("[source]\nroot = \"src/cf\"\nextensions = []\n").unwrap();
         assert_eq!(ProjectConfig::from(empty).extensions, Some(vec![]), "[] → Some([]) (opt-out)");
+    }
+
+    #[test]
+    fn source_exclude_is_resolved_from_the_config_directory_not_the_source_root() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("project");
+        let config_dir = project_root.join("ci");
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("bsl-analyzer.toml");
+        fs::write(&path, "[source]\nroot = \"../src/cf\"\nexclude = [\".tmp\"]\n").unwrap();
+
+        let config = ProjectConfig::load_from_file(&path).unwrap();
+        let excluded = config.source_exclusions(&project_root).unwrap();
+
+        assert!(excluded.is_excluded(&config_dir.join(".tmp/Module.bsl")));
+        assert!(!excluded.is_excluded(&project_root.join("src/cf/.tmp/Module.bsl")));
+        assert!(!excluded.is_excluded(&project_root.join(".tmp/Module.bsl")));
+
+        fs::write(&path, "[source]\nroot = \"../src/cf\"\nexclude = [\".\"]\n").unwrap();
+        let nested =
+            ProjectConfig::load_from_file(&path).unwrap().source_exclusions(&project_root).unwrap();
+        assert!(nested.is_excluded(&config_dir.join("anything/Module.bsl")));
+        assert!(
+            !nested.is_excluded(&project_root.join("src/cf/Module.bsl")),
+            "a nested config resolved '.' from the project root instead of its own directory"
+        );
+    }
+
+    #[test]
+    fn source_exclude_is_resolved_from_an_external_config_directory() {
+        let project = tempdir().unwrap();
+        let config = tempdir().unwrap();
+        let path = config.path().join("bsl-analyzer.toml");
+        fs::write(&path, "[source]\nroot = \".\"\nexclude = [\".\"]\n").unwrap();
+
+        let exclusions = ProjectConfig::load_from_file(&path)
+            .unwrap()
+            .source_exclusions(project.path())
+            .unwrap();
+
+        assert!(exclusions.is_excluded(&config.path().join("nested/Hidden.bsl")));
+        assert!(
+            !exclusions.is_excluded(&project.path().join("Allowed.bsl")),
+            "an external config resolved its exclusion from the project directory"
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_source_exclude_is_the_same_as_an_absent_one() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/Allowed.bsl"), "").unwrap();
+        let path = root.join("bsl-analyzer.toml");
+
+        let load = |body: &str| {
+            fs::write(&path, body).unwrap();
+            let config = ProjectConfig::load_from_file(&path).unwrap();
+            let exclusions = config.source_exclusions(root).unwrap();
+            let project = Project::with_config(root, config).unwrap();
+            let scan = SourceSet::scan_in_scope(&project.source_roots(), &[], &exclusions);
+            (
+                exclusions,
+                project.source_roots(),
+                project.semantic_base_path().map(|path| path.to_path_buf()),
+                scan,
+            )
+        };
+
+        let absent = load("[source]\nroot = \"src\"\n");
+        let explicit = load("[source]\nroot = \"src\"\nexclude = []\n");
+        assert_eq!(absent.0, explicit.0);
+        assert_eq!(absent.1, explicit.1);
+        assert_eq!(absent.2, explicit.2);
+        let signature = |scan: &SourceSet| {
+            scan.files
+                .iter()
+                .map(|file| (file.walked.clone(), file.canonical.clone(), file.role))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&absent.3), signature(&explicit.3));
+        assert!(explicit.3.files.iter().any(|file| file.walked.ends_with("Allowed.bsl")));
+    }
+
+    #[test]
+    fn source_exclude_rejects_non_lists_absolute_paths_and_empty_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bsl-analyzer.toml");
+
+        fs::write(&path, "[source]\nexclude = \".tmp\"\n").unwrap();
+        assert!(ProjectConfig::load_from_file(&path).is_err(), "a string is not the list contract");
+
+        let absolute = dir.path().join("outside");
+        fs::write(&path, format!("[source]\nexclude = [{:?}]\n", absolute.to_string_lossy()))
+            .unwrap();
+        assert!(ProjectConfig::load_from_file(&path).is_err(), "an absolute path was accepted");
+
+        fs::write(&path, "[source]\nexclude = [\"\"]\n").unwrap();
+        assert!(ProjectConfig::load_from_file(&path).is_err(), "an empty path was accepted");
+    }
+
+    #[test]
+    fn excluding_every_declared_source_yields_an_intentionally_empty_project() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_configuration_xml(&root.join("src/cf"), "<Configuration/>");
+        touch_extension(root, "src/cfe/VisibleWithoutExclude");
+
+        let ordinary = Project::with_config(
+            root,
+            ProjectConfig {
+                configuration_root: Some("src/cf".to_owned()),
+                extensions: Some(vec!["src/cfe/VisibleWithoutExclude".into()]),
+                ..ProjectConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ordinary.source_roots().len(), 2, "positive control: both roots exist");
+
+        let excluded = Project::with_config(
+            root,
+            ProjectConfig {
+                configuration_root: Some("src/cf".to_owned()),
+                extensions: Some(vec!["src/cfe/VisibleWithoutExclude".into()]),
+                source_exclude: vec!["src".to_owned()],
+                ..ProjectConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(excluded.source_roots().is_empty(), "the workspace fallback restored the roots");
+        assert!(excluded.semantic_base_path().is_none(), "an excluded base stayed semantic");
+    }
+
+    #[test]
+    fn exclusions_apply_to_the_descriptorless_fallback_and_to_a_discovered_configuration() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/.tmp")).unwrap();
+        fs::write(root.join("src/Allowed.bsl"), "").unwrap();
+        fs::write(root.join("src/.tmp/Hidden.bsl"), "").unwrap();
+        let config = ProjectConfig {
+            configuration_root: Some("src".to_owned()),
+            source_exclude: vec!["src/.tmp".to_owned()],
+            ..ProjectConfig::default()
+        };
+
+        let fallback = Project::with_config(root, config.clone()).unwrap();
+        assert_eq!(fallback.source_roots(), [root.to_path_buf()]);
+        let fallback_scan = crate::SourceSet::scan_in_scope(
+            &fallback.source_roots(),
+            &[],
+            fallback.source_exclusions(),
+        );
+        assert!(fallback_scan.files.iter().any(|file| file.walked.ends_with("src/Allowed.bsl")));
+        assert!(fallback_scan.files.iter().all(|file| !file.walked.ends_with("Hidden.bsl")));
+
+        write_configuration_xml(&root.join("src"), "<Configuration/>");
+        let discovered = Project::with_config(root, config).unwrap();
+        assert_eq!(discovered.source_roots(), [root.join("src")]);
+        let discovered_scan = crate::SourceSet::scan_in_scope(
+            &discovered.source_roots(),
+            &[],
+            discovered.source_exclusions(),
+        );
+        assert!(discovered_scan.files.iter().any(|file| file.walked.ends_with("Allowed.bsl")));
+        assert!(discovered_scan.files.iter().all(|file| !file.walked.ends_with("Hidden.bsl")));
+
+        let root_mode_dir = tempdir().unwrap();
+        let project_root = root_mode_dir.path();
+        fs::create_dir_all(project_root.join(".tmp")).unwrap();
+        fs::write(project_root.join("Allowed.bsl"), "").unwrap();
+        fs::write(project_root.join(".tmp/Hidden.bsl"), "").unwrap();
+        let root_config = ProjectConfig {
+            configuration_root: Some(".".to_owned()),
+            source_exclude: vec![".tmp".to_owned()],
+            ..ProjectConfig::default()
+        };
+        let before_descriptor = Project::with_config(project_root, root_config.clone()).unwrap();
+        assert_eq!(before_descriptor.source_roots(), [project_root.to_path_buf()]);
+        let before_scan = crate::SourceSet::scan_in_scope(
+            &before_descriptor.source_roots(),
+            &[],
+            before_descriptor.source_exclusions(),
+        );
+        assert!(before_scan.files.iter().any(|file| file.walked.ends_with("Allowed.bsl")));
+        assert!(before_scan.files.iter().all(|file| !file.walked.ends_with("Hidden.bsl")));
+
+        write_configuration_xml(project_root, "<Configuration/>");
+        let root_discovered = Project::with_config(project_root, root_config).unwrap();
+        assert_eq!(root_discovered.source_roots(), [project_root.to_path_buf()]);
+        let root_scan = crate::SourceSet::scan_in_scope(
+            &root_discovered.source_roots(),
+            &[],
+            root_discovered.source_exclusions(),
+        );
+        assert!(root_scan.files.iter().any(|file| file.walked.ends_with("Allowed.bsl")));
+        assert!(root_scan.files.iter().all(|file| !file.walked.ends_with("Hidden.bsl")));
+    }
+
+    #[test]
+    fn source_exclusions_prune_recursive_configuration_and_extension_discovery() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_configuration_xml(&root.join("a-hidden"), "<Configuration/>");
+        write_configuration_xml(&root.join("z-allowed"), "<Configuration/>");
+        touch_extension(root, "src/cfe/Hidden");
+        touch_extension(root, "src/cfe/Allowed");
+
+        let project = Project::with_config(
+            root,
+            ProjectConfig {
+                source_exclude: vec!["a-hidden".to_owned(), "src/cfe/Hidden".to_owned()],
+                ..ProjectConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(project.semantic_base_path(), Some(root.join("z-allowed").as_path()));
+        assert_eq!(
+            project.extension_paths(),
+            &[("Allowed".to_owned(), root.join("src/cfe/Allowed"))],
+            "automatic extension discovery admitted an excluded export"
+        );
+        assert!(project.source_roots().iter().all(|path| !path.starts_with(root.join("a-hidden"))));
+        assert!(project
+            .source_roots()
+            .iter()
+            .all(|path| !path.starts_with(root.join("src/cfe/Hidden"))));
+
+        let nested_dir = tempdir().unwrap();
+        let nested_root = nested_dir.path();
+        write_configuration_xml(&nested_root.join("excluded/deep"), "<Configuration/>");
+        std::fs::write(nested_root.join("Allowed.bsl"), "").unwrap();
+        let fallback = Project::with_config(
+            nested_root,
+            ProjectConfig {
+                source_exclude: vec!["excluded".to_owned()],
+                ..ProjectConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fallback.source_roots(),
+            [nested_root.to_path_buf()],
+            "recursive discovery entered an excluded parent and suppressed the ordinary fallback"
+        );
+    }
+
+    #[test]
+    fn source_exclusions_follow_validation_and_rebuild_survivor_closures() {
+        let dir = tempdir().unwrap();
+        write_configuration_xml(&dir.path().join("base"), "<Configuration/>");
+        touch_extension(dir.path(), "ext/a");
+        touch_extension(dir.path(), "ext/b");
+        touch_extension(dir.path(), "ext/c");
+
+        let config = ProjectConfig {
+            configuration_root: Some("base".to_owned()),
+            extensions: Some(vec![
+                structured("A", "ext/a", &[]),
+                structured("B", "ext/b", &["A"]),
+                structured("C", "ext/c", &["B"]),
+            ]),
+            source_exclude: vec!["ext/b".to_owned()],
+            ..ProjectConfig::default()
+        };
+        let project = Project::with_config(dir.path(), config).unwrap();
+        let topology = project.extension_topology();
+        let names: Vec<_> = topology.nodes().iter().map(|node| node.name()).collect();
+        assert_eq!(names, ["A", "C"], "the excluded node survived topology filtering");
+        let c = topology.nodes().iter().find(|node| node.name() == "C").unwrap();
+        let closure_names: Vec<_> =
+            c.closure().iter().map(|id| topology.node(*id).name()).collect();
+        assert_eq!(closure_names, ["A"], "the survivor closure retained or bypassed B");
+        assert!(c.depends_on().is_empty(), "a direct edge to the excluded node survived");
+
+        let invalid = ProjectConfig {
+            configuration_root: Some("base".to_owned()),
+            extensions: Some(vec![structured("C", "ext/c", &["Missing"])]),
+            source_exclude: vec!["ext/c".to_owned()],
+            ..ProjectConfig::default()
+        };
+        assert!(
+            matches!(
+                Project::with_config(dir.path(), invalid),
+                Err(ProjectError::Topology(TopologyError::UnknownDependency { .. }))
+            ),
+            "excluding the invalid node must not make an invalid declaration valid"
+        );
     }
 
     #[test]
@@ -6243,6 +6717,67 @@ externals = [
         assert!(project.source_roots().contains(&epf), "the external root is scanned");
         let node = project.extension_topology().nodes().iter().find(|n| n.name() == "АРМ").unwrap();
         assert_eq!(node.kind(), NodeKind::External(ExternalObjectKind::DataProcessor));
+    }
+
+    #[test]
+    fn source_exclusions_dominate_base_extension_and_external_roots_independently() {
+        let dir = tempdir().unwrap();
+        touch_base(dir.path(), "base");
+        touch_extension(dir.path(), "extensions/hidden");
+        touch_extension(dir.path(), "extensions/allowed");
+        touch_external(dir.path(), "external/hidden", "HiddenProcessor", "ExternalDataProcessor");
+
+        let declarations = ProjectConfig {
+            configuration_root: Some("base".into()),
+            extensions: Some(vec![
+                structured("HiddenExt", "extensions/hidden", &[]),
+                structured("AllowedExt", "extensions/allowed", &[]),
+            ]),
+            externals: Some(vec![external("HiddenExternal", "external/hidden")]),
+            ..Default::default()
+        };
+        let ordinary = Project::with_config(dir.path(), declarations.clone()).unwrap();
+        assert_eq!(ordinary.source_roots().len(), 4, "fixture sanity: every root is declared");
+
+        let scoped = Project::with_config(
+            dir.path(),
+            ProjectConfig {
+                source_exclude: vec!["base".into(), "extensions/hidden".into(), "external".into()],
+                ..declarations
+            },
+        )
+        .unwrap();
+        assert!(scoped.semantic_base_path().is_none(), "the excluded base stayed semantic");
+        assert_eq!(scoped.source_roots(), [dir.path().join("extensions/allowed")]);
+        assert_eq!(
+            scoped.extension_topology().nodes().iter().map(|node| node.name()).collect::<Vec<_>>(),
+            ["AllowedExt"],
+            "an excluded extension or external survived in the topology"
+        );
+    }
+
+    #[test]
+    fn source_exclusions_prune_automatic_external_discovery() {
+        let dir = tempdir().unwrap();
+        touch_base(dir.path(), "src/cf");
+        touch_external(dir.path(), "src/epf/Hidden", "HiddenProcessor", "ExternalDataProcessor");
+        touch_external(dir.path(), "src/epf/Allowed", "AllowedProcessor", "ExternalDataProcessor");
+
+        let project = Project::with_config(
+            dir.path(),
+            ProjectConfig {
+                configuration_root: Some("src/cf".to_owned()),
+                source_exclude: vec!["src/epf/Hidden".to_owned()],
+                ..ProjectConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            project.external_paths(),
+            &[("Allowed".to_owned(), dir.path().join("src/epf/Allowed"))]
+        );
+        assert!(project.source_roots().iter().all(|path| !path.ends_with("src/epf/Hidden")));
     }
 
     #[test]

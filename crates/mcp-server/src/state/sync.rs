@@ -48,7 +48,7 @@ struct SearchDriftPlan {
 }
 
 /// The declared roots of the workspace, and the subtrees a walk of them must skip.
-type RootsAndHoles = (Vec<PathBuf>, Vec<PathBuf>);
+type RootsAndHoles = (Vec<PathBuf>, Vec<PathBuf>, project_model::ExcludedPaths);
 
 enum SnapshotPreparationOutcome {
     OperationError(String),
@@ -857,19 +857,20 @@ impl SharedState {
         // A walk needs the root table, and the table is behind the same admission the stop
         // refuses. Refused, the pass has prepared nothing: reporting that as an empty plan
         // would let the caller acknowledge a batch it never applied.
-        let (declared, excluded) = match Self::registered_roots_and_exclusions(engine, stop) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return,
-            Err(crate::tools::search::OwnerLockRefused::Closing) => {
-                plan.preparation_stopping = true;
-                return;
-            }
-            Err(crate::tools::search::OwnerLockRefused::Poisoned) => {
-                plan.preparation_error = Some("search engine lock poisoned".to_owned());
-                return;
-            }
-        };
-        let set = project_model::SourceSet::scan_excluding(&declared, &excluded);
+        let (declared, excluded, user_excluded) =
+            match Self::registered_roots_and_exclusions(engine, stop) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => return,
+                Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                    plan.preparation_stopping = true;
+                    return;
+                }
+                Err(crate::tools::search::OwnerLockRefused::Poisoned) => {
+                    plan.preparation_error = Some("search engine lock poisoned".to_owned());
+                    return;
+                }
+            };
+        let set = project_model::SourceSet::scan_in_scope(&declared, &excluded, &user_excluded);
         let present: std::collections::HashSet<_> = set
             .files
             .iter()
@@ -1183,7 +1184,10 @@ impl SharedState {
         engine: &SharedSearchEngine,
         stop: &super::OwnerStop,
     ) -> Option<Vec<PathBuf>> {
-        Self::registered_roots_and_exclusions(engine, stop).ok().flatten().map(|(roots, _)| roots)
+        Self::registered_roots_and_exclusions(engine, stop)
+            .ok()
+            .flatten()
+            .map(|(roots, _, _)| roots)
     }
 
     /// The registered roots together with the subtrees a walk of them must skip.
@@ -1202,6 +1206,7 @@ impl SharedState {
             Some((
                 roots.entries().map(|(_, declared)| declared.to_path_buf()).collect(),
                 roots.excluded().to_vec(),
+                roots.user_excluded().clone(),
             ))
         })())
     }
@@ -1233,7 +1238,8 @@ impl SharedState {
         let declared: Vec<PathBuf> =
             roots.entries().map(|(_, declared)| declared.to_path_buf()).collect();
         let excluded = roots.excluded().to_vec();
-        let set = project_model::SourceSet::scan_excluding(&declared, &excluded);
+        let set =
+            project_model::SourceSet::scan_in_scope(&declared, &excluded, roots.user_excluded());
         let present: std::collections::HashSet<PathBuf> = set
             .files
             .iter()
@@ -3083,6 +3089,98 @@ mod tests {
         assert!(
             !snapshot.keys().any(|key| key.path.ends_with("Configuration.xml")),
             "non-.bsl paths are left alone",
+        );
+    }
+
+    #[test]
+    fn an_exclusion_only_root_table_update_narrows_the_resident_search_rewalk() {
+        // Reads the process-global `FORCE_REWALK_WALK_ERROR` seam; serialize against the
+        // tests that toggle it.
+        let _env_lock = env_lock();
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let configuration = workspace.join("cf");
+        let hidden = configuration.join("generated");
+        fs::create_dir_all(&hidden).unwrap();
+        let visible_file = configuration.join("Visible.bsl");
+        let hidden_file = hidden.join("Hidden.bsl");
+        fs::write(&visible_file, "Процедура Видимая()\nКонецПроцедуры").unwrap();
+        fs::write(&hidden_file, "Процедура Скрытая()\nКонецПроцедуры").unwrap();
+
+        let db_path = dir.path().join("search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        let (roots, _) = bsl_search::WorkspaceRoots::build(&workspace, &configuration, &[]);
+        engine.set_workspace_roots(roots.clone());
+        engine.index_directory_fts(&configuration).unwrap();
+        assert_eq!(engine.text_search("Видимая", 10, Some("code")).unwrap().len(), 1);
+        assert_eq!(engine.text_search("Скрытая", 10, Some("code")).unwrap().len(), 1);
+        let shared: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
+        let stop = crate::state::OwnerStop::default();
+
+        let mut before = SearchDriftPlan::default();
+        SharedState::prepare_search_rewalk(&shared, &stop, &mut before);
+        assert!(before.rewalk_paths.contains(&hidden_file), "fixture never entered the corpus");
+
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.as_mut().unwrap().set_workspace_roots(
+                roots
+                    .clone()
+                    .with_user_excluded(&project_model::ExcludedPaths::new([hidden.clone()])),
+            );
+        }
+        let mut after = SearchDriftPlan::default();
+        SharedState::prepare_search_rewalk(&shared, &stop, &mut after);
+
+        assert!(after.rewalk_paths.contains(&visible_file));
+        assert!(!after.rewalk_paths.contains(&hidden_file));
+        let present = after.reconcile_present.expect("a complete rewalk is authoritative");
+        assert!(present.contains(&visible_file));
+        assert!(
+            !present.contains(&hidden_file),
+            "the resident reconcile would keep a source excluded by the new root table"
+        );
+
+        SharedState::apply_search_drift(
+            &shared,
+            &stop,
+            &[],
+            true,
+            &crate::graph::GraphState::disabled(),
+        );
+        {
+            let guard = shared.lock().unwrap();
+            let engine = guard.as_ref().unwrap();
+            assert_eq!(engine.text_search("Видимая", 10, Some("code")).unwrap().len(), 1);
+            assert!(
+                engine.text_search("Скрытая", 10, Some("code")).unwrap().is_empty(),
+                "the applied resident reconcile kept an excluded search result"
+            );
+            assert!(
+                engine
+                    .load_indexed_documents(Some("code"))
+                    .unwrap()
+                    .iter()
+                    .all(|document| !document.path.ends_with("Hidden.bsl")),
+                "the applied resident reconcile left the excluded row in the published index"
+            );
+        }
+
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.as_mut().unwrap().set_workspace_roots(roots);
+        }
+        SharedState::apply_search_drift(
+            &shared,
+            &stop,
+            &[],
+            true,
+            &crate::graph::GraphState::disabled(),
+        );
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard.as_ref().unwrap().text_search("Скрытая", 10, Some("code")).unwrap().len(),
+            1
         );
     }
 

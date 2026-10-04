@@ -1580,10 +1580,7 @@ impl GraphState {
         // recovery pass, and a cost nothing counts is a cost nobody can measure.
         self.scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let project = super::input::ProjectSnapshot::load_excluding(root, &self.cache_exclusions());
-        let universe = super::universe::ScannedUniverse::scan_excluding(
-            &project.scan_roots,
-            &project.excluded,
-        );
+        let universe = super::universe::ScannedUniverse::scan_project(&project);
         #[cfg(test)]
         if let Some(hook) = self.scan_receipt_hook.clone() {
             // AFTER the walk and before the receipt is made: the window another owner's
@@ -1657,10 +1654,7 @@ impl GraphState {
         // the topology hash come from the same snapshot, so the fold can never
         // pair one project state's files with another's topology.
         let project = super::input::ProjectSnapshot::load_excluding(root, &self.cache_exclusions());
-        let universe = super::universe::ScannedUniverse::scan_excluding(
-            &project.scan_roots,
-            &project.excluded,
-        );
+        let universe = super::universe::ScannedUniverse::scan_project(&project);
         let clean = universe.clean();
         #[cfg(test)]
         if let Some(hook) = self.scan_window_hook.clone() {

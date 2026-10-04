@@ -2,8 +2,8 @@ use cfg::{CfgBuilder, ControlFlowGraph};
 use expect_test::{expect, Expect};
 use hir_def::{Binding, Body, Expr, Literal, Name, Stmt};
 
-fn snapshot(cfg: ControlFlowGraph, expect: Expect) {
-    expect.assert_eq(&cfg::test_utils::format_cfg(&cfg));
+fn snapshot(body: &Body, expect: Expect) {
+    expect.assert_eq(&cfg::test_utils::format_cfg(&build(body), body));
 }
 
 fn build(body: &Body) -> ControlFlowGraph {
@@ -25,7 +25,7 @@ fn while_continue_and_break_edges() {
     body.set_body_stmts(vec![while_stmt].into());
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:EMPTY:0
@@ -36,13 +36,13 @@ fn while_continue_and_break_edges() {
               NORMAL:EMPTY:4
               NORMAL:WHILE_STMT:1
             edges:
-              ENTRY:EMPTY:0 -> NORMAL:WHILE_STMT:1 [Direct]
-              NORMAL:BREAK_STMT:3 -> NORMAL:EMPTY:2 [LoopBreak]
-              NORMAL:BREAK_STMT:3 -> NORMAL:EMPTY:4 [AdjacentCode]
-              NORMAL:CONTINUE_STMT:2 -> NORMAL:BREAK_STMT:3 [AdjacentCode]
-              NORMAL:CONTINUE_STMT:2 -> NORMAL:WHILE_STMT:1 [LoopContinue]
-              NORMAL:EMPTY:2 -> EXIT:EMPTY:3 [Direct]
-              NORMAL:EMPTY:4 -> NORMAL:WHILE_STMT:1 [LoopIteration]
+              ENTRY:EMPTY:0 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:BREAK_STMT:3 -> NORMAL:EMPTY:2 [Unconditional]
+              NORMAL:BREAK_STMT:3 -> NORMAL:EMPTY:4 [Unexecutable]
+              NORMAL:CONTINUE_STMT:2 -> NORMAL:BREAK_STMT:3 [Unexecutable]
+              NORMAL:CONTINUE_STMT:2 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:EMPTY:2 -> EXIT:EMPTY:3 [Unconditional]
+              NORMAL:EMPTY:4 -> NORMAL:WHILE_STMT:1 [Unconditional]
               NORMAL:WHILE_STMT:1 -> NORMAL:CONTINUE_STMT:2 [TrueBranch]
               NORMAL:WHILE_STMT:1 -> NORMAL:EMPTY:2 [FalseBranch]
         "#]],
@@ -69,7 +69,7 @@ fn nested_for_and_while_back_edges() {
     body.set_body_stmts(vec![for_stmt].into());
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:EMPTY:0
@@ -77,25 +77,25 @@ fn nested_for_and_while_back_edges() {
               NORMAL:BREAK_STMT:4
               NORMAL:BREAK_STMT:5
               NORMAL:CONTINUE_STMT:4
-              NORMAL:EMPTY:2:#f3a7633e
+              NORMAL:EMPTY:2:#eb5a85f6
               NORMAL:EMPTY:2:#fae6e901
               NORMAL:EMPTY:5
               NORMAL:EMPTY:6
               NORMAL:FOR_STMT:1
               NORMAL:WHILE_STMT:3
             edges:
-              ENTRY:EMPTY:0 -> NORMAL:FOR_STMT:1 [Direct]
-              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:2:#f3a7633e [LoopBreak]
-              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:5 [AdjacentCode]
-              NORMAL:BREAK_STMT:5 -> NORMAL:BREAK_STMT:4 [LoopBreak]
-              NORMAL:BREAK_STMT:5 -> NORMAL:EMPTY:6 [AdjacentCode]
-              NORMAL:CONTINUE_STMT:4 -> NORMAL:BREAK_STMT:5 [AdjacentCode]
-              NORMAL:CONTINUE_STMT:4 -> NORMAL:WHILE_STMT:3 [LoopContinue]
-              NORMAL:EMPTY:2:#f3a7633e -> EXIT:EMPTY:3 [Direct]
-              NORMAL:EMPTY:2:#fae6e901 -> NORMAL:WHILE_STMT:3 [Direct]
-              NORMAL:EMPTY:5 -> NORMAL:FOR_STMT:1 [LoopIteration]
-              NORMAL:EMPTY:6 -> NORMAL:WHILE_STMT:3 [LoopIteration]
-              NORMAL:FOR_STMT:1 -> NORMAL:EMPTY:2:#f3a7633e [FalseBranch]
+              ENTRY:EMPTY:0 -> NORMAL:FOR_STMT:1 [Unconditional]
+              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:2:#eb5a85f6 [Unconditional]
+              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:5 [Unexecutable]
+              NORMAL:BREAK_STMT:5 -> NORMAL:BREAK_STMT:4 [Unconditional]
+              NORMAL:BREAK_STMT:5 -> NORMAL:EMPTY:6 [Unexecutable]
+              NORMAL:CONTINUE_STMT:4 -> NORMAL:BREAK_STMT:5 [Unexecutable]
+              NORMAL:CONTINUE_STMT:4 -> NORMAL:WHILE_STMT:3 [Unconditional]
+              NORMAL:EMPTY:2:#eb5a85f6 -> EXIT:EMPTY:3 [Unconditional]
+              NORMAL:EMPTY:2:#fae6e901 -> NORMAL:WHILE_STMT:3 [Unconditional]
+              NORMAL:EMPTY:5 -> NORMAL:FOR_STMT:1 [Unconditional]
+              NORMAL:EMPTY:6 -> NORMAL:WHILE_STMT:3 [Unconditional]
+              NORMAL:FOR_STMT:1 -> NORMAL:EMPTY:2:#eb5a85f6 [FalseBranch]
               NORMAL:FOR_STMT:1 -> NORMAL:EMPTY:2:#fae6e901 [TrueBranch]
               NORMAL:WHILE_STMT:3 -> NORMAL:BREAK_STMT:4 [FalseBranch]
               NORMAL:WHILE_STMT:3 -> NORMAL:CONTINUE_STMT:4 [TrueBranch]

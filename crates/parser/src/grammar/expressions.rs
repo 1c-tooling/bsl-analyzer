@@ -67,6 +67,7 @@ fn and_expr(p: &mut Parser) {
 }
 
 fn not_expr(p: &mut Parser) {
+    inline_directives(p);
     if p.at(T![KwNot]) {
         let m = p.start();
         p.bump();
@@ -144,6 +145,7 @@ fn multiplicative_expr(p: &mut Parser) {
 ///
 /// Provenance: `docs/legal/bsl-clean-room-slice-b3.md`, finding D9.
 fn unary_expr(p: &mut Parser) {
+    inline_directives(p);
     match p.current() {
         Some(T![Plus]) | Some(T![Minus]) => {
             p.bump();
@@ -189,6 +191,10 @@ fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
                 } else {
                     p.bump();
                 }
+                // Whether the word behind the markers is a name is decided just
+                // below, by the same rule as without them; here it only has to
+                // be a word.
+                inline_directives_before(p, |kind| kind == T![Ident] || kind.is_keyword());
                 let crossed_newline = p.a_line_break_precedes();
                 let is_orphaned_declaration = crossed_newline && p.at_declaration_start();
                 // On the same line `expr.keyword` is unambiguously a member access —
@@ -231,6 +237,8 @@ fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
                 lhs = m.complete(p, NodeKind::CallExpr);
                 is_valid_statement = true;
             }
+            Some(T![PreInsert] | T![PreEndInsert] | T![PreDelete])
+                if continue_across_inline_directives(p) => {}
             _ => break,
         }
     }
@@ -322,6 +330,9 @@ fn string_continuation_tail(p: &mut Parser) {
             Some(T![StringPart]) => {
                 p.bump();
             }
+            // The literal is still open, so no statement can begin here: the
+            // marker can only be tearing the literal apart.
+            _ if at_inline_directive(p) => inline_directives(p),
             None => {
                 p.error_custom("незакрытая многострочная строка");
                 break;
@@ -354,10 +365,12 @@ fn new_expr(p: &mut Parser) -> CompletedMarker {
     let m = p.start();
     p.bump();
 
+    inline_directives_before(p, |kind| kind == T![Ident] || kind == T![LParen]);
     if p.at(T![Ident]) {
         p.bump();
     }
 
+    inline_directives_before(p, |kind| kind == T![LParen]);
     if p.at(T![LParen]) {
         arg_list(p);
     }
@@ -433,6 +446,10 @@ fn arg_list(p: &mut Parser) {
     p.bump();
 
     p.within_boundary(super::at_paren_list_punctuation, |p| {
+        // Before an argument a marker is read first: an argument the extension
+        // removed entirely leaves the position empty, and only past the marker
+        // is it visible whether the next token is an argument or the comma.
+        inline_directives(p);
         if !p.at(T![RParen]) {
             if !p.at(T![Comma]) && !p.at(T![RParen]) {
                 expression(p);
@@ -440,6 +457,7 @@ fn arg_list(p: &mut Parser) {
 
             while p.eat(T![Comma]) {
                 p.check_iteration_limit();
+                inline_directives(p);
                 if !p.at(T![Comma]) && !p.at(T![RParen]) {
                     expression(p);
                 }
@@ -450,4 +468,163 @@ fn arg_list(p: &mut Parser) {
     p.expect(T![RParen]);
 
     m.complete(p, NodeKind::ArgList);
+}
+
+// Extension markers (`#Вставка`, `#Удаление` and their closers) are text-level
+// in the platform: the configurator applies them to the module text, so they may
+// tear any construct apart, a string literal included. Between statements the
+// statement rules take them as opaque blocks; the rules below accept them inside
+// an expression, where what is inserted is parsed as part of the expression and
+// what is removed stays an opaque `PreDeleteDir` the expression does not see.
+
+/// Whether a marker an expression may take stands here.
+///
+/// A closer counts only while an insertion opened inside an expression waits
+/// for it; any other closer stays the stray token it always was.
+pub(super) fn at_inline_directive(p: &Parser) -> bool {
+    match p.current() {
+        Some(T![PreInsert] | T![PreDelete]) => true,
+        Some(T![PreEndInsert]) => p.inline_insert_open(),
+        _ => false,
+    }
+}
+
+/// Consumes the markers standing where the construct cannot end — an operand
+/// position, a list item, the inside of an open literal. No statement can
+/// begin there, so a marker in that place tears the construct apart.
+pub(super) fn inline_directives(p: &mut Parser) {
+    while at_inline_directive(p) {
+        p.check_iteration_limit();
+        if p.at(T![PreDelete]) {
+            inline_delete(p);
+        } else if p.at(T![PreInsert]) && !at_closed_inline_insert(p) {
+            // Nothing will close it, so it opens nothing either: counted, it
+            // would make a stray closer further on acceptable.
+            let m = p.start();
+            p.bump();
+            p.error_custom_at_marker(m, "директива #Вставка без #КонецВставки");
+        } else {
+            p.bump_inline_insert_marker();
+        }
+    }
+}
+
+/// Whether the insertion opened here is closed before its method ends.
+///
+/// Before this marker could be read as tearing the expression, a missing
+/// closer was an error; taking the marker must not make it silent. Only the
+/// method is searched, since an insertion does not outlive it, and a marker
+/// inside removed text closes nothing.
+fn at_closed_inline_insert(p: &Parser) -> bool {
+    p.insert_here_is_closed()
+}
+
+/// Consumes the markers here only when the token behind them satisfies
+/// `continues`, so a construct that may end here is not extended by a block
+/// that belongs to the statements after it.
+fn inline_directives_before(p: &mut Parser, continues: impl Fn(Sig) -> bool) {
+    if at_inline_directives_before(p, continues) {
+        inline_directives(p);
+    }
+}
+
+/// Takes the markers after a complete operand when they tear the expression
+/// apart, and reports whether it took any.
+///
+/// After an operand the expression may just as well have ended — a statement
+/// with its `;` omitted is followed by the next statement, and a marker there
+/// opens a block of statements. Only the closer of an insertion this
+/// expression opened, or a token behind the markers that no statement starts
+/// with and the expression is waiting for, says the markers are the
+/// expression's.
+fn continue_across_inline_directives(p: &mut Parser) -> bool {
+    if p.at(T![PreEndInsert]) && p.inline_insert_open() {
+        p.bump_inline_insert_marker();
+        return true;
+    }
+    if at_inline_directives_before(p, |kind| TORN_EXPRESSION_CONTINUATION.contains(kind)) {
+        inline_directives(p);
+        return true;
+    }
+    false
+}
+
+/// Whether a run of markers an expression may take starts here, is complete,
+/// and is followed by a token satisfying `continues`.
+///
+/// An unclosed removal gives no answer: nothing stands behind it, and the
+/// markers stay with the rule for statement boundaries.
+fn at_inline_directives_before(p: &Parser, continues: impl Fn(Sig) -> bool) -> bool {
+    let mut n = 0;
+    let mut open = p.open_inline_inserts();
+    loop {
+        match p.nth(n) {
+            Some(T![PreInsert]) => {
+                open += 1;
+                n += 1;
+            }
+            Some(T![PreEndInsert]) if open > 0 => {
+                open -= 1;
+                n += 1;
+            }
+            Some(T![PreDelete]) => loop {
+                n += 1;
+                match p.nth(n) {
+                    Some(T![PreEndDelete]) => {
+                        n += 1;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => return false,
+                }
+            },
+            Some(next) if n > 0 => return continues(next),
+            _ => return false,
+        }
+    }
+}
+
+/// Tokens that carry on an expression from after its operand and that no
+/// statement begins with: operators, postfix openers, the punctuation of an
+/// enclosing list or group, and the words ending a statement header. The words
+/// ending a block are not here: a statement ends in front of them, and a
+/// marker there stands between statements.
+const TORN_EXPRESSION_CONTINUATION: TokenSet = TokenSet::new(&[
+    T![KwOr],
+    T![KwAnd],
+    T![Eq],
+    T![Neq],
+    T![Lt],
+    T![Le],
+    T![Gt],
+    T![Ge],
+    T![Plus],
+    T![Minus],
+    T![Star],
+    T![Slash],
+    T![Percent],
+    T![Dot],
+    T![LBracket],
+    T![LParen],
+    T![RParen],
+    T![RBracket],
+    T![Comma],
+    T![KwThen],
+    T![KwDo],
+    T![KwTo],
+]);
+
+/// A removed block inside an expression: kept whole and verbatim, and taken
+/// without group tracking because its brackets no longer exist in the module.
+fn inline_delete(p: &mut Parser) {
+    let m = p.start();
+    p.bump_removed();
+    while !p.at_end() && !p.at(T![PreEndDelete]) {
+        p.check_iteration_limit();
+        p.bump_removed();
+    }
+    if p.at(T![PreEndDelete]) {
+        p.bump_removed();
+    }
+    m.complete(p, NodeKind::PreDeleteDir);
 }

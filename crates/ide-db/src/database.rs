@@ -142,6 +142,22 @@ fn salsa_events_enabled_by_env() -> bool {
     matches!(std::env::var("BSL_SALSA_EVENTS").as_deref(), Ok("1"))
 }
 
+/// Fold the same-named common modules of the visible roots, base first and the
+/// file's own root last: an adopted copy overlays the fold so far, any other
+/// same-named module is independent and replaces it.
+fn overlay_common_modules(
+    modules: impl Iterator<Item = Option<Arc<bsl_metadata::CommonModule>>>,
+) -> Option<Arc<bsl_metadata::CommonModule>> {
+    modules.flatten().reduce(|base, overlay| {
+        if !overlay.adopts(&base) {
+            return overlay;
+        }
+        let mut merged = Arc::unwrap_or_clone(base);
+        merged.apply_extension_overlay(&overlay);
+        Arc::new(merged)
+    })
+}
+
 impl Default for RootDatabaseImpl {
     fn default() -> Self {
         Self::new()
@@ -1189,10 +1205,12 @@ impl RootDatabaseImpl {
 
     /// The common-module counterpart of [`resolve_metadata_object_for_file`]:
     /// resolve a common module's metadata by name visible to `file_id` — the base
-    /// config plus the file's visibility chain, the own extension winning. A
-    /// main-config common module is visible everywhere; an extension's common
-    /// module is visible within that extension and its dependents (an unrelated
-    /// extension's modules are not), the same scoping as metadata objects.
+    /// config overlaid by the file's visibility chain in order, the own extension
+    /// last ([`bsl_metadata::CommonModule::apply_extension_overlay`]: a property
+    /// absent in a borrowed module is inherited). A main-config common module is
+    /// visible everywhere; an extension's common module is visible within that
+    /// extension and its dependents (an unrelated extension's modules are not),
+    /// the same scoping as metadata objects.
     /// Per-common-module when the substrate is populated, falling back to a
     /// per-config scan otherwise — `merge_extension_overlay` does not fold common
     /// modules into the merged configuration, so the fallback cannot go through
@@ -1209,18 +1227,9 @@ impl RootDatabaseImpl {
             let resolve_in = |listing: Option<metadata::MetadataListingInput>| {
                 listing.and_then(|l| metadata::resolve_common_module(self, l, name.to_string()))
             };
-            let mut merged: Option<bsl_metadata::CommonModule> = None;
-            for overlay in std::iter::once(resolve_in(main_listing))
-                .chain(chain_listings.into_iter().map(resolve_in))
-                .flatten()
-            {
-                match &mut merged {
-                    Some(base) if overlay.adopts(base) => base.apply_extension_overlay(&overlay),
-                    Some(base) => *base = (*overlay).clone(),
-                    None => merged = Some((*overlay).clone()),
-                }
-            }
-            return merged.map(Arc::new);
+            return overlay_common_modules(
+                std::iter::once(main_listing).chain(chain_listings).map(resolve_in),
+            );
         }
 
         let find_in = |root: &std::path::Path| -> Option<Arc<bsl_metadata::CommonModule>> {
@@ -1238,17 +1247,13 @@ impl RootDatabaseImpl {
             return find_in(&config_root);
         };
 
-        let mut merged: Option<bsl_metadata::CommonModule> = None;
-        for path in roots.main.iter().chain(roots.chain.iter().map(|(_, path)| path)) {
-            if let Some(found) = find_in(path) {
-                match &mut merged {
-                    Some(base) if found.adopts(base) => base.apply_extension_overlay(&found),
-                    Some(base) => *base = (*found).clone(),
-                    None => merged = Some((*found).clone()),
-                }
-            }
-        }
-        merged.map(Arc::new)
+        overlay_common_modules(
+            roots
+                .main
+                .iter()
+                .map(|p| find_in(p))
+                .chain(roots.chain.iter().map(|(_, p)| find_in(p))),
+        )
     }
 
     pub fn resolve_http_service_for_file(
@@ -2117,12 +2122,22 @@ impl RootDatabaseImpl {
     }
 
     /// Resolve the common module that owns the `Ext/Module.bsl` whose id is
-    /// `module_file_id` (typically the file currently being analysed), composing the
-    /// roots visible to it. Answers "is this `.bsl` a common module's source, and if
-    /// so which?" via the per-root reverse index when the substrate is populated,
-    /// falling back to a root-relative URI scan over the merged configuration's
-    /// common modules otherwise.
+    /// `module_file_id` (typically the file currently being analysed). Answers "is
+    /// this `.bsl` a common module's source, and if so which?" via the per-root
+    /// reverse index when the substrate is populated, falling back to a
+    /// root-relative URI scan over the visible roots' common modules otherwise;
+    /// the owner's metadata is then composed by name over the roots visible to the
+    /// file, as [`Self::resolve_common_module_for_file`] does.
     pub fn common_module_for_file_id(
+        &self,
+        module_file_id: FileId,
+    ) -> Option<Arc<bsl_metadata::CommonModule>> {
+        use bsl_metadata::traits::MdObject;
+        let owner = self.common_module_owner_of_file(module_file_id)?;
+        self.resolve_common_module_for_file(module_file_id, owner.name()).or(Some(owner))
+    }
+
+    fn common_module_owner_of_file(
         &self,
         module_file_id: FileId,
     ) -> Option<Arc<bsl_metadata::CommonModule>> {

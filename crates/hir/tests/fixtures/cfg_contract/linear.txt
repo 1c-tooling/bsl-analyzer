@@ -1,0 +1,27 @@
+complexity: 1
+live: {0, 1, 2}
+dead: []
+evaluations: {}
+expr ExprId(0): Some(LocalRange(27..31))
+expr ExprId(1): Some(LocalRange(34..46))
+expr ExprId(2): Some(LocalRange(48..49))
+expr ExprId(3): Some(LocalRange(52..53))
+expr ExprId(4): Some(LocalRange(55..56))
+expr ExprId(5): Some(LocalRange(59..60))
+transitions:
+  s0 -> s1
+  s1 -> s2
+  s2 -> exit
+definitions (limit 3):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some(["Definition { var_name: \"a\", def_site: Assignment(1) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+definitions (limit 10000):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some(["Definition { var_name: \"a\", def_site: Assignment(1) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+source states:
+  s0: range=Some(LocalRange(27..46)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(48..53)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s2: range=Some(LocalRange(55..60)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

@@ -139,7 +139,7 @@ where
     }
 
     fn transfer_edge(&self, edge_kind: CfgEdgeType, state: &OpenSet<R>) -> OpenSet<R> {
-        if matches!(edge_kind, CfgEdgeType::AdjacentCode) {
+        if matches!(edge_kind, CfgEdgeType::Unexecutable) {
             OpenSet::bottom()
         } else {
             state.clone()
@@ -249,7 +249,7 @@ where
     R: Clone + Eq + Hash,
     P: ResourceProvider<R>,
 {
-    let exit_block = cfg.exit_point();
+    let exit_block = cfg.exit();
     let transfer = ResourceTransfer { provider, _r: PhantomData };
     let mut solver = DataflowSolver::new(Arc::new(cfg.clone()), body.clone(), transfer);
     solver.set_direction(Direction::Forward);

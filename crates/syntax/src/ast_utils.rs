@@ -1,4 +1,30 @@
-use crate::{SyntaxKind, SyntaxNode, SyntaxToken};
+use crate::{comment_runs, CommentRun, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
+
+/// Whether the element is an extension marker or a block of text the extension
+/// removed — part of the source, but not of the module the platform compiles.
+///
+/// Inside an expression the parser keeps them where they stand: the markers of
+/// an insertion as tokens, a removal as an opaque `PRE_DELETE_DIR`. Whatever
+/// reads the expression for its meaning has to step over both, or the removed
+/// argument comes back as an argument and a marker as an operand.
+pub fn is_extension_directive(element: &SyntaxElement) -> bool {
+    matches!(
+        element.kind(),
+        SyntaxKind::PRE_DELETE_DIR | SyntaxKind::PRE_INSERT | SyntaxKind::PRE_END_INSERT
+    )
+}
+
+/// Child nodes of `node` that stand in the compiled module: everything but
+/// the text an extension removed.
+pub fn active_children(node: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
+    node.children().filter(|child| child.kind() != SyntaxKind::PRE_DELETE_DIR)
+}
+
+/// Children of `node`, nodes and tokens, that stand in the compiled module:
+/// without the markers of extension blocks and without the text removed.
+pub fn active_children_with_tokens(node: &SyntaxNode) -> impl Iterator<Item = SyntaxElement> {
+    node.children_with_tokens().filter(|child| !is_extension_directive(child))
+}
 
 /// Точка с запятой, стоящая за узлом через одну лишь тривию.
 ///
@@ -25,62 +51,153 @@ pub fn trailing_semicolon(node: &SyntaxNode) -> Option<SyntaxToken> {
 }
 
 pub fn extract_leading_comments(node: &SyntaxNode, source_text: &str) -> Option<Vec<String>> {
+    // Leading comments are trivia of the enclosing nodes, not of `node`, so
+    // the runs are taken over the whole tree.
+    let root = node.ancestors().last().unwrap_or_else(|| node.clone());
+    let runs = comment_runs(&root);
     let node_start: usize = node.text_range().start().into();
-    extract_leading_comments_at_offset(node_start, source_text)
+    extract_leading_comments_at_offset(node_start, source_text, &runs)
 }
 
-/// Keeps the normalized comment contract for callers that do not interpret indentation.
-pub fn extract_leading_comments_at_offset(offset: usize, source_text: &str) -> Option<Vec<String>> {
-    let comments = extract_leading_comment_lines_at_offset(offset, source_text)?;
-    Some(
-        comments
-            .into_iter()
-            .map(|line| line.trim().to_owned())
-            .filter(|line| !line.is_empty())
-            .collect(),
-    )
+/// Documentation block right above `offset`: the comments of `runs` on the
+/// lines directly above it, each one alone on its line.
+///
+/// A blank line or code breaks the block, so an unrelated comment further up
+/// (e.g. a change-log marker) is never attached as the method's documentation.
+/// `runs` are the comment runs of the tree `source_text` was parsed into.
+pub fn extract_leading_comments_at_offset(
+    offset: usize,
+    source_text: &str,
+    runs: &[CommentRun],
+) -> Option<Vec<String>> {
+    if offset > source_text.len() {
+        return None;
+    }
+    leading_comments(source_text, offset, runs, LeadingScope::Method, Layout::Trimmed)
 }
 
-/// Retains indentation and blank comment lines needed to distinguish documentation fields
-/// from their type and description continuations. The space immediately after `//` is omitted.
+/// Same block as [`extract_leading_comments_at_offset`], but each line keeps
+/// its indentation and empty `//` lines stay: documentation tells fields from
+/// their type and description continuations by them. Only the one space right
+/// after `//` is dropped.
 pub fn extract_leading_comment_lines_at_offset(
     offset: usize,
     source_text: &str,
+    runs: &[CommentRun],
 ) -> Option<Vec<String>> {
-    let text_before_node = source_text.get(..offset)?.trim_start_matches('\u{feff}');
+    if offset > source_text.len() {
+        return None;
+    }
+    leading_comments(source_text, offset, runs, LeadingScope::Method, Layout::Preserved)
+}
+
+/// What stands between a declaration and its leading comments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeadingScope {
+    /// Nothing: only comment lines.
+    Method,
+    /// Annotation lines as well; the text of a comment the anchor stands in
+    /// counts up to the anchor.
+    Variable,
+}
+
+/// How much of a comment line's text is kept.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// Trimmed content; empty `//` lines are dropped.
+    Trimmed,
+    /// Indentation and empty `//` lines are kept.
+    Preserved,
+}
+
+/// Contents of the comments directly above `anchor`, in text order; `None`
+/// when there is nothing but empty `//` markers.
+///
+/// Comments come only from `runs`; the text is read for what the runs do not
+/// say: what precedes a comment on its line and which lines lie between two
+/// comments. A run may go on below the anchor or pass through a trailing
+/// comment of a code line, so the block is cut out of the runs line by line
+/// rather than taken as a whole run.
+fn leading_comments(
+    text: &str,
+    anchor: usize,
+    runs: &[CommentRun],
+    scope: LeadingScope,
+    layout: Layout,
+) -> Option<Vec<String>> {
+    let before_anchor = runs.partition_point(|run| usize::from(run.range().start()) < anchor);
+    let mut candidates = runs[..before_anchor]
+        .iter()
+        .rev()
+        .flat_map(|run| run.lines().iter().rev())
+        .filter(|line| usize::from(line.range.start()) < anchor)
+        .peekable();
 
     let mut comments = Vec::new();
+    let mut push = |content: &str| match layout {
+        Layout::Trimmed => {
+            let content = content.trim();
+            if !content.is_empty() {
+                comments.push(content.to_string());
+            }
+        }
+        Layout::Preserved => {
+            let content = content.strip_prefix(' ').unwrap_or(content).trim_end();
+            comments.push(content.to_string());
+        }
+    };
 
-    // Walk lines backwards from the offset. The documentation block is only
-    // the contiguous run of `//` lines directly above the method: a blank
-    // line or code breaks it, so an unrelated comment further up (e.g. a
-    // change-log marker) is never attached as the method's documentation.
-    let mut lines = text_before_node.rsplit('\n');
-
-    // The first fragment is the method's own line up to the offset
-    // (indentation before the keyword or annotation); it is not a separate
-    // source line and must not terminate the scan.
-    if let Some(fragment) = lines.next() {
-        let trimmed = fragment.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with("//") {
-            return None;
+    // The anchor's own line up to the anchor is indentation, an annotation or
+    // the part of a comment the anchor stands in; it is not a separate line
+    // and does not end the block.
+    let mut line_start = text[..anchor].rfind('\n').map_or(0, |newline| newline + 1);
+    let fragment = &text[line_start..anchor];
+    // An anchor between the two slashes leaves a lone `/`, which is code.
+    let fragment_comment = candidates
+        .next_if(|line| usize::from(line.range.start()) >= line_start)
+        .map(|line| usize::from(line.range.start()))
+        .filter(|&start| text[line_start..start].trim().is_empty() && anchor >= start + 2);
+    let fragment_trimmed = fragment.trim();
+    let fragment_is_open = fragment_trimmed.is_empty()
+        || (scope == LeadingScope::Variable && fragment_trimmed.starts_with('&'));
+    if !fragment_is_open {
+        let start = fragment_comment?;
+        if scope == LeadingScope::Variable {
+            push(&text[start + 2..anchor]);
         }
     }
 
-    for line in lines {
-        let trimmed = line.trim();
-
-        if let Some(comment_text) = trimmed.strip_prefix("//") {
-            comments.push(comment_text.strip_prefix(' ').unwrap_or(comment_text).to_owned());
+    // A byte order mark opens the file, not a line of code: it must not hide
+    // the first line of a method's documentation.
+    let line_prefix = |start: usize, end: usize| {
+        let prefix = &text[start..end];
+        let prefix = if start == 0 && scope == LeadingScope::Method {
+            prefix.strip_prefix('\u{feff}').unwrap_or(prefix)
         } else {
-            break;
+            prefix
+        };
+        prefix.trim()
+    };
+    while line_start > 0 {
+        let line_end = line_start - 1;
+        let prev_start = text[..line_end].rfind('\n').map_or(0, |newline| newline + 1);
+        // A comment runs to the end of its line, so the one starting on this
+        // line is the last thing on it.
+        let comment = candidates.next_if(|line| usize::from(line.range.start()) >= prev_start);
+        match comment {
+            Some(comment) if line_prefix(prev_start, comment.range.start().into()).is_empty() => {
+                push(text[comment.range].strip_prefix("//").unwrap_or_default());
+            }
+            _ if scope == LeadingScope::Variable
+                && text[prev_start..line_end].trim().starts_with('&') => {}
+            _ => break,
         }
+        line_start = prev_start;
     }
 
     if comments.iter().all(|line| line.trim().is_empty()) {
         return None;
     }
-
     comments.reverse();
     Some(comments)
 }
@@ -178,6 +295,7 @@ pub fn extract_variable_comments_at_offset(
     var_keyword_offset: usize,
     var_end_offset: usize,
     first_annotation_offset: Option<usize>,
+    runs: &[CommentRun],
 ) -> Option<Vec<String>> {
     debug_assert!(
         var_keyword_offset == 0 || file_text.is_char_boundary(var_keyword_offset),
@@ -195,7 +313,7 @@ pub fn extract_variable_comments_at_offset(
     let mut comments: Vec<String> = Vec::new();
 
     let leading_anchor = first_annotation_offset.unwrap_or(var_keyword_offset);
-    if let Some(leading) = collect_variable_leading_comments(file_text, leading_anchor) {
+    if let Some(leading) = collect_variable_leading_comments(file_text, leading_anchor, runs) {
         comments.extend(leading);
     }
 
@@ -225,48 +343,15 @@ pub fn extract_variable_comments_at_offset(
     }
 }
 
-fn collect_variable_leading_comments(file_text: &str, anchor: usize) -> Option<Vec<String>> {
+fn collect_variable_leading_comments(
+    file_text: &str,
+    anchor: usize,
+    runs: &[CommentRun],
+) -> Option<Vec<String>> {
     if anchor == 0 || anchor > file_text.len() {
         return None;
     }
-
-    let text_before = &file_text[..anchor];
-
-    // Same backwards bounded scan as `has_variable_leading_description`.
-    let mut rev_lines = text_before.rsplit('\n');
-    let last_line = rev_lines.next().unwrap_or("");
-    let trimmed_last = last_line.trim();
-    let skip_last = trimmed_last.is_empty() || trimmed_last.starts_with('&');
-
-    let mut comments: Vec<String> = Vec::new();
-    for line in (!skip_last).then_some(last_line).into_iter().chain(rev_lines) {
-        let line = line.trim();
-
-        if let Some(rest) = line.strip_prefix("//") {
-            let comment_text = rest.trim();
-            if !comment_text.is_empty() {
-                comments.push(comment_text.to_string());
-            }
-            continue;
-        }
-
-        if line.is_empty() {
-            break;
-        }
-
-        if line.starts_with('&') {
-            continue;
-        }
-
-        break;
-    }
-
-    if comments.is_empty() {
-        None
-    } else {
-        comments.reverse();
-        Some(comments)
-    }
+    leading_comments(file_text, anchor, runs, LeadingScope::Variable, Layout::Trimmed)
 }
 
 fn scan_variable_trailing_comment(file_text: &str, var_end_offset: usize) -> Option<String> {
@@ -380,302 +465,4 @@ pub fn new_expr_type_name_token(new_expr: &SyntaxNode) -> Option<SyntaxToken> {
         }
         tok.kind().is_name_token()
     })
-}
-
-#[cfg(test)]
-mod leading_comment_line_tests {
-    use super::{extract_leading_comment_lines_at_offset, extract_leading_comments_at_offset};
-
-    /// Documentation needs indentation and empty comment lines even when source uses CRLF.
-    #[test]
-    fn documentation_layout_and_legacy_trimmed_comments() {
-        let source = "// Returns:\r\n//\r\n//   Structure:\r\n//     * Field - String\r\nFunction Test()\r\nEndFunction";
-        let offset = source.find("Function").unwrap();
-        assert_eq!(
-            extract_leading_comment_lines_at_offset(offset, source).unwrap(),
-            ["Returns:", "", "  Structure:", "    * Field - String"]
-        );
-        assert_eq!(
-            extract_leading_comments_at_offset(offset, source).unwrap(),
-            ["Returns:", "Structure:", "* Field - String"]
-        );
-    }
-
-    /// An actual blank source line still breaks the association with a method.
-    #[test]
-    fn blank_source_line_breaks_documentation() {
-        let source = "// Returns:\n\nFunction Test()\nEndFunction";
-        assert!(extract_leading_comment_lines_at_offset(source.find("Function").unwrap(), source)
-            .is_none());
-    }
-
-    /// A UTF-8 BOM must not hide the first documentation line from hover.
-    #[test]
-    fn bom_keeps_the_first_documentation_line() {
-        let source =
-            "\u{feff}// Parameters:\r\n// Value - String\r\nProcedure Test(Value)\r\nEndProcedure";
-        assert_eq!(
-            extract_leading_comment_lines_at_offset(source.find("Procedure").unwrap(), source)
-                .unwrap(),
-            ["Parameters:", "Value - String"]
-        );
-    }
-}
-
-#[cfg(test)]
-mod variable_comment_extractor_tests {
-    use super::extract_variable_comments_at_offset;
-
-    fn off(text: &str, marker: &str) -> usize {
-        text.find(marker).unwrap_or_else(|| panic!("marker {marker:?} not found in {text:?}"))
-    }
-
-    #[test]
-    fn no_comments_returns_none() {
-        let text = "Перем X;";
-        let var_kw = off(text, "Перем");
-        let var_end = text.len();
-        assert_eq!(extract_variable_comments_at_offset(text, var_kw, var_end, None), None);
-    }
-
-    #[test]
-    fn leading_single_line() {
-        let text = "// purpose\nПерем X;";
-        let var_kw = off(text, "Перем");
-        let var_end = text.len();
-        let got = extract_variable_comments_at_offset(text, var_kw, var_end, None).unwrap();
-        assert_eq!(got, vec!["purpose".to_string()]);
-    }
-
-    #[test]
-    fn leading_multiline_block() {
-        let text = "// first\n// second\nПерем X;";
-        let var_kw = off(text, "Перем");
-        let var_end = text.len();
-        let got = extract_variable_comments_at_offset(text, var_kw, var_end, None).unwrap();
-        assert_eq!(got, vec!["first".to_string(), "second".to_string()]);
-    }
-
-    #[test]
-    fn blank_line_breaks_leading() {
-        let text = "// far away\n\nПерем X;";
-        let var_kw = off(text, "Перем");
-        let var_end = text.len();
-        assert_eq!(extract_variable_comments_at_offset(text, var_kw, var_end, None), None);
-    }
-
-    #[test]
-    fn trailing_only() {
-        let text = "Перем X; // trailing";
-        let var_kw = off(text, "Перем");
-        let var_end = off(text, ";") + 1;
-        let got = extract_variable_comments_at_offset(text, var_kw, var_end, None).unwrap();
-        assert_eq!(got, vec!["trailing".to_string()]);
-    }
-
-    #[test]
-    fn empty_trailing_marker_filtered() {
-        let text = "Перем X; //";
-        let var_kw = off(text, "Перем");
-        let var_end = off(text, ";") + 1;
-        assert_eq!(extract_variable_comments_at_offset(text, var_kw, var_end, None), None);
-    }
-
-    #[test]
-    fn empty_leading_marker_filtered() {
-        let text = "//\nПерем X;";
-        let var_kw = off(text, "Перем");
-        let var_end = text.len();
-        assert_eq!(extract_variable_comments_at_offset(text, var_kw, var_end, None), None);
-    }
-
-    #[test]
-    fn leading_then_trailing_combined() {
-        let text = "// purpose\nПерем X; // remark";
-        let var_kw = off(text, "Перем");
-        let var_end = off(text, ";") + 1;
-        let got = extract_variable_comments_at_offset(text, var_kw, var_end, None).unwrap();
-        assert_eq!(got, vec!["purpose".to_string(), "remark".to_string()]);
-    }
-
-    #[test]
-    fn inter_annotation_capture() {
-        let text = "&Идентификатор\n// inter\n&Колонка\nПерем X;";
-        let var_kw = off(text, "Перем");
-        let first_ann = off(text, "&Идентификатор");
-        let var_end = text.len();
-        let got =
-            extract_variable_comments_at_offset(text, var_kw, var_end, Some(first_ann)).unwrap();
-        assert_eq!(got, vec!["inter".to_string()]);
-    }
-
-    #[test]
-    fn leading_above_first_annotation() {
-        let text = "// header\n&Идентификатор\nПерем X;";
-        let var_kw = off(text, "Перем");
-        let first_ann = off(text, "&Идентификатор");
-        let var_end = text.len();
-        let got =
-            extract_variable_comments_at_offset(text, var_kw, var_end, Some(first_ann)).unwrap();
-        assert_eq!(got, vec!["header".to_string()]);
-    }
-
-    #[test]
-    fn trailing_with_annotations() {
-        let text = "&Идентификатор\nПерем X; // tail";
-        let var_kw = off(text, "Перем");
-        let first_ann = off(text, "&Идентификатор");
-        let var_end = off(text, ";") + 1;
-        let got =
-            extract_variable_comments_at_offset(text, var_kw, var_end, Some(first_ann)).unwrap();
-        assert_eq!(got, vec!["tail".to_string()]);
-    }
-
-    #[test]
-    fn leading_blank_above_annotation_breaks_connection() {
-        let text = "// orphan\n\n&Идентификатор\nПерем X;";
-        let var_kw = off(text, "Перем");
-        let first_ann = off(text, "&Идентификатор");
-        let var_end = text.len();
-        assert_eq!(
-            extract_variable_comments_at_offset(text, var_kw, var_end, Some(first_ann)),
-            None
-        );
-    }
-
-    #[test]
-    fn crlf_line_endings_are_handled() {
-        let text = "// purpose\r\nПерем X;\r\n";
-        let var_kw = off(text, "Перем");
-        let var_end = off(text, ";") + 1;
-        let got = extract_variable_comments_at_offset(text, var_kw, var_end, None).unwrap();
-        assert_eq!(got, vec!["purpose".to_string()]);
-    }
-
-    #[test]
-    fn cyrillic_variable_name_offsets() {
-        let text = "// заголовок\nПерем СчётчикВызовов; // примечание";
-        let var_kw = off(text, "Перем");
-        let var_end = off(text, ";") + 1;
-        let got = extract_variable_comments_at_offset(text, var_kw, var_end, None).unwrap();
-        assert_eq!(got, vec!["заголовок".to_string(), "примечание".to_string()]);
-    }
-
-    #[test]
-    fn all_three_regions_combined() {
-        let text = "// header\n&Идентификатор\n// inter\n&Колонка\nПерем X; // tail";
-        let var_kw = off(text, "Перем");
-        let first_ann = off(text, "&Идентификатор");
-        let var_end = off(text, ";") + 1;
-        let got =
-            extract_variable_comments_at_offset(text, var_kw, var_end, Some(first_ann)).unwrap();
-        assert_eq!(got, vec!["header".to_string(), "inter".to_string(), "tail".to_string()]);
-    }
-}
-
-#[cfg(test)]
-mod leading_comment_scan_tests {
-    use super::{extract_leading_comments_at_offset, has_variable_leading_description};
-
-    fn off(text: &str, marker: &str) -> usize {
-        text.find(marker).unwrap_or_else(|| panic!("marker {marker:?} not found in {text:?}"))
-    }
-
-    #[test]
-    fn comment_block_above_method() {
-        let text = "// Описание.\n// Вторая строка.\nПроцедура П()";
-        let got = extract_leading_comments_at_offset(off(text, "Процедура"), text).unwrap();
-        assert_eq!(got, vec!["Описание.".to_string(), "Вторая строка.".to_string()]);
-    }
-
-    #[test]
-    fn blank_line_above_method_detaches_the_block() {
-        let text = "// первый\n\n// второй\n\nПроцедура П()";
-        assert_eq!(extract_leading_comments_at_offset(off(text, "Процедура"), text), None);
-    }
-
-    #[test]
-    fn blank_line_inside_block_keeps_only_adjacent_part() {
-        let text = "// далёкий\n\n// ближний\nПроцедура П()";
-        let got = extract_leading_comments_at_offset(off(text, "Процедура"), text).unwrap();
-        assert_eq!(got, vec!["ближний".to_string()]);
-    }
-
-    #[test]
-    fn code_line_stops_the_scan() {
-        let text = "// далёкий\nКонецПроцедуры\n\n// ближний\nПроцедура П()";
-        let got = extract_leading_comments_at_offset(off(text, "Процедура"), text).unwrap();
-        assert_eq!(got, vec!["ближний".to_string()]);
-    }
-
-    #[test]
-    fn crlf_comments_are_trimmed() {
-        let text = "// заметка\r\nПроцедура П()";
-        let got = extract_leading_comments_at_offset(off(text, "Процедура"), text).unwrap();
-        assert_eq!(got, vec!["заметка".to_string()]);
-    }
-
-    #[test]
-    fn comment_at_file_start() {
-        let text = "// шапка\nПроцедура П()";
-        let got = extract_leading_comments_at_offset(off(text, "Процедура"), text).unwrap();
-        assert_eq!(got, vec!["шапка".to_string()]);
-    }
-
-    #[test]
-    fn no_comments_returns_none() {
-        let text = "КонецПроцедуры\nПроцедура П()";
-        assert_eq!(extract_leading_comments_at_offset(off(text, "Процедура П"), text), None);
-        assert_eq!(extract_leading_comments_at_offset(0, text), None);
-    }
-
-    #[test]
-    fn comments_above_annotation_anchor_are_attached() {
-        // Callers anchor the offset at the annotation when a method has one,
-        // so the doc block right above the annotation is found.
-        let text = "// Описание.\n&НаСервере\nПроцедура П()";
-        let got = extract_leading_comments_at_offset(off(text, "&НаСервере"), text).unwrap();
-        assert_eq!(got, vec!["Описание.".to_string()]);
-    }
-
-    #[test]
-    fn code_before_offset_on_same_line_returns_none() {
-        let text = "// Описание.\nПерем А; Процедура П()";
-        assert_eq!(extract_leading_comments_at_offset(off(text, "Процедура"), text), None);
-    }
-
-    #[test]
-    fn empty_marker_comments_are_dropped() {
-        let text = "//\n// текст\n//\nПроцедура П()";
-        let got = extract_leading_comments_at_offset(off(text, "Процедура"), text).unwrap();
-        assert_eq!(got, vec!["текст".to_string()]);
-    }
-
-    #[test]
-    fn offset_past_text_returns_none() {
-        assert_eq!(extract_leading_comments_at_offset(100, "короткий"), None);
-    }
-
-    #[test]
-    fn variable_description_above_annotation() {
-        let text = "// назначение\n&НаКлиенте\nПерем X;";
-        assert!(has_variable_leading_description(off(text, "Перем"), text, Some(off(text, "&"))));
-    }
-
-    #[test]
-    fn variable_without_description() {
-        let text = "КонецПроцедуры\n&НаКлиенте\nПерем X;";
-        assert!(!has_variable_leading_description(off(text, "Перем"), text, Some(off(text, "&"))));
-    }
-
-    #[test]
-    fn annotation_on_first_line_only() {
-        let text = "&НаКлиенте\nПерем X;";
-        assert!(!has_variable_leading_description(off(text, "Перем"), text, Some(0)));
-    }
-
-    #[test]
-    fn anchor_at_zero_returns_false() {
-        assert!(!has_variable_leading_description(0, "Перем X;", None));
-    }
 }

@@ -214,6 +214,250 @@ fn path(root: &Path, rel: &str) -> PathBuf {
     root.join(rel)
 }
 
+fn extension_metadata_fixture() -> PathBuf {
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata"
+    ))
+}
+
+fn assert_extension_metadata_fields(run: &Run, tail: &str, extension_visible: bool) {
+    let unresolved = run.messages_at(tail, "UnresolvedField");
+    let query = run.messages_at(tail, "UnknownFieldInQuery");
+    for field in ["Номенклатура", "Количество"] {
+        assert!(
+            !unresolved.iter().any(|message| message.contains(field)),
+            "{field} is inherited for {tail}; UnresolvedField: {unresolved:?}"
+        );
+        assert!(
+            !query.iter().any(|message| message.contains(field)),
+            "{field} is inherited for {tail}; UnknownFieldInQuery: {query:?}"
+        );
+    }
+    for (code, messages) in [("UnresolvedField", &unresolved), ("UnknownFieldInQuery", &query)] {
+        assert_eq!(
+            messages.iter().any(|message| message.contains("РасшПоле")),
+            !extension_visible,
+            "extension visibility for {tail}; {code}: {messages:?}"
+        );
+    }
+    assert!(
+        unresolved.iter().any(|message| message.contains("НетТакогоПослеДобавить")),
+        "the Добавить() control must fire for {tail}: {unresolved:?}"
+    );
+    assert!(
+        query.iter().any(|message| message.contains("НетТакогоВЗапросе")),
+        "the query control must fire for {tail}: {query:?}"
+    );
+}
+
+#[test]
+fn extension_metadata_cli_covers_document_fields_common_module_and_external() {
+    let root = extension_metadata_fixture();
+    let run = analyze(
+        &root,
+        &[
+            "--configuration-root",
+            "base",
+            "--extension",
+            "Расширение=extension",
+            "--external",
+            "АРМ=external",
+        ],
+    );
+
+    assert_extension_metadata_fields(&run, "base/Documents/Заказ/Ext/ObjectModule.bsl", false);
+    assert_extension_metadata_fields(&run, "extension/Documents/Заказ/Ext/ObjectModule.bsl", true);
+    assert_extension_metadata_fields(&run, "external/АРМ/Ext/ObjectModule.bsl", true);
+
+    assert!(
+        run.messages_at("extension/CommonModules/Сервер/Ext/Module.bsl", "CommonModuleNameCached")
+            .is_empty(),
+        "the borrowed Сервер inherits DontUse"
+    );
+    assert_eq!(
+        run.messages_at(
+            "base/CommonModules/СерверЗапросов/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .len(),
+        1,
+        "a cached module without the naming marker remains a positive control"
+    );
+    assert!(
+        run.messages_at(
+            "base/CommonModules/СерверПовтИсп/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .is_empty(),
+        "a cached module with the marker remains clean"
+    );
+    assert_eq!(
+        run.messages_at(
+            "extension/CommonModules/СерверЗапросов/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .len(),
+        1,
+        "the borrowed module inherits DuringRequest"
+    );
+    assert_eq!(
+        run.messages_at(
+            "extension/CommonModules/СерверСеанса/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .len(),
+        1,
+        "the borrowed module inherits DuringSession"
+    );
+    assert_eq!(
+        run.messages_at(
+            "extension/CommonModules/СерверНеизвестный/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .len(),
+        1,
+        "explicit Unknown remains cached because only DontUse disables caching"
+    );
+    assert!(
+        run.messages_at(
+            "extension/CommonModules/СерверОтключаемый/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .is_empty(),
+        "explicit DontUse in the extension disables caching"
+    );
+    assert_eq!(
+        run.messages_at(
+            "extension/CommonModules/СерверВключаемый/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .len(),
+        1,
+        "explicit DuringRequest in the extension enables caching"
+    );
+    let extension_unresolved =
+        run.messages_at("extension/Documents/Заказ/Ext/ObjectModule.bsl", "UnresolvedField");
+    assert!(
+        !extension_unresolved.iter().any(|message| message.contains("Добавлено")),
+        "the extension-only section field resolves: {extension_unresolved:?}"
+    );
+    assert!(
+        extension_unresolved.iter().any(|message| message.contains("НетТакогоВРасшТаблице")),
+        "the extension-only section row stays typed: {extension_unresolved:?}"
+    );
+}
+
+#[test]
+fn extension_metadata_cli_no_extensions_keeps_base_and_rejects_extension_fields() {
+    let root = extension_metadata_fixture();
+    let run = analyze(
+        &root,
+        &["--configuration-root", "base", "--no-extensions", "--external", "АРМ=external"],
+    );
+
+    assert_extension_metadata_fields(&run, "base/Documents/Заказ/Ext/ObjectModule.bsl", false);
+    assert_extension_metadata_fields(&run, "external/АРМ/Ext/ObjectModule.bsl", false);
+    assert!(
+        run.file_event_at("extension/Documents/Заказ/Ext/ObjectModule.bsl").is_none(),
+        "the extension module must not be analyzed under --no-extensions"
+    );
+    for tail in [
+        "base/CommonModules/Сервер/Ext/Module.bsl",
+        "base/CommonModules/СерверПовтИсп/Ext/Module.bsl",
+    ] {
+        assert!(run.messages_at(tail, "CommonModuleNameCached").is_empty());
+    }
+    assert_eq!(
+        run.messages_at(
+            "base/CommonModules/СерверЗапросов/Ext/Module.bsl",
+            "CommonModuleNameCached"
+        )
+        .len(),
+        1
+    );
+    assert!(
+        run.files.iter().all(|event| {
+            event["path"].as_str().is_none_or(|path| !path.contains("/extension/"))
+        }),
+        "no extension file may enter the source set: {:?}",
+        run.files
+    );
+
+    let base_only = analyze(&root, &["--configuration-root", "base"]);
+    assert_extension_metadata_fields(
+        &base_only,
+        "base/Documents/Заказ/Ext/ObjectModule.bsl",
+        false,
+    );
+    assert!(base_only
+        .messages_at("base/CommonModules/Сервер/Ext/Module.bsl", "CommonModuleNameCached")
+        .is_empty());
+    assert!(
+        base_only.file_event_at("extension/Documents/Заказ/Ext/ObjectModule.bsl").is_none(),
+        "an ordinary base-only run must not analyze extension modules"
+    );
+    assert!(
+        base_only.files.iter().all(|event| {
+            event["path"].as_str().is_none_or(|path| !path.contains("/extension/"))
+        }),
+        "an ordinary base-only run must exclude every extension file: {:?}",
+        base_only.files
+    );
+}
+
+#[test]
+fn extension_metadata_cli_external_depends_on_empty_excludes_only_extension_metadata() {
+    let root = extension_metadata_fixture();
+    let run = analyze(
+        &root,
+        &[
+            "--configuration-root",
+            "base",
+            "--extension",
+            "Расширение=extension",
+            "--external",
+            "АРМ=external",
+            "--external-depends-on",
+            "АРМ=",
+        ],
+    );
+
+    assert_extension_metadata_fields(&run, "external/АРМ/Ext/ObjectModule.bsl", false);
+    assert_extension_metadata_fields(&run, "extension/Documents/Заказ/Ext/ObjectModule.bsl", true);
+}
+
+#[test]
+fn extension_metadata_cli_external_dependency_excludes_other_selected_extension() {
+    let root = extension_metadata_fixture();
+    let run = analyze(
+        &root,
+        &[
+            "--configuration-root",
+            "base",
+            "--extension",
+            "Расширение=extension",
+            "--extension",
+            "Зависимое=dependent",
+            "--extension-depends-on",
+            "Зависимое=Расширение",
+            "--external",
+            "АРМ=external",
+            "--external-depends-on",
+            "АРМ=Расширение",
+        ],
+    );
+
+    assert_extension_metadata_fields(&run, "external/АРМ/Ext/ObjectModule.bsl", true);
+    for code in ["UnresolvedField", "UnknownFieldInQuery"] {
+        let messages = run.messages_at("external/АРМ/Ext/ObjectModule.bsl", code);
+        assert!(
+            messages.iter().any(|message| message.contains("ЗависимоеПоле")),
+            "metadata from the excluded dependent extension must stay invisible; {code}: {messages:?}"
+        );
+    }
+}
+
 #[test]
 fn shared_configuration_dependency_resolves_from_project_dotenv() {
     let dir = workspace();

@@ -10,13 +10,13 @@ use rustc_hash::FxHashMap;
 pub struct ControlFlowGraph {
     graph: DiGraph<CfgVertex, CfgEdgeType>,
     statement_origins: FxHashMap<NodeIndex, StmtId>,
-    entry_point: Option<NodeIndex>,
-    exit_point: NodeIndex,
+    start: Option<NodeIndex>,
+    exit: NodeIndex,
 }
 
 impl PartialEq for ControlFlowGraph {
     fn eq(&self, other: &Self) -> bool {
-        if self.entry_point != other.entry_point || self.exit_point != other.exit_point {
+        if self.start != other.start || self.exit != other.exit {
             return false;
         }
 
@@ -36,9 +36,9 @@ impl ControlFlowGraph {
     pub fn new() -> Self {
         let mut graph = DiGraph::new();
 
-        let exit_point = graph.add_node(CfgVertex::Exit);
+        let exit = graph.add_node(CfgVertex::Exit);
 
-        Self { graph, statement_origins: FxHashMap::default(), entry_point: None, exit_point }
+        Self { graph, statement_origins: FxHashMap::default(), start: None, exit }
     }
 
     pub fn add_vertex(&mut self, vertex: CfgVertex) -> NodeIndex {
@@ -55,47 +55,22 @@ impl ControlFlowGraph {
         self.statement_origins.get(&index).copied()
     }
 
-    pub fn add_edge(
-        &mut self,
-        source: NodeIndex,
-        target: NodeIndex,
-        edge_type: CfgEdgeType,
-    ) -> Result<(), String> {
-        if let Some(source_vertex) = self.graph.node_weight(source) {
-            self.validate_outgoing_edge(source_vertex, edge_type)?;
-        }
-
+    pub fn add_edge(&mut self, source: NodeIndex, target: NodeIndex, edge_type: CfgEdgeType) {
         self.graph.add_edge(source, target, edge_type);
-        Ok(())
     }
 
-    fn validate_outgoing_edge(
-        &self,
-        source_vertex: &CfgVertex,
-        edge_type: CfgEdgeType,
-    ) -> Result<(), String> {
-        match source_vertex {
-            CfgVertex::Conditional(_) if !edge_type.is_conditional_branch() => {
-                return Err(format!(
-                    "Conditional vertex can only have TRUE_BRANCH or FALSE_BRANCH edges, got {:?}",
-                    edge_type
-                ));
-            }
-            _ => {}
-        }
-        Ok(())
+    pub fn set_start(&mut self, start: NodeIndex) {
+        self.start = Some(start);
     }
 
-    pub fn set_entry_point(&mut self, entry: NodeIndex) {
-        self.entry_point = Some(entry);
+    /// Where forward analyses begin. A graph built without a body has none.
+    pub fn start(&self) -> Option<NodeIndex> {
+        self.start
     }
 
-    pub fn entry_point(&self) -> Option<NodeIndex> {
-        self.entry_point
-    }
-
-    pub fn exit_point(&self) -> NodeIndex {
-        self.exit_point
+    /// Exists in every graph, so backward analyses always have a seed.
+    pub fn exit(&self) -> NodeIndex {
+        self.exit
     }
 
     /// Approximate live heap bytes of this graph for Salsa's `memory_usage`
@@ -103,8 +78,7 @@ impl ControlFlowGraph {
     /// `Vec<Edge>`, each element a weight plus four `u32` index links) at element
     /// granularity, plus statement-origin metadata and the only vertex-owned heap: a basic
     /// block's `Vec<StmtId>`.
-    /// The `Exit`/branch/loop vertices own no extra heap; `LabelVertex`'s `Name`
-    /// is a small inlined `SmolStr` and is ignored. Spare capacity is not counted,
+    /// The other vertices own no extra heap. Spare capacity is not counted,
     /// so the figure tracks live content within a small factor.
     pub fn estimated_heap(&self) -> usize {
         use std::mem::size_of;
@@ -194,20 +168,13 @@ impl ControlFlowGraph {
         self.graph.edges_directed(vertex, Direction::Incoming).count()
     }
 
-    pub fn edge_presentation(&self, source: NodeIndex, target: NodeIndex) -> String {
-        let source_name = self.vertex(source).map(|v| v.type_name()).unwrap_or("?");
-        let target_name = self.vertex(target).map(|v| v.type_name()).unwrap_or("?");
-        format!("{}[{:?}] -> {}[{:?}]", source_name, source, target_name, target)
-    }
-
     pub fn reverse_postorder(&self) -> Vec<NodeIndex> {
-        let entry = match self.entry_point {
-            Some(e) => e,
-            None => return vec![],
+        let Some(start) = self.start else {
+            return vec![];
         };
 
         let mut postorder = Vec::with_capacity(self.vertex_count());
-        let mut dfs = DfsPostOrder::new(&self.graph, entry);
+        let mut dfs = DfsPostOrder::new(&self.graph, start);
 
         while let Some(node) = dfs.next(&self.graph) {
             postorder.push(node);
@@ -218,7 +185,7 @@ impl ControlFlowGraph {
     }
 
     pub fn postorder_from_exit(&self) -> Vec<NodeIndex> {
-        let exit = self.exit_point;
+        let exit = self.exit;
 
         let reversed = Reversed(&self.graph);
         let mut postorder = Vec::with_capacity(self.vertex_count());
@@ -249,8 +216,8 @@ mod tests {
     fn test_graph_creation() {
         let cfg = ControlFlowGraph::new();
         assert_eq!(cfg.vertex_count(), 1);
-        assert!(cfg.entry_point().is_none());
-        assert!(cfg.contains_vertex(cfg.exit_point()));
+        assert!(cfg.start().is_none());
+        assert!(cfg.contains_vertex(cfg.exit()));
     }
 
     #[test]
@@ -299,17 +266,17 @@ mod tests {
         let block1 = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let block2 = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
 
-        assert!(cfg.add_edge(block1, block2, CfgEdgeType::Direct).is_ok());
+        cfg.add_edge(block1, block2, CfgEdgeType::Unconditional);
         assert_eq!(cfg.edge_count(), 1);
     }
 
     #[test]
-    fn test_set_entry_point() {
+    fn test_set_start() {
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
 
-        assert_eq!(cfg.entry_point(), Some(entry));
+        assert_eq!(cfg.start(), Some(entry));
     }
 
     #[test]
@@ -319,10 +286,10 @@ mod tests {
         let b2 = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let b3 = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
 
-        cfg.set_entry_point(b1);
-        cfg.add_edge(b1, b2, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(b2, b3, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(b3, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(b1);
+        cfg.add_edge(b1, b2, CfgEdgeType::Unconditional);
+        cfg.add_edge(b2, b3, CfgEdgeType::Unconditional);
+        cfg.add_edge(b3, cfg.exit(), CfgEdgeType::Unconditional);
 
         let rpo = cfg.reverse_postorder();
 
@@ -342,14 +309,14 @@ mod tests {
         let b1 = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let b2 = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
 
-        cfg.set_entry_point(b1);
-        cfg.add_edge(b1, b2, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(b2, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(b1);
+        cfg.add_edge(b1, b2, CfgEdgeType::Unconditional);
+        cfg.add_edge(b2, cfg.exit(), CfgEdgeType::Unconditional);
 
         let postorder = cfg.postorder_from_exit();
 
         assert!(postorder.len() >= 3);
-        assert!(postorder.contains(&cfg.exit_point()));
+        assert!(postorder.contains(&cfg.exit()));
     }
 
     #[test]
@@ -360,12 +327,12 @@ mod tests {
         let loop_body = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let after_loop = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
 
-        cfg.set_entry_point(entry);
-        cfg.add_edge(entry, loop_header, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(loop_header, loop_body, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(loop_header, after_loop, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(loop_body, loop_header, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(after_loop, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.set_start(entry);
+        cfg.add_edge(entry, loop_header, CfgEdgeType::Unconditional);
+        cfg.add_edge(loop_header, loop_body, CfgEdgeType::TrueBranch);
+        cfg.add_edge(loop_header, after_loop, CfgEdgeType::FalseBranch);
+        cfg.add_edge(loop_body, loop_header, CfgEdgeType::Unconditional);
+        cfg.add_edge(after_loop, cfg.exit(), CfgEdgeType::Unconditional);
 
         let rpo = cfg.reverse_postorder();
 

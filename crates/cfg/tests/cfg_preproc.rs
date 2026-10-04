@@ -3,8 +3,8 @@ use expect_test::{expect, Expect};
 use hir_def::{hir::PreprocIfStmt, Body, Expr, Literal, LocalRange, Stmt};
 use syntax::{SyntaxKind, TextRange, TextSize};
 
-fn snapshot(cfg: ControlFlowGraph, expect: Expect) {
-    expect.assert_eq(&cfg::test_utils::format_cfg(&cfg));
+fn snapshot(body: &Body, expect: Expect) {
+    expect.assert_eq(&cfg::test_utils::format_cfg(&build(body), body));
 }
 
 fn build(body: &Body) -> ControlFlowGraph {
@@ -36,23 +36,23 @@ fn pre_if_elsif_else_materializes_preproc_conditions() {
     body.set_body_stmts(vec![preproc, after_preproc].into());
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:EMPTY:0
               EXIT:EMPTY:3
               NORMAL:CALL_STMT:2:#1644ee6a
-              NORMAL:CALL_STMT:2:#7bceca9e
+              NORMAL:CALL_STMT:2:#c4480dec
               NORMAL:CALL_STMT:3:#00a972c0
               NORMAL:CALL_STMT:3:#9e03b807
               NORMAL:PRE_IF_DIR:1
               NORMAL:PRE_IF_DIR:2
             edges:
-              ENTRY:EMPTY:0 -> NORMAL:PRE_IF_DIR:1 [Direct]
-              NORMAL:CALL_STMT:2:#1644ee6a -> NORMAL:CALL_STMT:2:#7bceca9e [Direct]
-              NORMAL:CALL_STMT:2:#7bceca9e -> EXIT:EMPTY:3 [Direct]
-              NORMAL:CALL_STMT:3:#00a972c0 -> NORMAL:CALL_STMT:2:#7bceca9e [Direct]
-              NORMAL:CALL_STMT:3:#9e03b807 -> NORMAL:CALL_STMT:2:#7bceca9e [Direct]
+              ENTRY:EMPTY:0 -> NORMAL:PRE_IF_DIR:1 [Unconditional]
+              NORMAL:CALL_STMT:2:#1644ee6a -> NORMAL:CALL_STMT:2:#c4480dec [Unconditional]
+              NORMAL:CALL_STMT:2:#c4480dec -> EXIT:EMPTY:3 [Unconditional]
+              NORMAL:CALL_STMT:3:#00a972c0 -> NORMAL:CALL_STMT:2:#c4480dec [Unconditional]
+              NORMAL:CALL_STMT:3:#9e03b807 -> NORMAL:CALL_STMT:2:#c4480dec [Unconditional]
               NORMAL:PRE_IF_DIR:1 -> NORMAL:CALL_STMT:2:#1644ee6a [TrueBranch]
               NORMAL:PRE_IF_DIR:1 -> NORMAL:PRE_IF_DIR:2 [FalseBranch]
               NORMAL:PRE_IF_DIR:2 -> NORMAL:CALL_STMT:3:#00a972c0 [FalseBranch]
@@ -71,13 +71,13 @@ fn pre_region_dir_kind_smoke_does_not_change_plain_cfg() {
     body.set_body_stmts(vec![stmt].into());
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:CALL_STMT:0
               EXIT:EMPTY:1
             edges:
-              ENTRY:CALL_STMT:0 -> EXIT:EMPTY:1 [Direct]
+              ENTRY:CALL_STMT:0 -> EXIT:EMPTY:1 [Unconditional]
         "#]],
     );
 }

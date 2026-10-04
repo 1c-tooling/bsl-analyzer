@@ -120,6 +120,11 @@ pub struct WorkspaceRoots {
     /// Not part of root identity: the transition machinery compares roots, and a cache
     /// moved without the roots moving is not a topology change.
     excluded: Vec<PathBuf>,
+    /// Directories the user took out of the project (`[source].exclude`). Unlike
+    /// `excluded`, part of identity: changing them changes which files the roots hold,
+    /// so a table that differs only here describes a different source universe. A path
+    /// inside one belongs to no root, whether a walk reaches it or a caller names it.
+    user_excluded: project_model::ExcludedPaths,
 }
 
 /// Equality is the ROOTS, and the doc on `excluded` is what the machinery around this
@@ -141,6 +146,7 @@ impl PartialEq for WorkspaceRoots {
         self.workspace == other.workspace
             && self.workspace_canonical == other.workspace_canonical
             && self.roots == other.roots
+            && self.user_excluded == other.user_excluded
     }
 }
 
@@ -222,6 +228,7 @@ impl WorkspaceRoots {
                 workspace_canonical,
                 roots,
                 excluded: Vec::new(),
+                user_excluded: project_model::ExcludedPaths::default(),
             },
             rejected,
         )
@@ -260,6 +267,9 @@ impl WorkspaceRoots {
     /// through. What remains is the key space's own long-standing property: two names that
     /// differ only in unrepresentable bytes share a key, whichever spelling reaches it.
     pub fn root_of(&self, walked: &Path, canonical: &Path) -> Option<FileKey> {
+        if self.user_excluded.is_excluded(walked) || self.user_excluded.is_excluded(canonical) {
+            return None;
+        }
         self.longest_match(canonical, |root| &root.canonical)
             .or_else(|| self.longest_match(walked, |root| &root.declared))
     }
@@ -270,6 +280,9 @@ impl WorkspaceRoots {
     /// a root declared through a link, the walked path also lies under the enclosing root's
     /// canonical spelling, handing the key to the wrong root.
     pub(crate) fn root_of_declared(&self, walked: &Path) -> Option<FileKey> {
+        if self.user_excluded.is_excluded(walked) {
+            return None;
+        }
         self.longest_match(walked, |root| &root.declared)
     }
 
@@ -385,6 +398,20 @@ impl WorkspaceRoots {
     /// See [`Self::with_excluded`].
     pub fn excluded(&self) -> &[PathBuf] {
         &self.excluded
+    }
+
+    /// The directories the user took out of the project, re-spelled under each root so
+    /// that a walk from a root declared through a link recognises them too.
+    #[must_use]
+    pub fn with_user_excluded(mut self, user_excluded: &project_model::ExcludedPaths) -> Self {
+        let declared: Vec<PathBuf> = self.roots.iter().map(|root| root.declared.clone()).collect();
+        self.user_excluded = user_excluded.respelled_under(&declared);
+        self
+    }
+
+    /// See [`Self::with_user_excluded`].
+    pub fn user_excluded(&self) -> &project_model::ExcludedPaths {
+        &self.user_excluded
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&str, &Path)> {
@@ -619,6 +646,26 @@ mod tests {
         // would hold on a build where every table equals every other.
         let (moved, _) = WorkspaceRoots::build(dir.path(), &made[1], &[]);
         assert_ne!(with_cache, moved, "two different root sets compared equal");
+    }
+
+    #[test]
+    fn user_exclusions_change_identity_and_reject_addressed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let made = dirs(dir.path(), &["cf"]);
+        let hidden = made[0].join("Generated");
+        let visible = made[0].join("Generated2");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::create_dir_all(&visible).unwrap();
+        let (roots, _) = WorkspaceRoots::build(dir.path(), &made[0], &[]);
+        let scoped =
+            roots.clone().with_user_excluded(&project_model::ExcludedPaths::new([hidden.clone()]));
+
+        assert_ne!(roots, scoped, "changing only [source].exclude reused root identity");
+        assert!(scoped.key_of_path(&hidden.join("Module.bsl")).is_none());
+        assert_eq!(
+            scoped.key_of_path(&visible.join("Module.bsl")),
+            Some(FileKey::configuration("Generated2/Module.bsl"))
+        );
     }
 
     #[test]

@@ -1,0 +1,27 @@
+complexity: 1
+live: {0}
+dead: [1, 2]
+evaluations: {"directive:Some(LocalRange(43..76))": {"condition=LocalRange(53..65); directive=Some(LocalRange(43..76)); full=Some(LocalRange(43..124))"}}
+expr ExprId(0): Some(LocalRange(78..79))
+expr ExprId(1): Some(LocalRange(82..83))
+expr ExprId(2): Some(LocalRange(98..99))
+expr ExprId(3): Some(LocalRange(102..103))
+transitions:
+  s0 -> exit
+  s1 -> exit
+  s2 -> exit
+definitions (limit 3):
+  s0: Some([])
+  s1: Some([])
+  s2: Some([])
+  s3: None
+definitions (limit 10000):
+  s0: Some([])
+  s1: Some([])
+  s2: Some([])
+  s3: None
+source states:
+  s0: range=Some(LocalRange(27..42)); fallthrough=false; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(78..83)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s2: range=Some(LocalRange(98..103)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

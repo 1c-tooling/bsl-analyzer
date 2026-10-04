@@ -662,8 +662,8 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("change_hub.rs", "wait", ".wait_timeout_while(", Waiting::OwnProtocol),
     // The re-arm handshake and the hub's stop poll: bounded in the source by
     // `REARM_ACK_TIMEOUT` and `STOP_BUDGET`.
-    ("change_hub.rs", "rearm", ".recv_timeout(", Waiting::Bounded),
-    ("change_hub.rs", "rearm", "thread::sleep", Waiting::Bounded),
+    ("change_hub.rs", "handshake", ".recv_timeout(", Waiting::Bounded),
+    ("change_hub.rs", "handshake", "thread::sleep", Waiting::Bounded),
     ("change_hub.rs", "stop", "thread::sleep", Waiting::Bounded),
     ("change_hub.rs", "stop", "thread::sleep", Waiting::Bounded),
     // What a consumer parks in: released by the hub's `closing`, which the stop raises, and

@@ -1,0 +1,31 @@
+complexity: 1
+live: {0, 1, 2, 3, 4}
+dead: []
+evaluations: {}
+expr ExprId(0): Some(LocalRange(27..28))
+expr ExprId(1): Some(LocalRange(31..32))
+expr ExprId(2): Some(LocalRange(42..43))
+expr ExprId(3): Some(LocalRange(46..47))
+expr ExprId(4): Some(LocalRange(58..59))
+expr ExprId(5): Some(LocalRange(62..63))
+transitions:
+  s0 -> s1
+  s1 -> s2
+  s2 -> s3
+  s3 -> s4
+  s4 -> exit
+definitions (limit 3):
+  s0: Some([])
+  s2: Some(["Definition { var_name: \"a\", def_site: Assignment(0) }"])
+  s4: Some([])
+definitions (limit 10000):
+  s0: Some([])
+  s2: Some(["Definition { var_name: \"a\", def_site: Assignment(0) }"])
+  s4: Some(["Definition { var_name: \"a\", def_site: Assignment(0) }", "Definition { var_name: \"b\", def_site: Assignment(2) }"])
+source states:
+  s0: range=Some(LocalRange(27..32)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(34..41)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s2: range=Some(LocalRange(42..47)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s3: range=Some(LocalRange(49..57)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s4: range=Some(LocalRange(58..63)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

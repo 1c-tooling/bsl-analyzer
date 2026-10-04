@@ -1,6 +1,6 @@
 use parser_error::{ParseError, RecoveryKind};
 
-use crate::{Parse, SyntaxKind, SyntaxNode, TextRange};
+use crate::{NodeOrToken, Parse, SyntaxKind, SyntaxNode, TextRange, TextSize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SdblQueryInfo {
@@ -13,6 +13,10 @@ pub struct SdblQueryInfo {
     pub quote_corrections: Vec<(usize, usize)>,
 
     pub error_ranges_in_bsl: Vec<(TextRange, ParseError)>,
+
+    /// How the query text lies in a literal torn by extension markers; `None`
+    /// for an ordinary literal, whose query lies line for line.
+    pub literal_map: Option<LiteralTextMap>,
 }
 
 /// The parsed query of one string literal without the literal's position —
@@ -28,6 +32,10 @@ pub struct SdblQuery {
 
     /// Parse errors in the coordinates of the literal text.
     pub error_ranges_in_bsl: Vec<(TextRange, ParseError)>,
+
+    /// How the query text lies in a literal torn by extension markers; `None`
+    /// for an ordinary literal, whose query lies line for line.
+    pub literal_map: Option<LiteralTextMap>,
 }
 
 impl SdblQuery {
@@ -48,6 +56,7 @@ impl SdblQueryInfo {
             query_ast: query.query_ast.clone(),
             quote_corrections: query.quote_corrections.clone(),
             error_ranges_in_bsl: query.error_ranges_in_bsl.clone(),
+            literal_map: query.literal_map.clone(),
         }
     }
 
@@ -58,7 +67,14 @@ impl SdblQueryInfo {
         quote_corrections: Vec<(usize, usize)>,
         error_ranges_in_bsl: Vec<(TextRange, ParseError)>,
     ) -> Self {
-        Self { bsl_literal_range, query_text, query_ast, quote_corrections, error_ranges_in_bsl }
+        Self {
+            bsl_literal_range,
+            query_text,
+            query_ast,
+            quote_corrections,
+            error_ranges_in_bsl,
+            literal_map: None,
+        }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -209,6 +225,196 @@ pub fn extract_sdbl_with_corrections(node: &SyntaxNode) -> Option<(String, Vec<(
     }
 
     Some((result, corrections))
+}
+
+/// Where one piece of the active text lies in the literal: `text_len` bytes of
+/// the text at `text_start` come from `literal_len` bytes of the literal at
+/// `literal_start`. A doubled quote is two literal bytes for one, a line break
+/// is the newline, the indent and the `|` of the next line for one `\n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MapUnit {
+    text_start: u32,
+    text_len: u32,
+    literal_start: u32,
+    literal_len: u32,
+}
+
+/// The text a string literal holds once the extension markers inside it are
+/// applied, and where each of its bytes stands in the literal.
+///
+/// The platform applies `#Вставка` and `#Удаление` to the module text, so a
+/// literal they tear apart holds its inserted lines and none of the removed
+/// ones — and the markers are no part of it. Line arithmetic cannot place such
+/// a text back in the source: a query line is no longer the literal line of the
+/// same number, and the lines in between are not text of the literal. The map
+/// is built together with the text so that every consumer places a position
+/// the same way.
+///
+/// Offsets on the literal side are relative to the literal's start, so the map
+/// stays equal when the literal moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralTextMap {
+    units: Vec<MapUnit>,
+    text_len: u32,
+    /// The end of the active content: where the closing quote stands, or where
+    /// the last active line ends when the literal is not closed.
+    content_end: u32,
+}
+
+impl LiteralTextMap {
+    /// Places a range of the active text in the literal.
+    ///
+    /// A non-empty range covers the source bytes of every character it holds;
+    /// an empty one stands before the character at its position, and past the
+    /// last character — before the closing quote.
+    pub fn map_range_to_literal(&self, range: TextRange) -> TextRange {
+        let start = self.literal_position(u32::from(range.start()));
+        if range.is_empty() {
+            return TextRange::empty(start.into());
+        }
+        let end = match self.unit_at_text(u32::from(range.end()) - 1) {
+            Some(unit) => unit.literal_start + unit.literal_len,
+            None => self.content_end,
+        };
+        TextRange::new(start.into(), end.max(start).into())
+    }
+
+    /// The offset in the active text that a literal offset stands at, or
+    /// `None` where the literal holds no active text — on a marker, or in what
+    /// an extension removed.
+    pub fn map_offset_to_text(&self, literal_offset: TextSize) -> Option<TextSize> {
+        let offset = u32::from(literal_offset);
+        if offset == self.content_end {
+            return Some(self.text_len.into());
+        }
+        let index =
+            self.units.partition_point(|unit| unit.literal_start <= offset).checked_sub(1)?;
+        let unit = self.units[index];
+        if offset >= unit.literal_start + unit.literal_len {
+            return None;
+        }
+        let inside =
+            if unit.text_len == unit.literal_len { offset - unit.literal_start } else { 0 };
+        Some((unit.text_start + inside).into())
+    }
+
+    fn literal_position(&self, text_offset: u32) -> u32 {
+        self.unit_at_text(text_offset).map_or(self.content_end, |unit| unit.literal_start)
+    }
+
+    fn unit_at_text(&self, text_offset: u32) -> Option<MapUnit> {
+        if text_offset >= self.text_len {
+            return None;
+        }
+        let index = self.units.partition_point(|unit| unit.text_start <= text_offset);
+        index.checked_sub(1).map(|index| self.units[index])
+    }
+}
+
+/// Whether the literal is torn apart by extension markers — whether its text
+/// has to be read through [`extract_torn_literal`].
+pub fn is_torn_literal(literal: &SyntaxNode) -> bool {
+    literal.kind() == SyntaxKind::LITERAL
+        && literal
+            .children_with_tokens()
+            .any(|child| crate::ast_utils::is_extension_directive(&child))
+}
+
+/// The active text of a literal torn by extension markers, with its map; `None`
+/// for any other literal.
+///
+/// Inserted lines are part of the text, removed ones are not, and a closing
+/// line inside a removed block does not close the literal. What looks like a
+/// marker inside a line of the literal is its text: the lexer takes a line of a
+/// literal whole.
+pub fn extract_torn_literal(literal: &SyntaxNode) -> Option<(String, LiteralTextMap)> {
+    if !is_torn_literal(literal) {
+        return None;
+    }
+    let base = literal.text_range().start();
+    let relative = |offset: TextSize| u32::from(offset - base);
+
+    let mut builder = TornLiteralBuilder::default();
+    let mut started = false;
+    let mut line_break_start = None;
+
+    for child in literal.children_with_tokens() {
+        let token = match child {
+            NodeOrToken::Node(_) => {
+                line_break_start = None;
+                continue;
+            }
+            NodeOrToken::Token(token) => token,
+        };
+        let start = relative(token.text_range().start());
+        match token.kind() {
+            SyntaxKind::STRING_START if !started => {
+                started = true;
+                builder.push_content(&token.text()[1..], start + 1);
+            }
+            SyntaxKind::STRING_PART | SyntaxKind::STRING_TAIL if started => {
+                let text = token.text();
+                let break_start = line_break_start.take().unwrap_or(start);
+                builder.push_unit('\n', break_start, start + 1 - break_start);
+                let content = &text[1..];
+                let content = if token.kind() == SyntaxKind::STRING_TAIL {
+                    content.strip_suffix('"').unwrap_or(content)
+                } else {
+                    content
+                };
+                builder.push_content(content, start + 1);
+                if token.kind() == SyntaxKind::STRING_TAIL {
+                    break;
+                }
+            }
+            SyntaxKind::NEWLINE => line_break_start = Some(start),
+            SyntaxKind::PRE_INSERT | SyntaxKind::PRE_END_INSERT => line_break_start = None,
+            kind if kind.is_trivia() => {}
+            _ => break,
+        }
+    }
+
+    started.then(|| builder.finish())
+}
+
+#[derive(Default)]
+struct TornLiteralBuilder {
+    text: String,
+    units: Vec<MapUnit>,
+    content_end: u32,
+}
+
+impl TornLiteralBuilder {
+    fn push_content(&mut self, content: &str, literal_start: u32) {
+        let mut chars = content.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            let at = literal_start + index as u32;
+            if ch == '"' && chars.peek().is_some_and(|&(_, next)| next == '"') {
+                chars.next();
+                self.push_unit('"', at, 2);
+            } else {
+                self.push_unit(ch, at, ch.len_utf8() as u32);
+            }
+        }
+        self.content_end = literal_start + content.len() as u32;
+    }
+
+    fn push_unit(&mut self, ch: char, literal_start: u32, literal_len: u32) {
+        let text_start = self.text.len() as u32;
+        self.text.push(ch);
+        self.units.push(MapUnit {
+            text_start,
+            text_len: ch.len_utf8() as u32,
+            literal_start,
+            literal_len,
+        });
+        self.content_end = literal_start + literal_len;
+    }
+
+    fn finish(self) -> (String, LiteralTextMap) {
+        let text_len = self.text.len() as u32;
+        (self.text, LiteralTextMap { units: self.units, text_len, content_end: self.content_end })
+    }
 }
 
 pub fn map_range_query_to_literal(literal_text: &str, query_range: TextRange) -> TextRange {

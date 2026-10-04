@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ignore::WalkBuilder;
 
+use crate::path_exclusion::{ExcludedPaths, ResolvedDirs};
+
 pub struct WalkResult<T> {
     items: Vec<T>,
 }
@@ -25,7 +27,22 @@ impl<T> WalkResult<T> {
 pub struct WalkConfig<'a> {
     pub extensions: &'a [&'a str],
     pub excludes: &'a [&'a Path],
+    /// Directories taken out of the walk whatever spelling reaches them, the walk's
+    /// roots included.
+    pub excluded: Option<&'a ExcludedPaths>,
     pub follow_links: bool,
+}
+
+/// Whether the walk must not go into (or past) `entry`.
+fn skips(config: &WalkConfig<'_>, entry: &ignore::DirEntry, resolved: &mut ResolvedDirs) -> bool {
+    let path = entry.path();
+    if config.excludes.iter().any(|ex| path.starts_with(ex)) {
+        return true;
+    }
+    let Some(excluded) = config.excluded else { return false };
+    let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+    (is_dir || entry.depth() == 0 || entry.path_is_symlink())
+        && excluded.prunes_walked_dir(path, entry.path_is_symlink(), resolved)
 }
 
 pub fn parallel_count(roots: &[&Path], config: &WalkConfig<'_>) -> usize {
@@ -47,11 +64,12 @@ pub fn parallel_count_cancellable(
         let mut builder = WalkBuilder::new(root);
         builder.follow_links(config.follow_links).standard_filters(false).hidden(false);
 
-        let excludes = config.excludes;
         let extensions = config.extensions;
 
         builder.build_parallel().run(|| {
-            Box::new(|entry| {
+            let count = &count;
+            let mut resolved = ResolvedDirs::default();
+            Box::new(move |entry| {
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     return ignore::WalkState::Quit;
                 }
@@ -60,11 +78,10 @@ pub fn parallel_count_cancellable(
                     return ignore::WalkState::Continue;
                 };
 
-                let path = entry.path();
-
-                if excludes.iter().any(|ex| path.starts_with(ex)) {
+                if skips(config, &entry, &mut resolved) {
                     return ignore::WalkState::Skip;
                 }
+                let path = entry.path();
 
                 let Some(file_type) = entry.file_type() else {
                     return ignore::WalkState::Continue;
@@ -96,20 +113,20 @@ pub fn parallel_walk_paths(
         let mut builder = WalkBuilder::new(root);
         builder.follow_links(config.follow_links).standard_filters(false).hidden(false);
 
-        let excludes = config.excludes;
         let extensions = config.extensions;
 
         builder.build_parallel().run(|| {
-            Box::new(|entry| {
+            let items = &items;
+            let mut resolved = ResolvedDirs::default();
+            Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
                 };
 
-                let path = entry.path();
-
-                if excludes.iter().any(|ex| path.starts_with(ex)) {
+                if skips(config, &entry, &mut resolved) {
                     return ignore::WalkState::Skip;
                 }
+                let path = entry.path();
 
                 let Some(file_type) = entry.file_type() else {
                     return ignore::WalkState::Continue;
@@ -141,20 +158,20 @@ pub fn parallel_read_files(
         let mut builder = WalkBuilder::new(root);
         builder.follow_links(config.follow_links).standard_filters(false).hidden(false);
 
-        let excludes = config.excludes;
         let extensions = config.extensions;
 
         builder.build_parallel().run(|| {
-            Box::new(|entry| {
+            let items = &items;
+            let mut resolved = ResolvedDirs::default();
+            Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
                 };
 
-                let path = entry.path();
-
-                if excludes.iter().any(|ex| path.starts_with(ex)) {
+                if skips(config, &entry, &mut resolved) {
                     return ignore::WalkState::Skip;
                 }
+                let path = entry.path();
 
                 let Some(file_type) = entry.file_type() else {
                     return ignore::WalkState::Continue;
@@ -193,20 +210,21 @@ where
         let mut builder = WalkBuilder::new(root);
         builder.follow_links(config.follow_links).standard_filters(false).hidden(false);
 
-        let excludes = config.excludes;
         let extensions = config.extensions;
 
         builder.build_parallel().run(|| {
-            Box::new(|entry| {
+            let items = &items;
+            let transform = &transform;
+            let mut resolved = ResolvedDirs::default();
+            Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
                 };
 
-                let path = entry.path();
-
-                if excludes.iter().any(|ex| path.starts_with(ex)) {
+                if skips(config, &entry, &mut resolved) {
                     return ignore::WalkState::Skip;
                 }
+                let path = entry.path();
 
                 let Some(file_type) = entry.file_type() else {
                     return ignore::WalkState::Continue;
@@ -249,20 +267,22 @@ where
         let mut builder = WalkBuilder::new(root);
         builder.follow_links(config.follow_links).standard_filters(false).hidden(false);
 
-        let excludes = config.excludes;
         let extensions = config.extensions;
 
         builder.build_parallel().run(|| {
-            Box::new(|entry| {
+            let items = &items;
+            let transform = &transform;
+            let on_progress = &on_progress;
+            let mut resolved = ResolvedDirs::default();
+            Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
                 };
 
-                let path = entry.path();
-
-                if excludes.iter().any(|ex| path.starts_with(ex)) {
+                if skips(config, &entry, &mut resolved) {
                     return ignore::WalkState::Skip;
                 }
+                let path = entry.path();
 
                 let Some(file_type) = entry.file_type() else {
                     return ignore::WalkState::Continue;
@@ -320,14 +340,14 @@ mod tests {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         let baseline = parallel_count(
             &[here],
-            &WalkConfig { extensions: &["rs"], excludes: &[], follow_links: false },
+            &WalkConfig { extensions: &["rs"], excludes: &[], excluded: None, follow_links: false },
         );
         assert!(baseline >= 1, "expected at least one .rs file under stdx/, got {baseline}");
 
         let cancel = AtomicBool::new(true);
         let cancelled = parallel_count_cancellable(
             &[here],
-            &WalkConfig { extensions: &["rs"], excludes: &[], follow_links: false },
+            &WalkConfig { extensions: &["rs"], excludes: &[], excluded: None, follow_links: false },
             Some(&cancel),
         );
         assert_eq!(cancelled, 0, "pre-set cancel must short-circuit before any fetch_add");
@@ -336,7 +356,8 @@ mod tests {
     #[test]
     fn parallel_count_cancellable_matches_uncancelled_when_disabled() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let cfg = WalkConfig { extensions: &["rs"], excludes: &[], follow_links: false };
+        let cfg =
+            WalkConfig { extensions: &["rs"], excludes: &[], excluded: None, follow_links: false };
         let plain = parallel_count(&[here], &cfg);
         let with_none = parallel_count_cancellable(&[here], &cfg, None);
         assert_eq!(plain, with_none);

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.20">
+  <Document uuid="15500000-0000-0000-0000-000000000110">
+    <Properties><Name>Заказ</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>15500000-0000-0000-0000-000000000010</ExtendedConfigurationObject></Properties>
+    <ChildObjects>
+      <Attribute uuid="15500000-0000-0000-0000-000000000111">
+        <Properties>
+          <Name>РасшРеквизит</Name>
+          <Type><v8:Type>xs:string</v8:Type><v8:StringQualifiers><v8:Length>30</v8:Length></v8:StringQualifiers></Type>
+        </Properties>
+      </Attribute>
+      <TabularSection uuid="15500000-0000-0000-0000-000000000112">
+        <Properties><Name>Товары</Name></Properties>
+        <ChildObjects>
+          <Attribute uuid="15500000-0000-0000-0000-000000000113">
+            <Properties>
+              <Name>Количество</Name>
+              <Type><v8:Type>xs:string</v8:Type><v8:StringQualifiers><v8:Length>15</v8:Length></v8:StringQualifiers></Type>
+            </Properties>
+          </Attribute>
+          <Attribute uuid="15500000-0000-0000-0000-000000000114">
+            <Properties>
+              <Name>РасшПоле</Name>
+              <Type><v8:Type>xs:string</v8:Type><v8:StringQualifiers><v8:Length>25</v8:Length></v8:StringQualifiers></Type>
+            </Properties>
+          </Attribute>
+        </ChildObjects>
+      </TabularSection>
+      <TabularSection uuid="15500000-0000-0000-0000-000000000115">
+        <Properties><Name>РасшТаблица</Name></Properties>
+        <ChildObjects>
+          <Attribute uuid="15500000-0000-0000-0000-000000000116">
+            <Properties>
+              <Name>Добавлено</Name>
+              <Type><v8:Type>xs:string</v8:Type></Type>
+            </Properties>
+          </Attribute>
+        </ChildObjects>
+      </TabularSection>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>

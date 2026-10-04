@@ -1,15 +1,7 @@
-//! Разбор устойчив: тот же вход даёт то же дерево.
-//!
-//! Снятие ветки, принимавшей вложенную аннотацию значением параметра, изменило
-//! классификацию одного класса входов. Правка поведения обязана предъявить не
-//! только то, ЧТО изменилось, но и то, что не изменилось ничего сверх этого:
-//! классификацию корпуса закрывает замер в аттестации, устойчивость самого
-//! разбора — эта проверка.
+//! Дерево, текст и диапазоны ошибок не зависят от повторного разбора и кеша.
 //!
 //! Provenance: `docs/legal/bsl-clean-room-slice-b3.md`.
 
-/// Входы подобраны так, чтобы среди них были задетые правкой и соседние с ней:
-/// проверка на одних лишь безошибочных входах зелена при любом восстановлении.
 const INPUTS: &[&str] = &[
     "&Перед(&НаКлиенте)\nПроцедура Т() КонецПроцедуры",
     "&Перед(\"Тест\")\nПроцедура Т() КонецПроцедуры",
@@ -19,47 +11,59 @@ const INPUTS: &[&str] = &[
     "Функция Ф()\n  Попытка\n    Выполнить Х;\n  Исключение\n    ВызватьИсключение;\n  КонецПопытки;\nКонецФункции",
     "Х = \"первая\"\n  \"вторая\";",
     "Перейти ~М;\n~М: Х = 1;",
+    "Х = а = б = в;",
+    "Х = -а.б + Ф();",
+    "Процедура П(Знач",
+    "Процедура П()\nЕсли А Тогда\nХ = Ф(\nКонецПроцедуры",
+    "Х = \"первая\n|вторая",
+    "Процедура П()\nХ = А.\nКонецПроцедуры",
+    "Х = Новый Файл(\"а\").Имя;",
+    "Х = а = Не б;",
 ];
+
+#[derive(Debug, PartialEq, Eq)]
+struct Observation {
+    tree: String,
+    errors: Vec<String>,
+}
+
+fn observe(parsed: syntax::Parse<syntax::SyntaxNode>) -> Observation {
+    Observation {
+        tree: format!("{:#?}", parsed.syntax_node()),
+        errors: parsed.errors().iter().map(|error| format!("{error:?}")).collect(),
+    }
+}
 
 #[test]
 fn parsing_the_same_input_twice_gives_the_same_tree() {
-    let mut breaches = Vec::new();
-
     for input in INPUTS {
-        let first = format!("{:#?}", parser::parse(input).syntax_node());
-        let second = format!("{:#?}", parser::parse(input).syntax_node());
-        if first != second {
-            breaches.push(format!("дерево разошлось между прогонами: {input:?}"));
-        }
-
-        let errors_first = parser::parse(input).errors().len();
-        let errors_second = parser::parse(input).errors().len();
-        if errors_first != errors_second {
-            breaches.push(format!(
-                "число ошибок разошлось между прогонами ({errors_first} против {errors_second}): {input:?}"
-            ));
-        }
+        assert_eq!(observe(parser::parse(input)), observe(parser::parse(input)), "{input:?}");
     }
-
-    assert!(!INPUTS.is_empty(), "список входов пуст — проверка была бы зелена вхолостую");
-    assert!(breaches.is_empty(), "разбор неустойчив:\n  {}", breaches.join("\n  "));
 }
 
-/// Общий кеш разбора даёт то же дерево, что и разбор без него.
-///
-/// Это второй способ прочитать «независимость от порядка обхода»: путь через
-/// общий кеш видит вход после других входов, а не в одиночестве.
 #[test]
 fn the_shared_cache_does_not_change_the_tree() {
-    let mut breaches = Vec::new();
-
-    for input in INPUTS {
-        let plain = format!("{:#?}", parser::parse(input).syntax_node());
-        let shared = format!("{:#?}", parser::parse_with_shared_cache(input).syntax_node());
-        if plain != shared {
-            breaches.push(format!("дерево зависит от кеша: {input:?}"));
-        }
+    let plain: Vec<_> = INPUTS.iter().map(|input| observe(parser::parse(input))).collect();
+    for index in (0..INPUTS.len()).chain((0..INPUTS.len()).rev()) {
+        let input = INPUTS[index];
+        assert_eq!(plain[index], observe(parser::parse_with_shared_cache(input)), "{input:?}");
     }
+}
 
-    assert!(breaches.is_empty(), "разбор зависит от порядка:\n  {}", breaches.join("\n  "));
+#[test]
+fn the_stability_observer_sees_changed_trees_error_messages_and_ranges() {
+    let clean = observe(parser::parse("Х = а Или б И в;"));
+    let changed_tree = observe(parser::parse("Х = а И б Или в;"));
+    assert_ne!(clean.tree, changed_tree.tree);
+    assert_eq!(clean.errors, changed_tree.errors);
+
+    let original = parser::parse("Х = а = Не б;");
+    assert!(original.has_errors());
+    let mut changed_message = observe(original.clone());
+    changed_message.errors[0].push_str("changed");
+    assert_ne!(observe(original), changed_message);
+
+    let shifted = observe(parser::parse("  Х = а = Не б;"));
+    let plain = observe(parser::parse("Х = а = Не б;"));
+    assert_ne!(plain.errors, shifted.errors);
 }

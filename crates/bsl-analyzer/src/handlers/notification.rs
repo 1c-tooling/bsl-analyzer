@@ -17,6 +17,28 @@ fn is_handled_uri(uri: &Url) -> bool {
     uri.to_file_path().map(|p| project_model::is_bsl_source_path(&p)).unwrap_or(false)
 }
 
+/// Whether `uri` names a document the project's `[source].exclude` took out. Such a
+/// document stays in the editor's buffer set but is never analysed.
+fn is_excluded_document(state: &GlobalState, uri: &Url) -> bool {
+    uri.to_file_path().is_ok_and(|path| state.is_source_excluded_resolved(&path))
+}
+
+/// Cancel whatever diagnostics work is pending for `uri` and clear what was published
+/// for it, from either stream. The generation moves on too: a result already computed
+/// and queued must not be published after the withdrawal, while the buffer stays open.
+pub(crate) fn withdraw_document_diagnostics(state: &mut GlobalState, uri: &Url) {
+    if let Some(token) = state.diagnostics_tokens.remove(uri) {
+        token.cancel();
+    }
+    *state.diagnostics_generation.entry(uri.clone()).or_insert(0) += 1;
+    state.clear_batch_push_for(uri);
+    let params = PublishDiagnosticsParams { uri: uri.clone(), diagnostics: vec![], version: None };
+    let notification = Notification::new("textDocument/publishDiagnostics".to_string(), params);
+    if let Err(error) = state.sender.send(notification.into()) {
+        tracing::warn!(%uri, %error, "could not withdraw diagnostics of an excluded document");
+    }
+}
+
 pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     // A pull-capable client with the feature enabled drives diagnostics via
     // `textDocument/diagnostic`; publishing here too would double-report open buffers.
@@ -32,6 +54,11 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     // finalize reschedules every open document, so deferring loses nothing.
     if !state.vfs_done {
         tracing::debug!(%uri, "diagnostics deferred until workspace load completes");
+        return;
+    }
+
+    if is_excluded_document(state, uri) {
+        tracing::debug!(%uri, "diagnostics skipped: document is excluded by [source].exclude");
         return;
     }
 
@@ -172,6 +199,13 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
 
     state.mem_docs.insert(uri.clone(), text.clone(), version);
 
+    // The buffer is kept, so that lifting the exclusion later brings back the
+    // editor's text; the file itself gets no FileId, no text input and no analysis.
+    if is_excluded_document(state, &uri) {
+        tracing::info!(%uri, "didOpen: document is excluded by [source].exclude; not analysed");
+        return Ok(());
+    }
+
     let file_id = state.vfs_file_for_url(&uri)?;
     // Mark open BEFORE process_changes so the edit is stored as a resident
     // overlay (authoritative for unsaved content), not disk-backed.
@@ -249,7 +283,14 @@ pub(crate) fn preload_dependencies(state: &mut GlobalState, file_id: vfs::FileId
 
     let discover_start = Instant::now();
     let analysis = state.analysis_host.analysis();
-    let deps = analysis.file_dependencies(file_id);
+    // A dependency the exclusions now cover keeps its id, tombstoned; it is not warmed.
+    let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+    let deps: Vec<_> = analysis
+        .file_dependencies(file_id)
+        .iter()
+        .copied()
+        .filter(|&dep| !state.is_file_id_excluded(dep, &mut resolved))
+        .collect();
     let discover_ms = discover_start.elapsed().as_millis() as u64;
 
     if deps.is_empty() {
@@ -340,6 +381,10 @@ pub fn handle_did_change(
 
     state.scope_dirty_docs.insert(uri.clone());
 
+    if is_excluded_document(state, &uri) {
+        return Ok(());
+    }
+
     let text = state
         .mem_docs
         .get(&uri)
@@ -368,6 +413,13 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
     let uri = params.text_document.uri;
 
     tracing::debug!("Document closed: {}", uri);
+
+    if is_excluded_document(state, &uri) {
+        state.scope_dirty_docs.remove(&uri);
+        state.mem_docs.remove(&uri);
+        withdraw_document_diagnostics(state, &uri);
+        return Ok(());
+    }
 
     if let Some(token) = state.diagnostics_tokens.remove(&uri) {
         token.cancel();
@@ -555,6 +607,105 @@ mod tests {
 
         assert_eq!(state.diagnostics_generation.get(&params.text_document.uri).copied(), Some(1));
         assert!(state.diagnostics_tokens.contains_key(&params.text_document.uri));
+    }
+
+    #[test]
+    fn did_open_keeps_an_excluded_buffer_without_creating_a_vfs_file() {
+        let (mut state, _receiver) = create_test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_dir = dir.path().join(".tmp");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let hidden = hidden_dir.join("Hidden.bsl");
+        std::fs::write(&hidden, "Процедура Скрытая() КонецПроцедуры").unwrap();
+        let uri = lsp_types::Url::from_file_path(&hidden).unwrap();
+        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: "Процедура Несохраненная() КонецПроцедуры".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(state.mem_docs.contains(&uri), "the editor buffer must survive exclusion");
+        assert!(
+            state.vfs.read().file_id(&vfs::VfsPath::new(hidden.clone())).is_none(),
+            "didOpen admitted an excluded document to the VFS"
+        );
+        assert!(state.open_files.is_empty());
+        assert!(state.diagnostics_tokens.is_empty());
+        assert!(state.preload_tokens.is_empty());
+
+        handle_did_change(
+            &mut state,
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri: uri.clone(), version: 2 },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "Процедура ЕщеОдна() КонецПроцедуры".to_owned(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(state.mem_docs.get(&uri).as_deref(), Some("Процедура ЕщеОдна() КонецПроцедуры"));
+        assert!(state.vfs.read().file_id(&vfs::VfsPath::new(hidden.clone())).is_none());
+        assert!(state.diagnostics_tokens.is_empty());
+
+        handle_did_close(
+            &mut state,
+            DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            },
+        )
+        .unwrap();
+        assert!(!state.mem_docs.contains(&uri));
+        assert!(!state.scope_dirty_docs.contains(&uri));
+        assert!(state.diagnostics_tokens.is_empty());
+        assert!(state.vfs.read().file_id(&vfs::VfsPath::new(hidden)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn did_open_cannot_create_an_unsaved_vfs_file_through_an_excluded_symlink_alias() {
+        let (mut state, _receiver) = create_test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let hidden_dir = real.join(".tmp");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let unsaved = alias.join(".tmp/New.bsl");
+        assert!(!unsaved.exists(), "the counterexample requires an unsaved new document");
+        let uri = lsp_types::Url::from_file_path(&unsaved).unwrap();
+        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: "Процедура Новая() КонецПроцедуры".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(state.mem_docs.contains(&uri));
+        assert!(
+            state.vfs.read().file_id(&vfs::VfsPath::new(unsaved)).is_none(),
+            "an excluded unsaved alias entered the VFS"
+        );
+        assert!(state.open_files.is_empty());
+        assert!(state.diagnostics_tokens.is_empty());
     }
 
     #[test]

@@ -322,21 +322,23 @@ pub fn open_events(result: &DataflowResult<SecurityModeState>, body: &Body) -> V
                 walk_expr_for_calls(body, v.condition.to_idx(), &mut calls_buf);
                 emit_for_calls(body, &calls_buf, vertex_overlay, None, &mut events);
             }
-            CfgVertex::WhileLoop(v) => {
+            CfgVertex::WhileHeader(v) => {
                 calls_buf.clear();
                 walk_expr_for_calls(body, v.condition.to_idx(), &mut calls_buf);
                 emit_for_calls(body, &calls_buf, vertex_overlay, None, &mut events);
             }
-            CfgVertex::ForLoop(v) => {
+            CfgVertex::ForHeader(v) => {
                 calls_buf.clear();
                 walk_expr_for_calls(body, v.from.to_idx(), &mut calls_buf);
                 walk_expr_for_calls(body, v.to.to_idx(), &mut calls_buf);
-                emit_for_calls(body, &calls_buf, vertex_overlay, v.stmt_id, &mut events);
+                let origin = result.cfg().source_stmt_id(vertex_idx);
+                emit_for_calls(body, &calls_buf, vertex_overlay, origin, &mut events);
             }
-            CfgVertex::ForEachLoop(v) => {
+            CfgVertex::ForEachHeader(v) => {
                 calls_buf.clear();
                 walk_expr_for_calls(body, v.collection.to_idx(), &mut calls_buf);
-                emit_for_calls(body, &calls_buf, vertex_overlay, v.stmt_id, &mut events);
+                let origin = result.cfg().source_stmt_id(vertex_idx);
+                emit_for_calls(body, &calls_buf, vertex_overlay, origin, &mut events);
             }
             _ => {}
         }

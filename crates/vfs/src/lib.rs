@@ -190,6 +190,16 @@ impl Vfs {
         file_id
     }
 
+    /// Drop a watch-only registration without recording a change: nothing was loaded
+    /// for it, so there is nothing for a consumer to tombstone. A path that holds
+    /// content is left alone — it goes through [`Self::set_file_contents`].
+    pub fn unregister_watch_only(&mut self, path: &VfsPath) {
+        let Some(file_id) = self.file_id(path) else { return };
+        if matches!(self.get_state(file_id), FileState::WatchOnly) {
+            self.data[file_id.0 as usize] = FileState::Deleted;
+        }
+    }
+
     fn get_state(&self, file_id: FileId) -> FileState {
         self.data.get(file_id.0 as usize).copied().unwrap_or(FileState::Deleted)
     }

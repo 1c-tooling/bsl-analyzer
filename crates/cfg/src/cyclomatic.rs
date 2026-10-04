@@ -2,17 +2,17 @@ use crate::graph::ControlFlowGraph;
 use petgraph::visit::EdgeRef;
 
 pub fn cyclomatic_complexity(cfg: &ControlFlowGraph) -> u32 {
-    let Some(entry) = cfg.entry_point() else {
+    let Some(start) = cfg.start() else {
         return 1;
     };
 
     let graph = cfg.graph();
     let mut reachable: rustc_hash::FxHashSet<_> = rustc_hash::FxHashSet::default();
-    reachable.insert(entry);
-    let mut stack = vec![entry];
+    reachable.insert(start);
+    let mut stack = vec![start];
     while let Some(node) = stack.pop() {
         for edge in graph.edges(node) {
-            if edge.weight().is_dead_code_edge() {
+            if !edge.weight().is_executable() {
                 continue;
             }
             let target = edge.target();
@@ -26,7 +26,7 @@ pub fn cyclomatic_complexity(cfg: &ControlFlowGraph) -> u32 {
     let mut edge_count: i64 = 0;
     for &node in &reachable {
         for edge in graph.edges(node) {
-            if edge.weight().is_dead_code_edge() {
+            if !edge.weight().is_executable() {
                 continue;
             }
             if !reachable.contains(&edge.target()) {
@@ -71,10 +71,10 @@ mod tests {
         let mut cfg = build_cfg();
         let entry = cfg.add_vertex(fresh_block());
         let mid = cfg.add_vertex(fresh_block());
-        let exit = cfg.exit_point();
-        cfg.add_edge(entry, mid, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(mid, exit, CfgEdgeType::Direct).unwrap();
-        cfg.set_entry_point(entry);
+        let exit = cfg.exit();
+        cfg.add_edge(entry, mid, CfgEdgeType::Unconditional);
+        cfg.add_edge(mid, exit, CfgEdgeType::Unconditional);
+        cfg.set_start(entry);
         assert_eq!(cyclomatic_complexity(&cfg), 1);
     }
 
@@ -85,27 +85,27 @@ mod tests {
         let cond = cfg.add_vertex(fresh_conditional());
         let then_block = cfg.add_vertex(fresh_block());
         let else_block = cfg.add_vertex(fresh_block());
-        let exit = cfg.exit_point();
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, else_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(then_block, exit, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(else_block, exit, CfgEdgeType::Direct).unwrap();
-        cfg.set_entry_point(entry);
+        let exit = cfg.exit();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, else_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(then_block, exit, CfgEdgeType::Unconditional);
+        cfg.add_edge(else_block, exit, CfgEdgeType::Unconditional);
+        cfg.set_start(entry);
         assert_eq!(cyclomatic_complexity(&cfg), 2);
     }
 
     #[test]
-    fn adjacent_code_edge_is_excluded() {
+    fn unexecutable_edge_is_excluded() {
         let mut cfg = build_cfg();
         let entry = cfg.add_vertex(fresh_block());
         let mid = cfg.add_vertex(fresh_block());
-        let exit = cfg.exit_point();
+        let exit = cfg.exit();
         let unreachable = cfg.add_vertex(fresh_block());
-        cfg.add_edge(entry, mid, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(mid, exit, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(mid, unreachable, CfgEdgeType::AdjacentCode).unwrap();
-        cfg.set_entry_point(entry);
+        cfg.add_edge(entry, mid, CfgEdgeType::Unconditional);
+        cfg.add_edge(mid, exit, CfgEdgeType::Unconditional);
+        cfg.add_edge(mid, unreachable, CfgEdgeType::Unexecutable);
+        cfg.set_start(entry);
         assert_eq!(cyclomatic_complexity(&cfg), 1);
     }
 
@@ -115,27 +115,27 @@ mod tests {
         let entry = cfg.add_vertex(fresh_block());
         let cond = cfg.add_vertex(fresh_conditional());
         let body = cfg.add_vertex(fresh_block());
-        let exit = cfg.exit_point();
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, body, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(body, cond, CfgEdgeType::LoopIteration).unwrap();
-        cfg.add_edge(cond, exit, CfgEdgeType::FalseBranch).unwrap();
-        cfg.set_entry_point(entry);
+        let exit = cfg.exit();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, body, CfgEdgeType::TrueBranch);
+        cfg.add_edge(body, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, exit, CfgEdgeType::FalseBranch);
+        cfg.set_start(entry);
         assert_eq!(cyclomatic_complexity(&cfg), 2);
     }
 
     #[test]
-    fn dead_edge_reachability_excludes_orphan() {
+    fn unexecutable_edge_reachability_excludes_orphan() {
         let mut cfg = build_cfg();
         let entry = cfg.add_vertex(fresh_block());
         let live = cfg.add_vertex(fresh_block());
         let orphan = cfg.add_vertex(fresh_block());
-        let exit = cfg.exit_point();
-        cfg.add_edge(entry, live, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(live, exit, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(live, orphan, CfgEdgeType::AdjacentCode).unwrap();
-        cfg.add_edge(orphan, exit, CfgEdgeType::Direct).unwrap();
-        cfg.set_entry_point(entry);
+        let exit = cfg.exit();
+        cfg.add_edge(entry, live, CfgEdgeType::Unconditional);
+        cfg.add_edge(live, exit, CfgEdgeType::Unconditional);
+        cfg.add_edge(live, orphan, CfgEdgeType::Unexecutable);
+        cfg.add_edge(orphan, exit, CfgEdgeType::Unconditional);
+        cfg.set_start(entry);
         assert_eq!(cyclomatic_complexity(&cfg), 1);
     }
 
@@ -147,15 +147,15 @@ mod tests {
         let cond_i = cfg.add_vertex(fresh_conditional());
         let body = cfg.add_vertex(fresh_block());
         let skip = cfg.add_vertex(fresh_block());
-        let exit = cfg.exit_point();
-        cfg.add_edge(entry, cond_w, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond_w, cond_i, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond_i, body, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond_i, skip, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(body, cond_w, CfgEdgeType::LoopIteration).unwrap();
-        cfg.add_edge(skip, cond_w, CfgEdgeType::LoopIteration).unwrap();
-        cfg.add_edge(cond_w, exit, CfgEdgeType::FalseBranch).unwrap();
-        cfg.set_entry_point(entry);
+        let exit = cfg.exit();
+        cfg.add_edge(entry, cond_w, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond_w, cond_i, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond_i, body, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond_i, skip, CfgEdgeType::FalseBranch);
+        cfg.add_edge(body, cond_w, CfgEdgeType::Unconditional);
+        cfg.add_edge(skip, cond_w, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond_w, exit, CfgEdgeType::FalseBranch);
+        cfg.set_start(entry);
         assert_eq!(cyclomatic_complexity(&cfg), 3);
     }
 }

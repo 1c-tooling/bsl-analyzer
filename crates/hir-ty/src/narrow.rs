@@ -134,7 +134,7 @@ fn single_path_arg(args: &[ExprIdx], body: &Body) -> Option<Name> {
 pub struct NarrowState {
     narrowed: FxHashMap<Name, Box<[TypeId]>>,
     pending_guard: Option<Guard>,
-    /// Bottom of the lattice: the state arriving over a dead-code edge (the
+    /// Bottom of the lattice: the state arriving over an unexecutable edge (the
     /// fall-through from a branch every path of which returned or raised).
     /// Joining with it is identity, so `Если Х = Неопределено Тогда Возврат
     /// КонецЕсли` keeps the inverted guard after the block instead of being
@@ -339,7 +339,7 @@ impl Transfer<NarrowState> for NarrowingTransfer<'_> {
     }
 
     fn transfer_edge(&self, edge_kind: CfgEdgeType, state: &NarrowState) -> NarrowState {
-        if edge_kind.is_dead_code_edge() {
+        if !edge_kind.is_executable() {
             return NarrowState::unreachable_bottom();
         }
         let mut new_state = state.clone();
@@ -953,16 +953,13 @@ fn containing_vertex(
                 .iter()
                 .any(|stmt_id| stmt_covers_expr(body, stmt_id.to_idx(), expr_idx)),
             CfgVertex::Conditional(v) => expr_covers_expr(body, v.condition.to_idx(), expr_idx),
-            CfgVertex::WhileLoop(v) => expr_covers_expr(body, v.condition.to_idx(), expr_idx),
-            CfgVertex::ForLoop(v) => {
+            CfgVertex::WhileHeader(v) => expr_covers_expr(body, v.condition.to_idx(), expr_idx),
+            CfgVertex::ForHeader(v) => {
                 expr_covers_expr(body, v.from.to_idx(), expr_idx)
                     || expr_covers_expr(body, v.to.to_idx(), expr_idx)
             }
-            CfgVertex::ForEachLoop(v) => expr_covers_expr(body, v.collection.to_idx(), expr_idx),
-            CfgVertex::TryExcept(_)
-            | CfgVertex::Label(_)
-            | CfgVertex::PreprocCondition(_)
-            | CfgVertex::Exit => false,
+            CfgVertex::ForEachHeader(v) => expr_covers_expr(body, v.collection.to_idx(), expr_idx),
+            CfgVertex::Try | CfgVertex::PreprocCondition(_) | CfgVertex::Exit => false,
         };
         if covers {
             return Some(node_idx);
@@ -1083,16 +1080,13 @@ impl NarrowExprIndex {
                     }
                 }
                 CfgVertex::Conditional(v) => add_tree(v.condition.to_idx()),
-                CfgVertex::WhileLoop(v) => add_tree(v.condition.to_idx()),
-                CfgVertex::ForLoop(v) => {
+                CfgVertex::WhileHeader(v) => add_tree(v.condition.to_idx()),
+                CfgVertex::ForHeader(v) => {
                     add_tree(v.from.to_idx());
                     add_tree(v.to.to_idx());
                 }
-                CfgVertex::ForEachLoop(v) => add_tree(v.collection.to_idx()),
-                CfgVertex::TryExcept(_)
-                | CfgVertex::Label(_)
-                | CfgVertex::PreprocCondition(_)
-                | CfgVertex::Exit => {}
+                CfgVertex::ForEachHeader(v) => add_tree(v.collection.to_idx()),
+                CfgVertex::Try | CfgVertex::PreprocCondition(_) | CfgVertex::Exit => {}
             }
         }
         Self { expr_to_vertex }
@@ -2047,13 +2041,13 @@ mod tests {
         let tr = transfer_no_bases(&db);
         let mut state = state_with(&db, &[("Х", db.string(None, false))]);
         state.pending_guard = Some(Guard::IsUndefined { var: Name::new("Х") });
-        let out = tr.transfer_edge(CfgEdgeType::Direct, &state);
+        let out = tr.transfer_edge(CfgEdgeType::Unconditional, &state);
         assert_eq!(
             overlay_type_id(&db, &out, "Х"),
             Some(db.string(None, false)),
             "narrowing must be untouched"
         );
-        assert!(out.pending_guard.is_none(), "guard must be cleared on Direct edge");
+        assert!(out.pending_guard.is_none(), "guard must be cleared on an unconditional edge");
     }
 
     #[test]

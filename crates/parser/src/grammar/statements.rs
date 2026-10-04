@@ -50,6 +50,10 @@ pub fn statement(p: &mut Parser) -> bool {
         Some(T![PreIf]) => super::preprocessor_if(p),
         Some(T![PreDelete]) => super::preprocessor_delete(p),
         Some(T![PreInsert]) => super::preprocessor_insert(p),
+        // The closer of an insertion that tore apart the statement before this
+        // one, when the statement ended inside it — a literal whose closing
+        // line was inserted takes its `;` along.
+        Some(T![PreEndInsert]) if p.inline_insert_open() => p.bump_inline_insert_marker(),
         _ => {
             if p.current().is_some() {
                 let m = p.start();

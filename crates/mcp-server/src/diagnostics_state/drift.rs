@@ -1058,10 +1058,7 @@ impl DiagnosticsState {
         // another's topology and mask (or fabricate) drift.
         let config_files_fp = config_files_fingerprint(root);
         let project = crate::graph::input::ProjectSnapshot::load_excluding(root, &self.excluded);
-        let (stats, verdict) = crate::graph::scan::scan_stats_over_roots_excluding(
-            &project.scan_roots,
-            &project.excluded,
-        );
+        let (stats, verdict) = crate::graph::scan::scan_stats_over_project(&project);
         let config_fp = config_identity(config_files_fp, &project.configs);
         if armed_before_the_walk {
             // This call read the tree itself, with the watch already holding it: the walk

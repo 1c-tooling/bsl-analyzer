@@ -201,7 +201,7 @@ fn check_transaction_pairing_cfg(
     cfg: &ControlFlowGraph,
     max_level: i32,
 ) -> Vec<TransactionIssue> {
-    let entry = match cfg.entry_point() {
+    let entry = match cfg.start() {
         Some(e) => e,
         None => return vec![],
     };
@@ -382,7 +382,7 @@ fn dfs_check_paths(
         }
     }
 
-    if node == ctx.cfg.exit_point() {
+    if node == ctx.cfg.exit() {
         for begin_call in &state.begin_stack {
             issues.push(TransactionIssue {
                 range: begin_call.range,
@@ -393,14 +393,14 @@ fn dfs_check_paths(
         return;
     }
 
-    if matches!(ctx.cfg.vertex(node), Some(CfgVertex::TryExcept(_))) {
+    if matches!(ctx.cfg.vertex(node), Some(CfgVertex::Try)) {
         let mut try_node = None;
         let mut except_node = None;
 
         for (idx, edge_type) in ctx.cfg.outgoing_edges(node) {
             match edge_type {
-                CfgEdgeType::TrueBranch => try_node = Some(idx),
-                CfgEdgeType::FalseBranch => except_node = Some(idx),
+                CfgEdgeType::Unconditional => try_node = Some(idx),
+                CfgEdgeType::Exception => except_node = Some(idx),
                 _ => {}
             }
         }
@@ -410,10 +410,8 @@ fn dfs_check_paths(
         }
 
         if let Some(except_n) = except_node {
-            let has_raise_edges = ctx
-                .cfg
-                .incoming_edges(except_n)
-                .any(|(_, edge_type)| !matches!(edge_type, CfgEdgeType::FalseBranch));
+            let has_raise_edges =
+                ctx.cfg.incoming_edges(except_n).any(|(source, _)| source != node);
 
             if !has_raise_edges {
                 dfs_check_paths(except_n, state.clone(), visited_states, issues, ctx);
@@ -427,7 +425,7 @@ fn dfs_check_paths(
         let edges: Vec<_> = ctx
             .cfg
             .outgoing_edges(node)
-            .filter(|(_, edge_type)| !matches!(edge_type, CfgEdgeType::AdjacentCode))
+            .filter(|(_, edge_type)| !matches!(edge_type, CfgEdgeType::Unexecutable))
             .collect();
 
         for (succ, edge_type) in edges {
@@ -458,7 +456,7 @@ fn dfs_check_paths(
         let successors: Vec<_> = ctx
             .cfg
             .outgoing_edges(node)
-            .filter(|(_, edge_type)| !matches!(edge_type, CfgEdgeType::AdjacentCode))
+            .filter(|(_, edge_type)| !matches!(edge_type, CfgEdgeType::Unexecutable))
             .map(|(idx, _)| idx)
             .collect();
         for succ in successors {

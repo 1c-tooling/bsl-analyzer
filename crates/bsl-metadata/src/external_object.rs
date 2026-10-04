@@ -108,7 +108,12 @@ pub fn discover_external_object_structure(
 /// export or its element is neither external kind; a malformed export logs and
 /// yields `None` too, the way a malformed object in a configuration dump does.
 pub fn load_external_object(root: &Path) -> Option<MetadataObject> {
-    let main = external_object_xml(root, &bsl_conventions::RealFs)?;
+    load_external_object_in(root, &bsl_conventions::RealFs)
+}
+
+/// [`load_external_object`] reading through `tree`.
+pub(crate) fn load_external_object_in(root: &Path, tree: &dyn DirTree) -> Option<MetadataObject> {
+    let main = external_object_xml(root, tree)?;
     let text = match std::fs::read_to_string(&main) {
         Ok(text) => text,
         Err(error) => {

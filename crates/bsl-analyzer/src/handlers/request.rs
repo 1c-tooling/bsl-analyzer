@@ -2500,6 +2500,46 @@ mod tests {
     }
 
     #[test]
+    fn hover_after_an_excluded_did_open_returns_an_error_without_creating_a_file() {
+        let mut state = create_test_state();
+        state.init_empty_source_root();
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_dir = dir.path().join("generated");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let hidden = hidden_dir.join("Hidden.bsl");
+        let uri = lsp_types::Url::from_file_path(&hidden).unwrap();
+        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+
+        crate::handlers::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: "Процедура Скрытая()\nКонецПроцедуры".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        let ctx = latency_ctx(&state);
+        let result = handle_hover(
+            &ctx,
+            lsp_types::HoverParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                    position: lsp_types::Position::new(0, 0),
+                },
+                work_done_progress_params: Default::default(),
+            },
+        );
+
+        assert!(result.is_err(), "an absent excluded document produced a hover result");
+        assert!(state.vfs.read().file_id(&vfs::VfsPath::new(hidden)).is_none());
+        assert!(!state.request_tokens.values().any(|token| !token.is_cancelled()));
+    }
+
+    #[test]
     fn test_goto_definition_not_found() {
         let mut state = create_test_state();
 

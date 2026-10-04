@@ -241,7 +241,12 @@ impl GraphState {
             tracing::info!("skipping hub re-arm: the built snapshot's topology is superseded");
             return;
         }
-        if !hub.ensure_roots(&crate::change_hub::watch_targets_for(root, scan_roots)) {
+        // The exclusions travel with the roots: the same roots under a new `[source].exclude`
+        // are a different coverage, and the live project is the one to be followed.
+        if !hub.ensure_scope(
+            &crate::change_hub::watch_targets_for(root, scan_roots),
+            &live.user_excluded,
+        ) {
             tracing::warn!("graph rebuild could not re-arm the change hub onto new roots");
         }
     }
@@ -522,10 +527,7 @@ impl GraphState {
             Err(_) => return self.note_incremental("published graph moved"),
             _ => return self.note_incremental("topology moved"),
         }
-        let pre = crate::graph::universe::ScannedUniverse::scan_excluding(
-            &project.scan_roots,
-            &project.excluded,
-        );
+        let pre = crate::graph::universe::ScannedUniverse::scan_project(&project);
         // Before the diff, not inside the bracket: a diff against a short scan reads
         // hidden files as removals, and an unreadable EMPTY subtree does not move the
         // stats at all — the diff cannot see incompleteness, only the verdict can.
@@ -693,10 +695,7 @@ impl GraphState {
                 workspace_root,
                 &self.cache_exclusions(),
             );
-            let post = crate::graph::universe::ScannedUniverse::scan_excluding(
-                &post_project.scan_roots,
-                &post_project.excluded,
-            );
+            let post = crate::graph::universe::ScannedUniverse::scan_project(&post_project);
             let fp_post = super::scan::fingerprint_of_project(&post.stats, &post_project)
                 .ok_or_else(|| {
                     LoadFailure::operation("incomplete post-scan portable fingerprint")
@@ -874,10 +873,7 @@ impl GraphState {
                 super::content_hash::seed(observations);
             }
         }
-        let now = crate::graph::universe::ScannedUniverse::scan_excluding(
-            &project.scan_roots,
-            &project.excluded,
-        );
+        let now = crate::graph::universe::ScannedUniverse::scan_project(&project);
         let Some(fp_now) = super::scan::fingerprint_of_project(&now.stats, &project) else {
             tracing::warn!(
                 "cached graph database cannot be checked: project roots are unavailable or a scanned file has no registered key; rebuilding"
@@ -1156,10 +1152,7 @@ fn build_and_publish_graph_file(
     // the same tree by construction. Only the straddle check walks again.
     let project =
         crate::graph::ProjectSnapshot::load_excluding(workspace_root, &graph.cache_exclusions());
-    let pre = crate::graph::universe::ScannedUniverse::scan_excluding(
-        &project.scan_roots,
-        &project.excluded,
-    );
+    let pre = crate::graph::universe::ScannedUniverse::scan_project(&project);
     build_and_publish_scanned_inner(workspace_root, &project, &pre, generation, graph, chunk_sink)
 }
 
@@ -1521,10 +1514,7 @@ fn build_candidate(
     // mid-build would compare the frozen snapshot against itself and publish clean.
     let post_project =
         crate::graph::ProjectSnapshot::load_excluding(workspace_root, &graph.cache_exclusions());
-    let post = crate::graph::universe::ScannedUniverse::scan_excluding(
-        &post_project.scan_roots,
-        &post_project.excluded,
-    );
+    let post = crate::graph::universe::ScannedUniverse::scan_project(&post_project);
     let fp_post = super::scan::fingerprint_of_project(&post.stats, &post_project)
         .ok_or_else(|| LoadFailure::operation("incomplete portable post-scan fingerprint"))?;
     // A delivery after the analyzer started lowering may have landed and then been reverted
@@ -2110,14 +2100,12 @@ impl<'e> FusedChunkWriter<'e> {
             let rel = if let Ok(rel) = disk_path.strip_prefix(&self.source_root) {
                 rel.to_path_buf()
             } else {
+                // A file that can no longer be canonicalized still has a key: the rows carry
+                // its canonical spelling already, and the read that follows reports it.
                 let canonical_root = self.canonical_source_root.as_ref()?;
-                // The producer already emits canonical paths. Keep their key after a
-                // file disappears, so the read below can report ReadError without mutation.
-                if let Ok(rel) = disk_path.strip_prefix(canonical_root) {
-                    rel.to_path_buf()
-                } else {
-                    disk_path.canonicalize().ok()?.strip_prefix(canonical_root).ok()?.to_path_buf()
-                }
+                let canonical =
+                    disk_path.canonicalize().unwrap_or_else(|_| disk_path.to_path_buf());
+                canonical.strip_prefix(canonical_root).ok()?.to_path_buf()
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
             return (!rel.is_empty()).then(|| bsl_search::FileKey::configuration(rel));

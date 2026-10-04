@@ -55,6 +55,25 @@ fn window_matches(haystack: &[u8], span: usize, fingerprint: u64) -> bool {
     false
 }
 
+#[test]
+fn byte_window_detects_embedded_material_and_rejects_changed_bytes() {
+    let material = b"synthetic\nwindow\n";
+    let fingerprint = material
+        .iter()
+        .fold(0u64, |hash, byte| hash.wrapping_mul(BASE).wrapping_add(u64::from(*byte)));
+    for (prefix, suffix) in
+        [(b"".as_slice(), b"".as_slice()), (b"let code = ", b";"), (b"", b"tail")]
+    {
+        let text = [prefix, material, suffix].concat();
+        assert!(window_matches(&text, material.len(), fingerprint));
+    }
+    assert!(!window_matches(&material[..material.len() - 1], material.len(), fingerprint));
+    let mut changed = material.to_vec();
+    changed[0] = b'S';
+    assert!(!window_matches(&changed, material.len(), fingerprint));
+    assert!(!window_matches(b"", material.len(), fingerprint));
+}
+
 /// Файлы крейта, которые Git отслеживает, без разбора расширений.
 ///
 /// Отбор по расширению здесь был бы дырой, а не оптимизацией: материал уже

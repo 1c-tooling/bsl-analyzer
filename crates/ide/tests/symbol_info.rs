@@ -349,6 +349,7 @@ fn setup_applied_visibility() -> RootDatabaseImpl {
         closures: vec![vec![], vec![], vec![]],
         topological_order: vec![0, 1, 2],
         fingerprint: Some("symbol-info-visibility".to_string()),
+        source_exclusions: Default::default(),
     });
 
     let mut file_set = FileSet::new();
@@ -419,6 +420,7 @@ fn setup_form_resolution_visibility() -> (RootDatabaseImpl, PathBuf) {
         closures: vec![vec![], vec![], vec![]],
         topological_order: vec![0, 1, 2],
         fingerprint: Some("form-resolution-visibility".to_string()),
+        source_exclusions: Default::default(),
     });
 
     let xml = FileId(0);

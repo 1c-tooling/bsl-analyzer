@@ -88,7 +88,10 @@ pub fn workspace_roots(
         project.semantic_base_path(),
         &extensions,
     );
-    (roots.with_excluded(excluded.to_vec()), rejected)
+    (
+        roots.with_excluded(excluded.to_vec()).with_user_excluded(project.source_exclusions()),
+        rejected,
+    )
 }
 
 /// Name every root that did not make it into the table, with its reason: a silently dropped

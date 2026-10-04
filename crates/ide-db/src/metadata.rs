@@ -93,6 +93,7 @@ pub(crate) mod heap_estimate {
                 .map(|c| stdx::heap::vec_bytes::<usize>(c.len()))
                 .sum::<usize>()
             + snapshot.fingerprint.as_ref().map_or(0, String::capacity)
+            + snapshot.source_exclusions.heap_bytes()
     }
 
     /// Heap of a [`super::MetadataListingInput`]: the ten per-family `Arc<Vec<_>>`
@@ -402,6 +403,10 @@ pub struct WorkspaceConfigsSnapshot {
     /// Topology fingerprint (full hex digest) when built from a validated
     /// project; `None` for legacy path-only registration.
     pub fingerprint: Option<String>,
+    /// The project's `[source].exclude`. Part of this one value so a reload that
+    /// narrows the project never shows new roots with old exclusions or the reverse;
+    /// no metadata loader reads anything inside these directories.
+    pub source_exclusions: project_model::ExcludedPaths,
 }
 
 impl WorkspaceConfigsSnapshot {
@@ -415,7 +420,15 @@ impl WorkspaceConfigsSnapshot {
         let closures = vec![Vec::new(); paths.len()];
         let topological_order = (0..paths.len()).collect();
         let kinds = RootKind::from_labels(&paths);
-        Self { paths, kinds, canonical_paths, closures, topological_order, fingerprint: None }
+        Self {
+            paths,
+            kinds,
+            canonical_paths,
+            closures,
+            topological_order,
+            fingerprint: None,
+            source_exclusions: project_model::ExcludedPaths::default(),
+        }
     }
 
     /// The full shape from a validated project. A configured base occupies the
@@ -459,6 +472,7 @@ impl WorkspaceConfigsSnapshot {
             closures,
             topological_order,
             fingerprint: Some(topology.fingerprint().to_hex()),
+            source_exclusions: project.source_exclusions().clone(),
         }
     }
 
@@ -601,7 +615,8 @@ pub fn load_configuration<'db>(
 
     tracing::warn!(?path, "METADATA LOAD: loading configuration from directory");
 
-    let config = bsl_metadata::load_from_directory(&path).unwrap_or_else(|e| {
+    let excluded = source_exclusions_for(db, path_input);
+    let config = bsl_metadata::load_from_directory_scoped(&path, &excluded).unwrap_or_else(|e| {
         tracing::error!(error = %e, ?path, "failed to load configuration");
         Configuration::new("Configuration")
     });
@@ -613,6 +628,24 @@ pub fn load_configuration<'db>(
     );
 
     Arc::new(config)
+}
+
+/// The user's exclusions, whole, as the whole-config load of `path_input` reads them.
+///
+/// A projection of the workspace snapshot rather than a read of it, so a snapshot set
+/// again with the same exclusions — every project reload sets one — is backdated here
+/// and leaves the root's load standing instead of re-parsing it. Deliberately not
+/// narrowed to the exclusions near the root: a symlink inside the root can lead
+/// anywhere, and the loader must be able to refuse to follow it into any of them.
+#[salsa::tracked(returns(clone))]
+fn source_exclusions_for<'db>(
+    db: &'db dyn salsa::Database,
+    path_input: ConfigurationPathInput<'db>,
+) -> project_model::ExcludedPaths {
+    let _ = path_input;
+    WorkspaceConfigsInput::try_get(db)
+        .map(|input| input.snapshot(db).source_exclusions.clone())
+        .unwrap_or_default()
 }
 
 /// The base configuration merged with one extension's overlay, memoised per
@@ -1212,7 +1245,7 @@ pub fn common_module_index(
 /// Resolve a single common module's metadata by name within one config root, at
 /// per-common-module Salsa granularity. The common-module counterpart of
 /// [`resolve_defined_type`]; extension overlay across roots is composed by callers
-/// (an extension replaces the module wholesale).
+/// (a borrowed module inherits the properties absent in its XML from the base).
 #[salsa::tracked(heap_size = heap_estimate::shared_common_module_heap, returns(clone))]
 pub fn resolve_common_module(
     db: &dyn base_db::SourceDatabase,
@@ -2288,6 +2321,51 @@ pub(crate) fn find_integration_service_by_path(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_snapshot_carries_toml_source_exclusions_into_the_metadata_loader() {
+        use super::MetadataDb as _;
+        use crate::RootDatabaseImpl;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let write_module = |directory: &str, name: &str| {
+            let module = root.join("CommonModules").join(directory);
+            std::fs::create_dir_all(module.join("Ext")).unwrap();
+            std::fs::write(module.join("Ext/Module.bsl"), "").unwrap();
+            std::fs::write(
+                root.join("CommonModules").join(format!("{directory}.xml")),
+                format!(
+                    r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<CommonModule uuid="00000000-0000-0000-0000-000000000061">
+<Properties><Name>{name}</Name><Server>true</Server></Properties>
+</CommonModule></MetaDataObject>"#
+                ),
+            )
+            .unwrap();
+        };
+        write_module("Allowed", "Разрешенный");
+        write_module("Hidden", "Скрытый");
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\"CommonModules/Hidden\"]\n",
+        )
+        .unwrap();
+
+        let project = project_model::Project::new(root).unwrap();
+        let snapshot = super::WorkspaceConfigsSnapshot::from_project(&project);
+        assert!(snapshot.source_exclusions.is_excluded(&root.join("CommonModules/Hidden")));
+
+        let mut db = RootDatabaseImpl::new();
+        db.set_workspace_configs_snapshot(snapshot);
+        let root_str = root.to_string_lossy().to_string();
+        let revision = db.config_root_revision_for_path(root);
+        let input = super::intern_configuration_path(&db, &root_str, revision);
+        let loaded = db.load_configuration(input);
+        assert!(loaded.find_common_module("Разрешенный").is_some());
+        assert!(loaded.find_common_module("Скрытый").is_none());
+    }
+
     #[test]
     fn extension_only_project_snapshot_has_no_synthetic_base_slot() {
         let dir = tempfile::tempdir().unwrap();

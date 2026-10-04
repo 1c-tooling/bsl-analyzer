@@ -554,6 +554,46 @@ impl ExtensionTopology {
         fingerprint_with_paths(&portable(base_path), &self.nodes, portable)
     }
 
+    /// The topology without the nodes `keep` rejects.
+    ///
+    /// Validation already ran over the full declaration, so a dependency on a removed
+    /// node was legal; it is dropped from every edge and closure rather than kept as a
+    /// way back into the removed source. The survivors keep their relative declaration
+    /// and topological order and are renumbered densely. The fingerprint is taken over
+    /// what remains, because that is what the project now composes.
+    pub fn retain(
+        &self,
+        base_path: &Path,
+        mut keep: impl FnMut(&ExtensionNode) -> bool,
+    ) -> ExtensionTopology {
+        let mut renumbered: Vec<Option<NodeId>> = Vec::with_capacity(self.nodes.len());
+        let mut next = 0u32;
+        for node in &self.nodes {
+            if keep(node) {
+                renumbered.push(Some(NodeId(next)));
+                next += 1;
+            } else {
+                renumbered.push(None);
+            }
+        }
+        let remap =
+            |ids: &[NodeId]| ids.iter().filter_map(|id| renumbered[id.index()]).collect::<Vec<_>>();
+        let nodes: Vec<ExtensionNode> = self
+            .nodes
+            .iter()
+            .zip(&renumbered)
+            .filter(|(_, id)| id.is_some())
+            .map(|(node, _)| ExtensionNode {
+                depends_on: remap(&node.depends_on),
+                closure: remap(&node.closure),
+                ..node.clone()
+            })
+            .collect();
+        let topo_order = remap(&self.topo_order);
+        let fingerprint = fingerprint(base_path, &nodes);
+        ExtensionTopology { nodes, topo_order, fingerprint }
+    }
+
     pub fn has_dependencies(&self) -> bool {
         self.nodes.iter().any(|node| !node.depends_on.is_empty())
     }

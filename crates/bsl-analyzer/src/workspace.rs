@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -9,6 +10,9 @@ use lsp_types::Url;
 use vfs::{loader, FileId, VfsPath};
 
 use crate::global_state::GlobalState;
+
+/// A file the VFS holds, by id and path.
+type VfsEntry = (FileId, VfsPath);
 
 /// Adapts the LSP server's `parking_lot`-locked VFS to the lock-neutral
 /// [`ide_host_core::VfsWrite`] the shared metadata policy expects, keeping the lock
@@ -90,6 +94,8 @@ impl GlobalState {
         let configs_snapshot = ide_db::metadata::WorkspaceConfigsSnapshot::from_project(&project);
         let diagnostics_baseline =
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
+        self.source_exclusions =
+            project.source_exclusions().respelled_under(&project.source_roots());
         self.workspace_root = Some(root.clone());
         self.project = Some(project);
         self.install_diagnostics_baseline(diagnostics_baseline);
@@ -127,9 +133,14 @@ impl GlobalState {
     fn configure_loader(&mut self) {
         let (Some(root), Some(project)) = (&self.workspace_root, &self.project) else { return };
         self.vfs_progress_config_version += 1;
+        // A config file inside an excluded directory is not watched either — with
+        // `exclude = ["."]` that is the project's own config. It is still reloaded on a
+        // delivered didSave, which does not go through the loader.
         let mut config_files: Vec<_> = project_model::PROJECT_INPUT_FILE_NAMES
             .iter()
-            .map(|name| paths::AbsPathBuf::assert_utf8(root.join(name)))
+            .map(|name| root.join(name))
+            .filter(|path| !self.source_exclusions.is_excluded_resolved(path))
+            .map(paths::AbsPathBuf::assert_utf8)
             .collect();
         config_files.sort();
         config_files.dedup();
@@ -145,6 +156,7 @@ impl GlobalState {
             .diagnostics_baseline
             .observation_paths()
             .into_iter()
+            .filter(|path| !self.source_exclusions.is_excluded_resolved(path))
             .map(paths::AbsPathBuf::assert_utf8)
             .collect();
         baseline_files.sort();
@@ -163,6 +175,7 @@ impl GlobalState {
                 paths::AbsPathBuf::assert_utf8(root.join("build")),
                 paths::AbsPathBuf::assert_utf8(root.join(".vscode")),
             ],
+            hard_exclude: self.source_exclusions.clone(),
             rules: vec![loader::FileRule {
                 extensions: project_model::METADATA_WATCHED_EXTENSIONS
                     .iter()
@@ -558,21 +571,142 @@ impl GlobalState {
             return false;
         }
         self.prune_stale_workspace_files();
+        self.evict_excluded_sources();
+        self.readmit_open_documents();
         true
+    }
+
+    /// Whether `path` lies in a directory the project's `[source].exclude` took out,
+    /// under any spelling — a file the loader reached through a symlink alias of an
+    /// excluded directory included. For one path after another: `resolved` keeps the
+    /// resolution of every parent directory already asked about.
+    pub fn is_source_excluded(
+        &self,
+        path: &Path,
+        resolved: &mut stdx::path_exclusion::ResolvedDirs,
+    ) -> bool {
+        self.source_exclusions.is_excluded_resolving(path, resolved)
+    }
+
+    /// Whether the file behind `file_id` lies in an excluded directory. For work queued
+    /// against a `FileId` before a reload narrowed the project: the id outlives the
+    /// exclusion, tombstoned, and must not be analysed again. An id this VFS never
+    /// allocated counts as excluded too — there is nothing to analyse behind it. One
+    /// `resolved` serves a whole batch, so each parent directory resolves once.
+    pub fn is_file_id_excluded(
+        &self,
+        file_id: FileId,
+        resolved: &mut stdx::path_exclusion::ResolvedDirs,
+    ) -> bool {
+        let path = {
+            let vfs = self.vfs.read();
+            if file_id.0 >= vfs.num_file_ids() {
+                return true;
+            }
+            vfs.file_path(file_id).clone()
+        };
+        self.is_source_excluded(path.as_path(), resolved)
+    }
+
+    /// [`Self::is_source_excluded`] that also resolves `path` through the file system:
+    /// for a single decision about a path the editor names, which may reach an excluded
+    /// directory through a symlink.
+    pub fn is_source_excluded_resolved(&self, path: &Path) -> bool {
+        self.source_exclusions.is_excluded_resolved(path)
+    }
+
+    /// Take every BSL file the exclusions now cover out of the VFS and the source root,
+    /// open ones included: the editor keeps its buffer, but the file stops being
+    /// analysed, and its pending work and published diagnostics are withdrawn. Done
+    /// directly rather than left to file events — nothing on disk changed, so none
+    /// arrive. A watch-only registration (metadata XML) is dropped without a change
+    /// event: a tombstone would route it into the BSL source root, and the metadata
+    /// rebuild the reload triggers no longer discovers it.
+    fn evict_excluded_sources(&mut self) {
+        if self.source_exclusions.is_empty() {
+            return;
+        }
+        let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+        let (excluded, watch_only): (Vec<VfsEntry>, Vec<VfsEntry>) = {
+            let vfs = self.vfs.read();
+            (0..vfs.num_file_ids())
+                .map(FileId)
+                .filter(|&file_id| vfs.exists(file_id))
+                .map(|file_id| (file_id, vfs.file_path(file_id).clone()))
+                .filter(|(_, path)| self.is_source_excluded(path.as_path(), &mut resolved))
+                .partition(|(_, path)| project_model::is_bsl_source_path(path.as_path()))
+        };
+        if !watch_only.is_empty() {
+            let mut vfs = self.vfs.write();
+            for (_, path) in &watch_only {
+                vfs.unregister_watch_only(path);
+            }
+        }
+        for uri in self.mem_docs.uris() {
+            if uri.to_file_path().is_ok_and(|path| self.is_source_excluded_resolved(&path)) {
+                crate::handlers::notification::withdraw_document_diagnostics(self, &uri);
+            }
+        }
+        if excluded.is_empty() {
+            return;
+        }
+        tracing::info!(count = excluded.len(), "evicting sources taken out by [source].exclude");
+        for (file_id, _) in &excluded {
+            self.open_files.remove(file_id);
+            if let Some(token) = self.preload_tokens.remove(file_id) {
+                token.cancel();
+            }
+            if let Some(token) = self.preload_external_tokens.remove(file_id) {
+                token.cancel();
+            }
+        }
+        {
+            let mut vfs = self.vfs.write();
+            for (_, path) in excluded {
+                vfs.set_file_contents(path, None);
+            }
+        }
+        self.process_changes(!self.vfs_done);
+    }
+
+    /// Put open documents the exclusions no longer cover back into analysis, with
+    /// the editor's buffer as their text: an unsaved buffer stays more authoritative
+    /// than the disk it was kept out of while excluded.
+    fn readmit_open_documents(&mut self) {
+        let mut readmitted = false;
+        for uri in self.mem_docs.uris() {
+            let Ok(path) = uri.to_file_path() else { continue };
+            if !project_model::is_bsl_source_path(&path) || self.is_source_excluded_resolved(&path)
+            {
+                continue;
+            }
+            let vfs_path = VfsPath::new(path);
+            let already_open =
+                self.vfs.read().file_id(&vfs_path).is_some_and(|id| self.open_files.contains(&id));
+            if already_open {
+                continue;
+            }
+            let Some(text) = self.mem_docs.get(&uri) else { continue };
+            let Ok(file_id) = self.vfs_file_for_url(&uri) else { continue };
+            self.open_files.insert(file_id);
+            self.vfs.write().set_file_contents(vfs_path, Some(Arc::from(text.as_str())));
+            readmitted = true;
+        }
+        if readmitted {
+            self.process_changes(!self.vfs_done);
+        }
     }
 
     fn prune_stale_workspace_files(&mut self) {
         use base_db::{SourceDatabase, SourceRoot, SourceRootId};
 
-        let allowed_roots = self.workspace_allowed_roots();
-        if allowed_roots.is_empty() {
-            return;
-        }
+        let Some(allowed_roots) = self.workspace_allowed_roots() else { return };
         let open_paths = self.open_doc_paths();
 
         let source_root_id = SourceRootId(0);
         let mut new_file_set = vfs::file_set::FileSet::new();
         let mut dropped = 0usize;
+        let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
         {
             let db = self.analysis_host.raw_database();
             let source_root_input = db.source_root_input(source_root_id);
@@ -581,7 +715,13 @@ impl GlobalState {
 
             for file_id in file_set.iter() {
                 let Some(vfs_path) = file_set.path_for_file(&file_id) else { continue };
-                if path_in_workspace(vfs_path.as_path(), &allowed_roots, &open_paths) {
+                if path_in_workspace(
+                    vfs_path.as_path(),
+                    Some(&allowed_roots),
+                    &open_paths,
+                    &self.source_exclusions,
+                    &mut resolved,
+                ) {
                     new_file_set.insert(file_id, vfs_path.clone());
                 } else {
                     dropped += 1;
@@ -600,9 +740,10 @@ impl GlobalState {
         self.analysis_host.raw_database_mut().set_source_root(source_root_id, new_source_root);
     }
 
-    fn workspace_allowed_roots(&self) -> Vec<PathBuf> {
-        let Some(project) = self.project.as_ref() else { return Vec::new() };
-        project.source_roots()
+    /// The project's source roots, or `None` without a project. Empty when the user
+    /// excluded every root — which admits nothing, unlike having no project at all.
+    fn workspace_allowed_roots(&self) -> Option<Vec<PathBuf>> {
+        self.project.as_ref().map(|project| project.source_roots())
     }
 
     fn open_doc_paths(&self) -> HashSet<PathBuf> {
@@ -649,6 +790,7 @@ impl GlobalState {
         let mut bsl_file_set = vfs::file_set::FileSet::new();
 
         let mut vfs_files_skipped = 0;
+        let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
 
         for file_id_raw in 0..vfs.num_file_ids() {
             let file_id = vfs::FileId(file_id_raw);
@@ -656,7 +798,13 @@ impl GlobalState {
                 continue;
             }
             let path = vfs.file_path(file_id);
-            if !path_in_workspace(path.as_path(), &allowed_roots, &open_paths) {
+            if !path_in_workspace(
+                path.as_path(),
+                allowed_roots.as_deref(),
+                &open_paths,
+                &self.source_exclusions,
+                &mut resolved,
+            ) {
                 vfs_files_skipped += 1;
                 continue;
             }
@@ -843,6 +991,9 @@ impl GlobalState {
         if !project_model::is_bsl_source_path(&path) {
             return Err(anyhow!("File is not BSL, LSP unsupported: {}", url));
         }
+        if self.is_source_excluded_resolved(&path) {
+            return Err(anyhow!("File is excluded by [source].exclude: {}", url));
+        }
 
         let vfs_path = VfsPath::new(path);
 
@@ -866,14 +1017,20 @@ impl GlobalState {
     }
 }
 
+/// Whether `path` belongs in the BSL source root: never inside an exclusion, open or
+/// not; otherwise under a source root, or open in the editor. Without a project
+/// (`allowed_roots` is `None`) everything outside an exclusion belongs.
 fn path_in_workspace(
     path: &Path,
-    allowed_roots: &[PathBuf],
+    allowed_roots: Option<&[PathBuf]>,
     open_paths: &HashSet<PathBuf>,
+    exclusions: &stdx::path_exclusion::ExcludedPaths,
+    resolved: &mut stdx::path_exclusion::ResolvedDirs,
 ) -> bool {
-    if allowed_roots.is_empty() {
-        return true;
+    if exclusions.is_excluded_resolving(path, resolved) {
+        return false;
     }
+    let Some(allowed_roots) = allowed_roots else { return true };
     if allowed_roots.iter().any(|root| path.starts_with(root)) {
         return true;
     }

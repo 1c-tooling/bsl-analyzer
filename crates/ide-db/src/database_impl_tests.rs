@@ -61,6 +61,64 @@ fn workspace_load_gate_stubs_whole_config_loading() {
 }
 
 #[test]
+fn changing_only_source_exclusions_invalidates_the_whole_configuration_loader() {
+    use crate::metadata::{intern_configuration_path, MetadataDb as _, WorkspaceConfigsSnapshot};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let write_module = |directory: &str, name: &str| {
+        let module_root = root.join("CommonModules").join(directory);
+        std::fs::create_dir_all(module_root.join("Ext")).unwrap();
+        std::fs::write(module_root.join("Ext/Module.bsl"), "").unwrap();
+        std::fs::write(
+            root.join("CommonModules").join(format!("{directory}.xml")),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000041">
+        <Properties><Name>{name}</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#
+            ),
+        )
+        .unwrap();
+    };
+    write_module("Allowed", "Разрешенный");
+    write_module("Hidden", "Скрытый");
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot::from_paths(vec![(
+        None,
+        root.clone(),
+    )]));
+    let root_str = root.to_string_lossy().to_string();
+    let revision = db.config_root_revision_for_path(&root);
+    {
+        let path_input = intern_configuration_path(&db, &root_str, revision);
+        let ordinary = db.load_configuration(path_input);
+        assert!(ordinary.find_common_module("Разрешенный").is_some());
+        assert!(ordinary.find_common_module("Скрытый").is_some());
+    }
+
+    let mut scoped = WorkspaceConfigsSnapshot::from_paths(vec![(None, root.clone())]);
+    scoped.source_exclusions =
+        project_model::ExcludedPaths::new([root.join("CommonModules/Hidden")]);
+    db.set_workspace_configs_snapshot(scoped);
+    {
+        let path_input = intern_configuration_path(&db, &root_str, revision);
+        let narrowed = db.load_configuration(path_input);
+        assert!(narrowed.find_common_module("Разрешенный").is_some());
+        assert!(narrowed.find_common_module("Скрытый").is_none());
+    }
+
+    db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot::from_paths(vec![(None, root)]));
+    let path_input = intern_configuration_path(&db, &root_str, revision);
+    let restored = db.load_configuration(path_input);
+    assert!(restored.find_common_module("Разрешенный").is_some());
+    assert!(restored.find_common_module("Скрытый").is_some());
+}
+
+#[test]
 fn parse_mdo_query_parses_catalog_from_overlay() {
     use crate::metadata::{parse_mdo_query, MdoFiles};
     use bsl_metadata::MdoType;
@@ -1288,6 +1346,7 @@ fn a_chain_resolves_the_owning_extension_first_and_lists_each_name_once() {
         closures: vec![Vec::new(), vec![0]],
         topological_order: vec![0, 1],
         fingerprint: None,
+        source_exclusions: Default::default(),
     });
     for (root, file) in [(&dep_root, dep_role), (&own_root, own_role)] {
         db.set_metadata_listing(
@@ -5980,6 +6039,7 @@ fn effective_metadata_members_keep_topological_winner_and_source() {
         closures: vec![vec![], vec![2], vec![], vec![], vec![]],
         topological_order: vec![0, 2, 1, 3, 4],
         fingerprint: Some("test-topology".to_string()),
+        source_exclusions: Default::default(),
     });
     let listing = |main| MetadataListingData {
         entries: vec![MdoEntry {
@@ -6134,6 +6194,7 @@ fn effective_module_exports_cover_composition_matrix_for_all_module_roles() {
         closures: vec![vec![], vec![2], vec![], vec![]],
         topological_order: vec![0, 2, 1, 3],
         fingerprint: Some("exports-topology".to_string()),
+        source_exclusions: Default::default(),
     });
 
     let relative_paths = [
@@ -6267,6 +6328,7 @@ fn ba010_effective_module_variables_resolve_for_object_and_manager_facets() {
         closures: vec![vec![], vec![], vec![1]],
         topological_order: vec![0, 1, 2],
         fingerprint: Some("ba010".to_string()),
+        source_exclusions: Default::default(),
     });
 
     let files = [
@@ -6384,6 +6446,7 @@ fn ba021_module_exports_follow_the_callers_extension_visibility_chain() {
         closures: vec![vec![], vec![], vec![1], vec![]],
         topological_order: vec![0, 1, 2, 3],
         fingerprint: Some("ba021-visibility".to_string()),
+        source_exclusions: Default::default(),
     });
 
     let source = [
@@ -6614,6 +6677,705 @@ fn resolve_register_across_roots_folds_extension_overlay() {
         merged.dimensions().iter().any(|d| d.name() == "Справочник1"),
         "the extension overlay must contribute the dimension the base lacked: {:?}",
         merged.dimensions().iter().map(|d| d.name().to_string()).collect::<Vec<_>>(),
+    );
+}
+
+struct ExtensionMetadataDbFixture {
+    db: RootDatabaseImpl,
+    consumer: FileId,
+    base_document_xml: FileId,
+    extension_document_xml: FileId,
+    base_common_xml: FileId,
+    extension_common_xml: FileId,
+    base_common_module: FileId,
+    extension_common_module: FileId,
+    extension_session_module: FileId,
+    owner_shaped_impostor: FileId,
+    unrelated_module: FileId,
+}
+
+fn extension_metadata_db_fixture(with_listings: bool) -> ExtensionMetadataDbFixture {
+    use crate::metadata::{CommonModuleEntry, MdoEntry};
+    use bsl_metadata::MdoType;
+
+    let fixture = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata"
+    ));
+    let base = fixture.join("base");
+    let extension = fixture.join("extension");
+
+    let consumer = FileId(0);
+    let base_document_xml = FileId(1);
+    let extension_document_xml = FileId(2);
+    let base_common_xml = FileId(3);
+    let extension_common_xml = FileId(4);
+    let base_common_module = FileId(5);
+    let extension_common_module = FileId(6);
+    let unrelated_module = FileId(7);
+    let base_session_xml = FileId(8);
+    let extension_session_xml = FileId(9);
+    let base_session_module = FileId(10);
+    let extension_session_module = FileId(11);
+    let owner_shaped_impostor = FileId(12);
+
+    let paths = [
+        (consumer, extension.join("Documents/Заказ/Ext/ObjectModule.bsl")),
+        (base_document_xml, base.join("Documents/Заказ.xml")),
+        (extension_document_xml, extension.join("Documents/Заказ.xml")),
+        (base_common_xml, base.join("CommonModules/Сервер.xml")),
+        (extension_common_xml, extension.join("CommonModules/Сервер.xml")),
+        (base_common_module, base.join("CommonModules/Сервер/Ext/Module.bsl")),
+        (extension_common_module, extension.join("CommonModules/Сервер/Ext/Module.bsl")),
+        (base_session_xml, base.join("CommonModules/СерверСеанса.xml")),
+        (extension_session_xml, extension.join("CommonModules/СерверСеанса.xml")),
+        (base_session_module, base.join("CommonModules/СерверСеанса/Ext/Module.bsl")),
+        (extension_session_module, extension.join("CommonModules/СерверСеанса/Ext/Module.bsl")),
+        (owner_shaped_impostor, extension.join("CommonModules/Сервер/Ext/UnreadModule.bsl")),
+        (unrelated_module, extension.join("Other/Module.bsl")),
+    ];
+
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    for (file_id, path) in &paths {
+        file_set.insert(*file_id, VfsPath::new(path.to_string_lossy().as_ref()));
+    }
+    db.set_source_root(SourceRootId(1), SourceRoot::new_local(file_set));
+    for (file_id, path) in &paths {
+        db.set_file_source_root(*file_id, SourceRootId(1));
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|_| "Процедура Тест() КонецПроцедуры".to_string());
+        db.set_file_text(*file_id, &text);
+    }
+    db.set_all_config_paths(vec![
+        (None, base.clone()),
+        (Some("Расширение".to_string()), extension.clone()),
+    ]);
+
+    if with_listings {
+        db.set_metadata_listing(
+            &base.to_string_lossy(),
+            MetadataListingData {
+                entries: vec![MdoEntry {
+                    kind: MdoType::Document,
+                    name: "Заказ".to_string(),
+                    main: base_document_xml,
+                    predefined: None,
+                }],
+                common_modules: vec![
+                    CommonModuleEntry {
+                        name: "Сервер".to_string(),
+                        main: base_common_xml,
+                        module_file: Some(base_common_module),
+                        unread_module_file: None,
+                    },
+                    CommonModuleEntry {
+                        name: "СерверСеанса".to_string(),
+                        main: base_session_xml,
+                        module_file: Some(base_session_module),
+                        unread_module_file: None,
+                    },
+                ],
+                ..empty_listing_data()
+            },
+        );
+        db.set_metadata_listing(
+            &extension.to_string_lossy(),
+            MetadataListingData {
+                entries: vec![MdoEntry {
+                    kind: MdoType::Document,
+                    name: "Заказ".to_string(),
+                    main: extension_document_xml,
+                    predefined: None,
+                }],
+                common_modules: vec![
+                    CommonModuleEntry {
+                        name: "Сервер".to_string(),
+                        main: extension_common_xml,
+                        module_file: Some(extension_common_module),
+                        unread_module_file: None,
+                    },
+                    CommonModuleEntry {
+                        name: "СерверСеанса".to_string(),
+                        main: extension_session_xml,
+                        module_file: Some(extension_session_module),
+                        unread_module_file: None,
+                    },
+                ],
+                ..empty_listing_data()
+            },
+        );
+    }
+
+    ExtensionMetadataDbFixture {
+        db,
+        consumer,
+        base_document_xml,
+        extension_document_xml,
+        base_common_xml,
+        extension_common_xml,
+        base_common_module,
+        extension_common_module,
+        extension_session_module,
+        owner_shaped_impostor,
+        unrelated_module,
+    }
+}
+
+fn extension_metadata_field_names(db: &RootDatabaseImpl, consumer: FileId) -> Vec<String> {
+    db.resolve_metadata_object_for_file(consumer, bsl_metadata::MdoType::Document, "Заказ")
+        .expect("effective Заказ")
+        .find_tabular_section("Товары")
+        .expect("effective Товары")
+        .attributes()
+        .iter()
+        .map(|attribute| attribute.name().to_string())
+        .collect()
+}
+
+fn extension_metadata_field_types(
+    db: &RootDatabaseImpl,
+    consumer: FileId,
+) -> Vec<(String, bsl_metadata::AttributeType)> {
+    db.resolve_metadata_object_for_file(consumer, bsl_metadata::MdoType::Document, "Заказ")
+        .expect("effective Заказ")
+        .find_tabular_section("Товары")
+        .expect("effective Товары")
+        .attributes()
+        .iter()
+        .map(|attribute| (attribute.name().to_string(), attribute.attr_type().clone()))
+        .collect()
+}
+
+#[test]
+fn extension_metadata_resolvers_match_substrate_and_filesystem_fallback() {
+    use bsl_metadata::traits::{MdObject, Module};
+
+    let substrate = extension_metadata_db_fixture(true);
+    let fallback = extension_metadata_db_fixture(false);
+
+    for (fixture, expects_uri) in [(&substrate, false), (&fallback, true)] {
+        assert_eq!(
+            extension_metadata_field_names(&fixture.db, fixture.consumer),
+            ["Номенклатура", "Количество", "РасшПоле"],
+        );
+        assert_eq!(
+            extension_metadata_field_types(&fixture.db, fixture.consumer),
+            [
+                (
+                    "Номенклатура".to_string(),
+                    bsl_metadata::AttributeType::String { length: Some(50) },
+                ),
+                (
+                    "Количество".to_string(),
+                    bsl_metadata::AttributeType::String { length: Some(15) },
+                ),
+                ("РасшПоле".to_string(), bsl_metadata::AttributeType::String { length: Some(25) },),
+            ]
+        );
+        let document = fixture
+            .db
+            .resolve_metadata_object_for_file(
+                fixture.consumer,
+                bsl_metadata::MdoType::Document,
+                "Заказ",
+            )
+            .unwrap();
+        assert!(document.find_attribute("БазовыйРеквизит").is_some());
+        assert!(document.find_attribute("РасшРеквизит").is_some());
+        let upper_document = fixture
+            .db
+            .resolve_metadata_object_for_file(
+                fixture.consumer,
+                bsl_metadata::MdoType::Document,
+                "ЗАКАЗ",
+            )
+            .expect("Cyrillic case variant resolves the effective document");
+        let upper_section = upper_document
+            .find_tabular_section("ТОВАРЫ")
+            .expect("Cyrillic case variant resolves the effective tabular section");
+        assert!(upper_section
+            .attributes()
+            .iter()
+            .any(|attribute| stdx::case::eq_ignore_case(attribute.name(), "НОМЕНКЛАТУРА")));
+
+        let common = fixture
+            .db
+            .resolve_common_module_for_file(fixture.extension_common_module, "Сервер")
+            .expect("effective common module");
+        assert_eq!(common.name(), "Сервер");
+        assert_eq!(
+            common.uuid().to_string(),
+            "15500000-0000-0000-0000-000000000120",
+            "effective identity comes from the selected extension overlay"
+        );
+        assert_eq!(
+            common.return_values_reuse(),
+            bsl_metadata::ReturnValueReuse::DontUse,
+            "the missing extension property inherits the base value"
+        );
+        assert!(!common.is_server(), "the extension's explicit false wins");
+        assert!(!common.is_global(), "the extension's explicit false wins");
+        assert!(common.is_client_managed_application());
+        assert!(common.is_client_ordinary_application());
+        assert!(!common.is_external_connection(), "the extension's explicit false wins");
+        assert!(!common.is_server_call(), "the extension's explicit false wins");
+        assert!(common.is_privileged());
+        let upper_common = fixture
+            .db
+            .resolve_common_module_for_file(fixture.extension_common_module, "СЕРВЕР")
+            .expect("Cyrillic case variant resolves the effective common module");
+        assert_eq!(upper_common.as_ref(), common.as_ref());
+
+        let by_file = fixture
+            .db
+            .common_module_for_file_id(fixture.extension_common_module)
+            .expect("module owner resolves by file");
+        assert_eq!(by_file.as_ref(), common.as_ref(), "by-name and by-file must agree fully");
+        let metadata = fixture.db.module_metadata(ModuleId::new(fixture.extension_common_module));
+        assert_eq!(metadata.common_module.as_deref(), Some(common.as_ref()));
+        assert_eq!(
+            metadata.execution_context,
+            Some(hir::ExecutionContext::Client),
+            "execution context must be computed from the effective overlay, not the server base"
+        );
+
+        let inherited_session = fixture
+            .db
+            .resolve_common_module_for_file(fixture.extension_session_module, "СерверСеанса")
+            .expect("DuringSession module resolves through the borrowed overlay");
+        assert_eq!(
+            inherited_session.return_values_reuse(),
+            bsl_metadata::ReturnValueReuse::DuringSession
+        );
+        let session_by_file = fixture
+            .db
+            .common_module_for_file_id(fixture.extension_session_module)
+            .expect("borrowed DuringSession module resolves by file");
+        assert_eq!(session_by_file.as_ref(), inherited_session.as_ref());
+        assert_eq!(
+            fixture
+                .db
+                .module_metadata(ModuleId::new(fixture.extension_session_module))
+                .common_module
+                .as_deref(),
+            Some(inherited_session.as_ref())
+        );
+
+        let base_by_name = fixture
+            .db
+            .resolve_common_module_for_file(fixture.base_common_module, "Сервер")
+            .expect("base module resolves by name");
+        let base_by_file = fixture
+            .db
+            .common_module_for_file_id(fixture.base_common_module)
+            .expect("base module resolves by file");
+        assert_eq!(base_by_name.uuid().to_string(), "15500000-0000-0000-0000-000000000020");
+        assert_eq!(base_by_file.as_ref(), base_by_name.as_ref());
+        let base_metadata = fixture.db.module_metadata(ModuleId::new(fixture.base_common_module));
+        assert_eq!(base_metadata.common_module.as_deref(), Some(base_by_name.as_ref()));
+        assert_eq!(base_metadata.execution_context, Some(hir::ExecutionContext::ServerCall));
+        assert!(
+            fixture.db.common_module_for_file_id(fixture.unrelated_module).is_none(),
+            "a non-common-module file must not borrow an owner by name"
+        );
+        assert_eq!(
+            by_file.uri().is_some(),
+            expects_uri,
+            "filesystem loading attaches the body URI; the per-MDO model keeps XML properties"
+        );
+        assert!(
+            fixture.db.common_module_for_file_id(fixture.owner_shaped_impostor).is_none(),
+            "a common-module-shaped path outside module_file/unread_module_file has no owner"
+        );
+    }
+}
+
+#[test]
+fn extension_metadata_substrate_rejects_wrong_adoption_target_and_own_namesake() {
+    use bsl_metadata::traits::MdObject;
+
+    let mut fixture = extension_metadata_db_fixture(true);
+    let root = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata"
+    ));
+    let extension_document =
+        std::fs::read_to_string(root.join("extension/Documents/Заказ.xml")).unwrap().replace(
+            "15500000-0000-0000-0000-000000000010</ExtendedConfigurationObject>",
+            "15500000-0000-0000-0000-000000000099</ExtendedConfigurationObject>",
+        );
+    fixture.db.set_file_text(fixture.extension_document_xml, &extension_document);
+    let standalone_document = fixture
+        .db
+        .resolve_metadata_object_for_file(
+            fixture.consumer,
+            bsl_metadata::MdoType::Document,
+            "Заказ",
+        )
+        .unwrap();
+    assert!(standalone_document.find_attribute("РасшРеквизит").is_some());
+    assert!(
+        standalone_document.find_attribute("БазовыйРеквизит").is_none(),
+        "an adopted document targeting another UUID must not inherit base fields"
+    );
+
+    let extension_common =
+        std::fs::read_to_string(root.join("extension/CommonModules/Сервер.xml")).unwrap();
+    let assert_standalone = |module: &bsl_metadata::CommonModule| {
+        assert_eq!(module.uuid().to_string(), "15500000-0000-0000-0000-000000000120");
+        assert_eq!(module.return_values_reuse(), bsl_metadata::ReturnValueReuse::Unknown);
+        assert!(!module.is_client_managed_application());
+        assert!(!module.is_client_ordinary_application());
+        assert!(!module.is_privileged());
+    };
+    let wrong_target = extension_common.replace(
+        "15500000-0000-0000-0000-000000000020</ExtendedConfigurationObject>",
+        "15500000-0000-0000-0000-000000000099</ExtendedConfigurationObject>",
+    );
+    fixture.db.set_file_text(fixture.extension_common_xml, &wrong_target);
+    let wrong_target_module = fixture
+        .db
+        .resolve_common_module_for_file(fixture.extension_common_module, "Сервер")
+        .unwrap();
+    assert_standalone(&wrong_target_module);
+
+    let own = extension_common
+        .replace("      <ObjectBelonging>Adopted</ObjectBelonging>\n", "")
+        .replace(
+            "      <ExtendedConfigurationObject>15500000-0000-0000-0000-000000000020</ExtendedConfigurationObject>\n",
+            "",
+        );
+    fixture.db.set_file_text(fixture.extension_common_xml, &own);
+    let own_module = fixture
+        .db
+        .resolve_common_module_for_file(fixture.extension_common_module, "Сервер")
+        .unwrap();
+    assert_standalone(&own_module);
+}
+
+#[test]
+fn extension_metadata_filesystem_fallback_keeps_own_namesake_common_module_independent() {
+    use bsl_metadata::traits::MdObject;
+
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    let extension = root.path().join("extension");
+    let configuration_xml = |uuid: &str, name: &str| {
+        format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Configuration uuid="{uuid}"><Properties><Name>{name}</Name></Properties><ChildObjects><CommonModule>Shared</CommonModule></ChildObjects></Configuration></MetaDataObject>"#
+        )
+    };
+    for (path, text) in [
+        (
+            base.join("Configuration.xml"),
+            configuration_xml("15500000-0000-0000-0000-000000000701", "Base"),
+        ),
+        (
+            extension.join("Configuration.xml"),
+            configuration_xml("15500000-0000-0000-0000-000000000702", "Extension"),
+        ),
+        (
+            base.join("CommonModules/Shared.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><CommonModule uuid="15500000-0000-0000-0000-000000000703"><Properties><Name>Shared</Name><Server>true</Server><Global>true</Global><ClientManagedApplication>true</ClientManagedApplication><ClientOrdinaryApplication>true</ClientOrdinaryApplication><ExternalConnection>true</ExternalConnection><ServerCall>true</ServerCall><Privileged>true</Privileged><ReturnValuesReuse>DontUse</ReturnValuesReuse></Properties></CommonModule></MetaDataObject>"#.to_string(),
+        ),
+        (
+            extension.join("CommonModules/Shared.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><CommonModule uuid="15500000-0000-0000-0000-000000000704"><Properties><Name>Shared</Name></Properties></CommonModule></MetaDataObject>"#.to_string(),
+        ),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let module_path = extension.join("CommonModules/Shared/Ext/Module.bsl");
+    std::fs::create_dir_all(module_path.parent().unwrap()).unwrap();
+    std::fs::write(&module_path, "Процедура Тест() Экспорт\nКонецПроцедуры").unwrap();
+
+    let module_file = FileId(40);
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    file_set.insert(module_file, VfsPath::new(module_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(4), SourceRoot::new_local(file_set));
+    db.set_file_source_root(module_file, SourceRootId(4));
+    db.set_file_text(module_file, "Процедура Тест() Экспорт\nКонецПроцедуры");
+    db.set_all_config_paths(vec![(None, base), (Some("Extension".to_string()), extension)]);
+
+    let module = db
+        .resolve_common_module_for_file(module_file, "Shared")
+        .expect("own module resolves through the filesystem fallback");
+    assert_eq!(module.uuid().to_string(), "15500000-0000-0000-0000-000000000704");
+    assert_eq!(module.return_values_reuse(), bsl_metadata::ReturnValueReuse::Unknown);
+    assert!(!module.is_server());
+    assert!(!module.is_global());
+    assert!(!module.is_client_managed_application());
+    assert!(!module.is_client_ordinary_application());
+    assert!(!module.is_external_connection());
+    assert!(!module.is_server_call());
+    assert!(!module.is_privileged());
+}
+
+#[test]
+fn extension_metadata_dependency_chain_composes_only_visible_overlays() {
+    use bsl_metadata::traits::MdObject;
+
+    let root = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata"
+    ));
+    let base = root.join("base");
+    let extension = root.join("extension");
+    let dependent = root.join("dependent");
+    let extension_file = FileId(20);
+    let dependent_file = FileId(21);
+    let dependent_common = FileId(22);
+    let file_paths = [
+        (extension_file, extension.join("Documents/Заказ/Ext/ObjectModule.bsl")),
+        (dependent_file, dependent.join("Documents/Заказ/Ext/ObjectModule.bsl")),
+        (dependent_common, dependent.join("CommonModules/Сервер/Ext/Module.bsl")),
+    ];
+
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    for (file_id, path) in &file_paths {
+        file_set.insert(*file_id, VfsPath::new(path.to_string_lossy().as_ref()));
+    }
+    db.set_source_root(SourceRootId(2), SourceRoot::new_local(file_set));
+    for (file_id, path) in &file_paths {
+        db.set_file_source_root(*file_id, SourceRootId(2));
+        db.set_file_text(*file_id, &std::fs::read_to_string(path).unwrap());
+    }
+    let paths = vec![
+        (None, base.clone()),
+        (Some("Расширение".to_string()), extension.clone()),
+        (Some("Зависимое".to_string()), dependent.clone()),
+    ];
+    db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
+        kinds: vec![RootKind::Base, RootKind::Extension, RootKind::Extension],
+        paths,
+        closures: vec![vec![], vec![], vec![1]],
+        topological_order: vec![0, 1, 2],
+        fingerprint: None,
+        source_exclusions: Default::default(),
+    });
+
+    assert_eq!(
+        extension_metadata_field_names(&db, dependent_file),
+        ["Номенклатура", "Количество", "РасшПоле", "ЗависимоеПоле"]
+    );
+    assert_eq!(
+        extension_metadata_field_names(&db, extension_file),
+        ["Номенклатура", "Количество", "РасшПоле"],
+        "a dependency must not see its dependent overlay"
+    );
+    let common = db
+        .resolve_common_module_for_file(dependent_common, "Сервер")
+        .expect("common module is inherited through the chain");
+    assert!(!common.is_server(), "the dependency's explicit false remains effective");
+    assert!(!common.is_global(), "the dependency's explicit false remains effective");
+    assert_eq!(common.return_values_reuse(), bsl_metadata::ReturnValueReuse::DontUse);
+    assert_eq!(common.uuid().to_string(), "15500000-0000-0000-0000-000000000220");
+    let by_file = db
+        .common_module_for_file_id(dependent_common)
+        .expect("dependent common module resolves by file");
+    assert_eq!(by_file.as_ref(), common.as_ref());
+    let metadata = db.module_metadata(ModuleId::new(dependent_common));
+    assert_eq!(metadata.common_module.as_deref(), Some(common.as_ref()));
+    assert_eq!(metadata.execution_context, Some(hir::ExecutionContext::Client));
+}
+
+#[test]
+fn extension_metadata_dependency_chain_composes_in_substrate() {
+    use crate::metadata::{CommonModuleEntry, MdoEntry};
+    use bsl_metadata::traits::MdObject;
+
+    let root = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata"
+    ));
+    let base = root.join("base");
+    let extension = root.join("extension");
+    let dependent = root.join("dependent");
+    let base_doc = FileId(40);
+    let extension_doc = FileId(41);
+    let dependent_doc = FileId(42);
+    let base_common = FileId(43);
+    let extension_common = FileId(44);
+    let dependent_common_xml = FileId(45);
+    let extension_file = FileId(46);
+    let dependent_file = FileId(47);
+    let dependent_common_file = FileId(48);
+    let file_paths = [
+        (base_doc, base.join("Documents/Заказ.xml")),
+        (extension_doc, extension.join("Documents/Заказ.xml")),
+        (dependent_doc, dependent.join("Documents/Заказ.xml")),
+        (base_common, base.join("CommonModules/Сервер.xml")),
+        (extension_common, extension.join("CommonModules/Сервер.xml")),
+        (dependent_common_xml, dependent.join("CommonModules/Сервер.xml")),
+        (extension_file, extension.join("Documents/Заказ/Ext/ObjectModule.bsl")),
+        (dependent_file, dependent.join("Documents/Заказ/Ext/ObjectModule.bsl")),
+        (dependent_common_file, dependent.join("CommonModules/Сервер/Ext/Module.bsl")),
+    ];
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    for (file_id, path) in &file_paths {
+        file_set.insert(*file_id, VfsPath::new(path.to_string_lossy().as_ref()));
+    }
+    db.set_source_root(SourceRootId(3), SourceRoot::new_local(file_set));
+    for (file_id, path) in &file_paths {
+        db.set_file_source_root(*file_id, SourceRootId(3));
+        db.set_file_text(*file_id, &std::fs::read_to_string(path).unwrap());
+    }
+    let paths = vec![
+        (None, base.clone()),
+        (Some("Расширение".to_string()), extension.clone()),
+        (Some("Зависимое".to_string()), dependent.clone()),
+    ];
+    db.set_workspace_configs_snapshot(crate::metadata::WorkspaceConfigsSnapshot {
+        canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
+        kinds: vec![RootKind::Base, RootKind::Extension, RootKind::Extension],
+        paths,
+        closures: vec![vec![], vec![], vec![1]],
+        topological_order: vec![0, 1, 2],
+        fingerprint: None,
+        source_exclusions: Default::default(),
+    });
+    let listing = |main, common, module_file| MetadataListingData {
+        entries: vec![MdoEntry {
+            kind: bsl_metadata::MdoType::Document,
+            name: "Заказ".to_string(),
+            main,
+            predefined: None,
+        }],
+        common_modules: vec![CommonModuleEntry {
+            name: "Сервер".to_string(),
+            main: common,
+            module_file,
+            unread_module_file: None,
+        }],
+        ..empty_listing_data()
+    };
+    db.set_metadata_listing(&base.to_string_lossy(), listing(base_doc, base_common, None));
+    db.set_metadata_listing(
+        &extension.to_string_lossy(),
+        listing(extension_doc, extension_common, None),
+    );
+    db.set_metadata_listing(
+        &dependent.to_string_lossy(),
+        listing(dependent_doc, dependent_common_xml, Some(dependent_common_file)),
+    );
+
+    assert_eq!(
+        extension_metadata_field_names(&db, dependent_file),
+        ["Номенклатура", "Количество", "РасшПоле", "ЗависимоеПоле"]
+    );
+    assert_eq!(
+        extension_metadata_field_names(&db, extension_file),
+        ["Номенклатура", "Количество", "РасшПоле"]
+    );
+    let common = db
+        .resolve_common_module_for_file(dependent_common_file, "Сервер")
+        .expect("common module is inherited through the listed chain");
+    assert!(!common.is_server());
+    assert!(!common.is_global());
+    assert_eq!(common.return_values_reuse(), bsl_metadata::ReturnValueReuse::DontUse);
+    assert_eq!(common.uuid().to_string(), "15500000-0000-0000-0000-000000000220");
+    let by_file = db
+        .common_module_for_file_id(dependent_common_file)
+        .expect("listed dependent common module resolves by file");
+    assert_eq!(by_file.as_ref(), common.as_ref());
+    let metadata = db.module_metadata(ModuleId::new(dependent_common_file));
+    assert_eq!(metadata.common_module.as_deref(), Some(common.as_ref()));
+    assert_eq!(metadata.execution_context, Some(hir::ExecutionContext::Client));
+}
+
+#[test]
+fn extension_metadata_substrate_reacts_to_common_module_and_document_edits() {
+    let mut fixture = extension_metadata_db_fixture(true);
+
+    let before = fixture
+        .db
+        .resolve_common_module_for_file(fixture.extension_common_module, "Сервер")
+        .unwrap();
+    assert_eq!(before.return_values_reuse(), bsl_metadata::ReturnValueReuse::DontUse);
+    assert_eq!(
+        fixture
+            .db
+            .module_metadata(ModuleId::new(fixture.extension_common_module))
+            .common_module
+            .as_ref()
+            .map(|module| module.return_values_reuse()),
+        Some(bsl_metadata::ReturnValueReuse::DontUse)
+    );
+
+    let base_xml = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata/base/CommonModules/Сервер.xml"
+    ))
+    .unwrap()
+    .replace("DontUse", "DuringRequest");
+    fixture.db.set_file_text(fixture.base_common_xml, &base_xml);
+    let inherited = fixture
+        .db
+        .resolve_common_module_for_file(fixture.extension_common_module, "Сервер")
+        .unwrap();
+    assert_eq!(inherited.return_values_reuse(), bsl_metadata::ReturnValueReuse::DuringRequest);
+    assert_eq!(
+        fixture
+            .db
+            .module_metadata(ModuleId::new(fixture.extension_common_module))
+            .common_module
+            .as_ref()
+            .map(|module| module.return_values_reuse()),
+        Some(bsl_metadata::ReturnValueReuse::DuringRequest),
+        "ModuleMetadata must invalidate with the base XML input"
+    );
+
+    let extension_xml = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata/extension/CommonModules/Сервер.xml"
+    ))
+    .unwrap()
+    .replace(
+        "<Global>false</Global>",
+        "<Global>false</Global><ReturnValuesReuse>DontUse</ReturnValuesReuse>",
+    );
+    fixture.db.set_file_text(fixture.extension_common_xml, &extension_xml);
+    let overridden = fixture
+        .db
+        .resolve_common_module_for_file(fixture.extension_common_module, "Сервер")
+        .unwrap();
+    assert_eq!(overridden.return_values_reuse(), bsl_metadata::ReturnValueReuse::DontUse);
+    assert_eq!(
+        fixture
+            .db
+            .module_metadata(ModuleId::new(fixture.extension_common_module))
+            .common_module
+            .as_ref()
+            .map(|module| module.return_values_reuse()),
+        Some(bsl_metadata::ReturnValueReuse::DontUse),
+        "ModuleMetadata must invalidate with the extension XML input"
+    );
+
+    let original_document = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bsl-metadata/fixtures/extension_metadata/base/Documents/Заказ.xml"
+    ))
+    .unwrap();
+    let added = r#"<Attribute uuid="15500000-0000-0000-0000-000000000099"><Properties><Name>ПослеИзменения</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute>"#;
+    let changed_document = original_document.replacen(
+        "        </ChildObjects>\n      </TabularSection>",
+        &format!("          {added}\n        </ChildObjects>\n      </TabularSection>"),
+        1,
+    );
+    assert_ne!(changed_document, original_document, "the fixture edit must hit the section");
+    fixture.db.set_file_text(fixture.base_document_xml, &changed_document);
+    let types = extension_metadata_field_types(&fixture.db, fixture.consumer);
+    assert!(
+        types.iter().any(|(name, ty)| {
+            name == "ПослеИзменения" && ty == &bsl_metadata::AttributeType::String { length: None }
+        }),
+        "the same database must expose the newly added typed base column: {types:?}"
     );
 }
 
@@ -6997,6 +7759,7 @@ fn an_external_root_binds_its_files_through_the_snapshot_not_the_disk() {
         closures: vec![vec![], vec![], vec![1]],
         topological_order: vec![0, 1, 2],
         fingerprint: Some("external".to_string()),
+        source_exclusions: Default::default(),
     });
 
     let bound = db
@@ -7058,6 +7821,7 @@ fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_on
         closures: vec![vec![]],
         topological_order: vec![0],
         fingerprint: Some("spelling".to_string()),
+        source_exclusions: Default::default(),
     });
 
     let bound = db
@@ -7079,6 +7843,7 @@ fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_on
         closures: vec![vec![]],
         topological_order: vec![0],
         fingerprint: Some("alias".to_string()),
+        source_exclusions: Default::default(),
     });
     let bound = db
         .configuration_input_for_path(&cf_real.join("CommonModules/Foo/Ext/Module.bsl"))

@@ -107,6 +107,7 @@ fn at_end_function(p: &Parser) -> bool {
 ///
 /// Provenance: `docs/legal/bsl-clean-room-slice-b3.md`, finding D5.
 pub fn procedure_def_content(p: &mut Parser) {
+    p.forget_inline_inserts();
     p.eat(T![KwAsync]);
 
     p.expect(T![KwProcedure]);
@@ -153,6 +154,7 @@ pub fn function_def(p: &mut Parser) {
 ///
 /// Provenance: `docs/legal/bsl-clean-room-slice-b3.md`, finding D6.
 pub fn function_def_content(p: &mut Parser) {
+    p.forget_inline_inserts();
     p.eat(T![KwAsync]);
 
     p.expect(T![KwFunction]);

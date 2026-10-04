@@ -1,65 +1,30 @@
 use cfg_types::LocalRange;
 use cfg_types::{BindingId, ExprId, StmtId};
-use hir_def::Name;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfgVertex {
     BasicBlock(BasicBlockVertex),
 
+    /// Evaluates the condition of `Если` or of one `ИначеЕсли`.
     Conditional(ConditionalVertex),
 
-    WhileLoop(WhileLoopVertex),
+    /// Loop headers: the computations a loop performs before every pass of its
+    /// body, and the place its continuation is tested.
+    WhileHeader(WhileHeaderVertex),
 
-    ForLoop(ForLoopVertex),
+    ForHeader(ForHeaderVertex),
 
-    ForEachLoop(ForEachLoopVertex),
+    ForEachHeader(ForEachHeaderVertex),
 
-    TryExcept(TryExceptVertex),
+    /// Entry of `Попытка`: the protected statements start here, and the handler
+    /// is assumed reachable from here.
+    Try,
 
-    Label(LabelVertex),
-
+    /// One `#Если` or `#ИначеЕсли` directive.
     PreprocCondition(PreprocConditionVertex),
 
+    /// The single completion point of the method.
     Exit,
-}
-
-impl CfgVertex {
-    pub fn first_stmt_id(&self) -> Option<StmtId> {
-        match self {
-            CfgVertex::BasicBlock(v) => v.statements().first().copied(),
-            _ => None,
-        }
-    }
-
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            CfgVertex::BasicBlock(_) => "BasicBlock",
-            CfgVertex::Conditional(_) => "Conditional",
-            CfgVertex::WhileLoop(_) => "WhileLoop",
-            CfgVertex::ForLoop(_) => "ForLoop",
-            CfgVertex::ForEachLoop(_) => "ForEachLoop",
-            CfgVertex::TryExcept(_) => "TryExcept",
-            CfgVertex::Label(_) => "Label",
-            CfgVertex::PreprocCondition(_) => "PreprocCondition",
-            CfgVertex::Exit => "Exit",
-        }
-    }
-
-    pub fn is_branching(&self) -> bool {
-        matches!(
-            self,
-            CfgVertex::Conditional(_)
-                | CfgVertex::WhileLoop(_)
-                | CfgVertex::ForLoop(_)
-                | CfgVertex::ForEachLoop(_)
-                | CfgVertex::TryExcept(_)
-                | CfgVertex::PreprocCondition(_)
-        )
-    }
-
-    pub fn is_loop(&self) -> bool {
-        matches!(self, CfgVertex::WhileLoop(_) | CfgVertex::ForLoop(_) | CfgVertex::ForEachLoop(_))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,10 +89,6 @@ pub struct PreprocConditionVertex {
 }
 
 impl PreprocConditionVertex {
-    pub fn new(condition_range: LocalRange) -> Self {
-        Self { condition_range, directive_range: None, full_range: None }
-    }
-
     pub fn with_directive_range(condition_range: LocalRange, directive_range: LocalRange) -> Self {
         Self { condition_range, directive_range: Some(directive_range), full_range: None }
     }
@@ -146,74 +107,38 @@ impl PreprocConditionVertex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WhileLoopVertex {
+pub struct WhileHeaderVertex {
     pub condition: ExprId,
 }
 
-impl WhileLoopVertex {
+impl WhileHeaderVertex {
     pub fn new(condition: ExprId) -> Self {
         Self { condition }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForLoopVertex {
+pub struct ForHeaderVertex {
     pub loop_var: BindingId,
     pub from: ExprId,
     pub to: ExprId,
-    pub stmt_id: Option<StmtId>,
 }
 
-impl ForLoopVertex {
+impl ForHeaderVertex {
     pub fn new(loop_var: BindingId, from: ExprId, to: ExprId) -> Self {
-        Self { loop_var, from, to, stmt_id: None }
-    }
-
-    pub fn with_stmt_id(loop_var: BindingId, from: ExprId, to: ExprId, stmt_id: StmtId) -> Self {
-        Self { loop_var, from, to, stmt_id: Some(stmt_id) }
+        Self { loop_var, from, to }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForEachLoopVertex {
+pub struct ForEachHeaderVertex {
     pub loop_var: BindingId,
     pub collection: ExprId,
-    pub stmt_id: Option<StmtId>,
 }
 
-impl ForEachLoopVertex {
+impl ForEachHeaderVertex {
     pub fn new(loop_var: BindingId, collection: ExprId) -> Self {
-        Self { loop_var, collection, stmt_id: None }
-    }
-
-    pub fn with_stmt_id(loop_var: BindingId, collection: ExprId, stmt_id: StmtId) -> Self {
-        Self { loop_var, collection, stmt_id: Some(stmt_id) }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TryExceptVertex;
-
-impl TryExceptVertex {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for TryExceptVertex {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LabelVertex {
-    pub name: Name,
-}
-
-impl LabelVertex {
-    pub fn new(name: Name) -> Self {
-        Self { name }
+        Self { loop_var, collection }
     }
 }
 
@@ -226,20 +151,5 @@ mod tests {
         let block = BasicBlockVertex::new();
         assert!(block.is_empty());
         assert_eq!(block.len(), 0);
-    }
-
-    #[test]
-    fn test_vertex_type_names() {
-        let exit = CfgVertex::Exit;
-        assert_eq!(exit.type_name(), "Exit");
-        assert!(!exit.is_branching());
-        assert!(!exit.is_loop());
-    }
-
-    #[test]
-    fn test_branching_vertices() {
-        let block = CfgVertex::BasicBlock(BasicBlockVertex::new());
-        assert!(!block.is_branching());
-        assert!(!block.is_loop());
     }
 }

@@ -162,11 +162,28 @@ pub(crate) fn scan_stats_over_roots(
 }
 
 /// [`scan_stats_over_roots`] without descending into `excluded`.
+#[cfg(test)]
 pub(crate) fn scan_stats_over_roots_excluding(
     roots: &[PathBuf],
     excluded: &[PathBuf],
 ) -> (Vec<FileStat>, super::universe::ScanVerdict) {
-    let set = SourceSet::scan_excluding(roots, excluded);
+    scan_stats_in_scope(roots, excluded, &project_model::ExcludedPaths::default())
+}
+
+/// [`scan_stats_over_roots`] over one project snapshot's scope: its roots, less its
+/// cache holes and the directories its user excluded.
+pub(crate) fn scan_stats_over_project(
+    project: &super::input::ProjectSnapshot,
+) -> (Vec<FileStat>, super::universe::ScanVerdict) {
+    scan_stats_in_scope(&project.scan_roots, &project.excluded, &project.user_excluded)
+}
+
+fn scan_stats_in_scope(
+    roots: &[PathBuf],
+    excluded: &[PathBuf],
+    user_excluded: &project_model::ExcludedPaths,
+) -> (Vec<FileStat>, super::universe::ScanVerdict) {
+    let set = SourceSet::scan_in_scope(roots, excluded, user_excluded);
     let scan = super::universe::file_stats_with_content_errors(&set, roots);
     (
         scan.stats,
@@ -290,8 +307,7 @@ pub(crate) fn graph_matches_live_project_strict(
     if force_stale || !project.validated || project.search_roots.is_none() {
         return false;
     }
-    let universe =
-        super::universe::ScannedUniverse::scan_excluding(&project.scan_roots, &project.excluded);
+    let universe = super::universe::ScannedUniverse::scan_project(project);
     if !universe.clean() {
         return false;
     }

@@ -81,20 +81,27 @@ impl TabularSection {
         self.use_mode = use_mode;
     }
 
+    /// Apply an extension overlay (a borrowed tabular section of the same name)
+    /// onto this base section. Identity comes from the overlay; the base
+    /// attributes stay, an overlay attribute replaces a same-named one or is
+    /// added, and optional values absent in the overlay are inherited.
     pub fn apply_extension_overlay(&mut self, overlay: &TabularSection) {
-        if overlay.name_en.is_some() {
-            self.name_en = overlay.name_en.clone();
-        }
-        if overlay.synonym.is_some() {
-            self.synonym = overlay.synonym.clone();
-        }
-        if overlay.use_mode.is_some() {
-            self.use_mode = overlay.use_mode.clone();
-        }
+        let inherited = std::mem::replace(self, overlay.clone());
+        self.name_en = self.name_en.take().or(inherited.name_en);
+        self.synonym = self.synonym.take().or(inherited.synonym);
+        self.use_mode = self.use_mode.take().or(inherited.use_mode);
+
+        let mut attributes = inherited.attributes;
         for attr in &overlay.attributes {
-            self.attributes.retain(|existing| !existing.name.eq_ignore_ascii_case(&attr.name));
-            self.attributes.push(attr.clone());
+            match attributes
+                .iter_mut()
+                .find(|existing| stdx::case::eq_ignore_case(&existing.name, &attr.name))
+            {
+                Some(existing) => *existing = attr.clone(),
+                None => attributes.push(attr.clone()),
+            }
         }
+        self.attributes = attributes;
     }
 
     /// Heap bytes owned by this tabular section: its name strings plus the
@@ -188,5 +195,72 @@ mod tests {
         ts.set_synonym(Some("Коды товара".to_string()));
 
         assert_eq!(ts.synonym(), Some("Коды товара"));
+    }
+
+    #[test]
+    fn extension_metadata_overlay_preserves_base_fields_and_replaces_conflicts() {
+        let base_uuid = Uuid::new_v4();
+        let overlay_uuid = Uuid::new_v4();
+        let mut base = TabularSection::new(base_uuid, "Товары");
+        base.set_name_en(Some("Goods".to_string()));
+        base.set_synonym(Some("Товары базы".to_string()));
+        base.set_use_mode(Some("ForItem".to_string()));
+        base.set_attributes(vec![
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "Номенклатура",
+                crate::AttributeType::String { length: Some(50) },
+            ),
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "Количество",
+                crate::AttributeType::Number { precision: 10, scale: 0 },
+            ),
+        ]);
+
+        let mut overlay = TabularSection::new(overlay_uuid, "Товары");
+        overlay.set_attributes(vec![
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "Количество",
+                crate::AttributeType::String { length: Some(15) },
+            ),
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "РасшПоле",
+                crate::AttributeType::String { length: Some(25) },
+            ),
+        ]);
+
+        base.apply_extension_overlay(&overlay);
+
+        assert_eq!(base.uuid(), &overlay_uuid, "the borrowed section keeps overlay identity");
+        assert_eq!(base.name_en(), Some("Goods"));
+        assert_eq!(base.synonym(), Some("Товары базы"));
+        assert_eq!(base.use_mode(), Some("ForItem"));
+        let names: Vec<_> = base.attributes().iter().map(TabularSectionAttribute::name).collect();
+        assert_eq!(names, ["Номенклатура", "Количество", "РасшПоле"]);
+        assert!(matches!(
+            base.attributes()[1].attr_type(),
+            crate::AttributeType::String { length: Some(15) }
+        ));
+
+        let mut inherited = base.clone();
+        let empty_overlay = TabularSection::new(Uuid::new_v4(), "Товары");
+        inherited.apply_extension_overlay(&empty_overlay);
+        assert_eq!(
+            inherited.attributes().iter().map(TabularSectionAttribute::name).collect::<Vec<_>>(),
+            ["Номенклатура", "Количество", "РасшПоле"],
+            "an empty borrowed section must not erase inherited fields"
+        );
+
+        let mut explicit_overlay = TabularSection::new(Uuid::new_v4(), "Товары");
+        explicit_overlay.set_name_en(Some("OverlayGoods".to_string()));
+        explicit_overlay.set_synonym(Some("Товары расширения".to_string()));
+        explicit_overlay.set_use_mode(Some("ForFolder".to_string()));
+        inherited.apply_extension_overlay(&explicit_overlay);
+        assert_eq!(inherited.name_en(), Some("OverlayGoods"));
+        assert_eq!(inherited.synonym(), Some("Товары расширения"));
+        assert_eq!(inherited.use_mode(), Some("ForFolder"));
     }
 }

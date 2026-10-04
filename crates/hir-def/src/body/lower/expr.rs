@@ -1,7 +1,7 @@
 use bsl_platform::capability::{Category as CapabilityCategory, EntryKind as CapabilityEntryKind};
 use intern::NormName;
 use stdx::case::CaseExt;
-use syntax::ast_utils::field_tail_name_token;
+use syntax::ast_utils::{active_children, active_children_with_tokens, field_tail_name_token};
 use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 use crate::body::{
@@ -20,7 +20,7 @@ fn field_name_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 
 pub(crate) fn lower_expr_node(ctx: &mut LoweringCtx, node: &SyntaxNode) -> ExprIdx {
     let actual_node = if node.kind() == SyntaxKind::EXPR {
-        node.children().next().unwrap_or_else(|| node.clone())
+        active_children(node).next().unwrap_or_else(|| node.clone())
     } else {
         node.clone()
     };
@@ -41,15 +41,13 @@ fn lower_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> ExprIdx {
         SyntaxKind::FIELD_EXPR => lower_field_expr(ctx, node),
         SyntaxKind::NEW_EXPR => lower_new_expr(ctx, node),
         SyntaxKind::PAREN_EXPR => {
-            return node
-                .children()
+            return active_children(node)
                 .next()
                 .map(|n| lower_expr_node(ctx, &n))
                 .unwrap_or_else(|| ctx.missing_expr());
         }
         SyntaxKind::AWAIT_EXPR => {
-            return node
-                .children()
+            return active_children(node)
                 .next()
                 .map(|n| lower_expr_node(ctx, &n))
                 .unwrap_or_else(|| ctx.missing_expr());
@@ -71,8 +69,7 @@ fn lower_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> ExprIdx {
             Expr::Path(Name::new(&text))
         }
         SyntaxKind::EXPR => {
-            return node
-                .children()
+            return active_children(node)
                 .next()
                 .map(|n| lower_expr(ctx, &n))
                 .unwrap_or_else(|| ctx.missing_expr());
@@ -144,11 +141,21 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
             Literal::Number(value)
         }
         SyntaxKind::STRING | SyntaxKind::STRING_START => {
-            let value = extract_string_content(node).unwrap_or_default();
+            let torn = syntax::sdbl_query::extract_torn_literal(node);
+            let value = match &torn {
+                Some((text, _)) => text.clone(),
+                None => extract_string_content(node).unwrap_or_default(),
+            };
 
             if looks_like_sdbl(&value) {
-                let (sdbl_text, quote_corrections) = syntax::extract_sdbl_with_corrections(node)
-                    .unwrap_or_else(|| (value.clone(), vec![]));
+                let (sdbl_text, quote_corrections, literal_map) = match torn {
+                    Some((text, map)) => (text, Vec::new(), Some(map)),
+                    None => {
+                        let (text, corrections) = syntax::extract_sdbl_with_corrections(node)
+                            .unwrap_or_else(|| (value.clone(), vec![]));
+                        (text, corrections, None)
+                    }
+                };
 
                 let sdbl_ast = parser::parse_sdbl_with_shared_cache(&sdbl_text);
                 let literal_text = node.text().to_string();
@@ -156,10 +163,13 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                     syntax::sdbl_query::collect_query_parse_errors(&sdbl_ast)
                         .into_iter()
                         .map(|(query_range, err)| {
-                            let bsl_range = syntax::sdbl_query::map_range_query_to_literal(
-                                &literal_text,
-                                query_range,
-                            );
+                            let bsl_range = match &literal_map {
+                                Some(map) => map.map_range_to_literal(query_range),
+                                None => syntax::sdbl_query::map_range_query_to_literal(
+                                    &literal_text,
+                                    query_range,
+                                ),
+                            };
                             (bsl_range, err)
                         })
                         .collect();
@@ -169,6 +179,7 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                     query_ast: Some(sdbl_ast),
                     quote_corrections,
                     error_ranges_in_bsl,
+                    literal_map,
                 };
 
                 ctx.pending_sdbl.push((node.text_range(), query));
@@ -192,7 +203,7 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
 }
 
 fn lower_binary_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
-    let mut children = node.children();
+    let mut children = active_children(node);
 
     let lhs_node = match children.next() {
         Some(n) => n,
@@ -258,7 +269,7 @@ fn lower_binary_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                 break;
             }
 
-            if let Some(child) = current.children().next() {
+            if let Some(child) = active_children(&current).next() {
                 current = child;
             } else {
                 break;
@@ -301,7 +312,7 @@ fn lower_unary_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
         })
         .unwrap_or(UnaryOp::Neg);
 
-    let expr_node = match node.children().next() {
+    let expr_node = match active_children(node).next() {
         Some(n) => n,
         None => {
             let missing = ctx.missing_expr();
@@ -316,7 +327,7 @@ fn lower_unary_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
 fn lower_ternary_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     ctx.emit(BodyDiagnostic::TernaryOperatorUsage { range: node.text_range() });
 
-    let mut children = node.children();
+    let mut children = active_children(node);
 
     let condition =
         children.next().map(|n| lower_expr_node(ctx, &n)).unwrap_or_else(|| ctx.missing_expr());
@@ -331,7 +342,7 @@ fn lower_ternary_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
 }
 
 fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
-    let mut children = node.children();
+    let mut children = active_children(node);
 
     let callee_node = match children.next() {
         Some(n) => n,
@@ -339,7 +350,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     };
 
     let actual_callee = if callee_node.kind() == SyntaxKind::EXPR {
-        callee_node.children().next().unwrap_or_else(|| callee_node.clone())
+        active_children(&callee_node).next().unwrap_or_else(|| callee_node.clone())
     } else {
         callee_node.clone()
     };
@@ -404,8 +415,9 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
         use super::diagnostics::{is_deprecated_managed_form, is_type_method};
 
         if is_type_method(&name) {
-            if let Some(arg_list) = node.children().find(|n| n.kind() == SyntaxKind::ARG_LIST) {
-                if let Some(first_arg) = arg_list.children().next() {
+            if let Some(arg_list) = active_children(node).find(|n| n.kind() == SyntaxKind::ARG_LIST)
+            {
+                if let Some(first_arg) = active_children(&arg_list).next() {
                     if let Some(string_token) = first_arg
                         .descendants_with_tokens()
                         .filter_map(|el| el.into_token())
@@ -549,7 +561,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
 
     let callee = lower_expr_node(ctx, &callee_node);
 
-    let arg_list_node = node.children().find(|n| n.kind() == SyntaxKind::ARG_LIST);
+    let arg_list_node = active_children(node).find(|n| n.kind() == SyntaxKind::ARG_LIST);
 
     let args =
         arg_list_node.as_ref().map(|arg_list| lower_arg_list(ctx, arg_list)).unwrap_or_default();
@@ -560,7 +572,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
 
     if is_str_template_call {
         if let Some(ref arg_list) = arg_list_node {
-            if let Some(first_arg) = arg_list.children().next() {
+            if let Some(first_arg) = active_children(arg_list).next() {
                 if let Some(template_string) = find_string_in_node(&first_arg) {
                     let param_count = arg_list
                         .children_with_tokens()
@@ -606,14 +618,14 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     }
 
     if actual_callee.kind() == SyntaxKind::FIELD_EXPR {
-        let object_name_opt = actual_callee.children().next().and_then(|base_node| {
+        let object_name_opt = active_children(&actual_callee).next().and_then(|base_node| {
             if base_node.kind() == SyntaxKind::IDENT {
                 return Some(base_node.text().to_string());
             }
 
             if base_node.kind() == SyntaxKind::EXPR {
                 if let Some(ident_child) =
-                    base_node.children().find(|n| n.kind() == SyntaxKind::IDENT)
+                    active_children(&base_node).find(|n| n.kind() == SyntaxKind::IDENT)
                 {
                     return Some(ident_child.text().to_string());
                 }
@@ -735,7 +747,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
         {
             use super::diagnostics::is_find_by_code_method;
             if is_find_by_code_method(method_token.text()) {
-                if let Some(receiver) = actual_callee.first_child() {
+                if let Some(receiver) = active_children(&actual_callee).next() {
                     if receiver.kind() == SyntaxKind::FIELD_EXPR {
                         let object_name = receiver
                             .children_with_tokens()
@@ -744,7 +756,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                             .last()
                             .map(|t| t.text().to_string());
 
-                        let manager_name = receiver.first_child().and_then(|base| {
+                        let manager_name = active_children(&receiver).next().and_then(|base| {
                             if let Some(token) = base.first_token() {
                                 if token.kind() == SyntaxKind::IDENT {
                                     return Some(token.text().to_string());
@@ -862,7 +874,7 @@ fn lower_arg_list(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Vec<ExprIdx> {
     let mut current_expr: Option<ExprIdx> = None;
     let mut has_any_content = false;
 
-    for child in node.children_with_tokens() {
+    for child in active_children_with_tokens(node) {
         match child.kind() {
             SyntaxKind::COMMA => {
                 args.push(current_expr.unwrap_or_else(|| ctx.missing_expr()));
@@ -889,7 +901,7 @@ fn lower_arg_list(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Vec<ExprIdx> {
 fn find_trailing_comma(arg_list: &SyntaxNode) -> Option<syntax::TextRange> {
     use syntax::NodeOrToken;
 
-    let tokens: Vec<_> = arg_list.children_with_tokens().collect();
+    let tokens: Vec<_> = active_children_with_tokens(arg_list).collect();
     let mut iter = tokens.iter().rev().filter(|element| !is_trivia_element(element));
 
     let r_paren = iter.next()?;
@@ -918,7 +930,7 @@ fn extract_arg_presence(arg_list: &SyntaxNode) -> Vec<bool> {
     let mut args = Vec::new();
     let mut has_expr = false;
 
-    for child in arg_list.children_with_tokens() {
+    for child in active_children_with_tokens(arg_list) {
         match child.kind() {
             SyntaxKind::COMMA => {
                 args.push(has_expr);
@@ -932,7 +944,7 @@ fn extract_arg_presence(arg_list: &SyntaxNode) -> Vec<bool> {
         }
     }
 
-    if arg_list.children().count() > 0 || has_expr {
+    if active_children(arg_list).count() > 0 || has_expr {
         args.push(has_expr);
     }
 
@@ -940,7 +952,7 @@ fn extract_arg_presence(arg_list: &SyntaxNode) -> Vec<bool> {
 }
 
 fn lower_index_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
-    let mut children = node.children();
+    let mut children = active_children(node);
 
     let base =
         children.next().map(|n| lower_expr_node(ctx, &n)).unwrap_or_else(|| ctx.missing_expr());
@@ -952,7 +964,7 @@ fn lower_index_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
 }
 
 fn lower_field_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
-    let mut children = node.children();
+    let mut children = active_children(node);
 
     let base =
         children.next().map(|n| lower_expr_node(ctx, &n)).unwrap_or_else(|| ctx.missing_expr());
@@ -962,13 +974,14 @@ fn lower_field_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     let field_name =
         field_token.as_ref().map(|tok| Name::new(tok.text())).unwrap_or_else(Name::missing);
 
-    let object_name_opt = node.children().next().and_then(|base_node| {
+    let object_name_opt = active_children(node).next().and_then(|base_node| {
         if base_node.kind() == SyntaxKind::IDENT {
             return Some(base_node.text().to_string());
         }
 
         if base_node.kind() == SyntaxKind::EXPR {
-            if let Some(ident_child) = base_node.children().find(|n| n.kind() == SyntaxKind::IDENT)
+            if let Some(ident_child) =
+                active_children(&base_node).find(|n| n.kind() == SyntaxKind::IDENT)
             {
                 return Some(ident_child.text().to_string());
             }
@@ -993,12 +1006,13 @@ fn lower_field_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
         }
     }
 
-    let direct_base_name = node.children().next().and_then(|base_node| {
+    let direct_base_name = active_children(node).next().and_then(|base_node| {
         if base_node.kind() == SyntaxKind::IDENT {
             return Some(base_node.text().to_string());
         }
         if base_node.kind() == SyntaxKind::EXPR {
-            if let Some(ident_child) = base_node.children().find(|n| n.kind() == SyntaxKind::IDENT)
+            if let Some(ident_child) =
+                active_children(&base_node).find(|n| n.kind() == SyntaxKind::IDENT)
             {
                 return Some(ident_child.text().to_string());
             }
@@ -1036,15 +1050,16 @@ enum QualifiedCallInfo {
 }
 
 fn analyze_qualified_call(node: &SyntaxNode, ctx: &LoweringCtx) -> Option<QualifiedCallInfo> {
-    let first_child = node.children().next()?;
+    let first_child = active_children(node).next()?;
 
     if first_child.kind() == SyntaxKind::FIELD_EXPR {
-        let inner_base = first_child.children().next()?;
+        let inner_base = active_children(&first_child).next()?;
         let mdo_type = match inner_base.kind() {
             SyntaxKind::IDENT => inner_base.text().to_string(),
             SyntaxKind::EXPR => {
-                let ident_nodes: Vec<_> =
-                    inner_base.children().filter(|n| n.kind() == SyntaxKind::IDENT).collect();
+                let ident_nodes: Vec<_> = active_children(&inner_base)
+                    .filter(|n| n.kind() == SyntaxKind::IDENT)
+                    .collect();
                 if ident_nodes.len() == 1 {
                     ident_nodes[0].text().to_string()
                 } else {
@@ -1081,7 +1096,7 @@ fn analyze_qualified_call(node: &SyntaxNode, ctx: &LoweringCtx) -> Option<Qualif
         Some(first_child.text().to_string())
     } else if first_child.kind() == SyntaxKind::EXPR {
         let idents: Vec<_> =
-            first_child.children().filter(|n| n.kind() == SyntaxKind::IDENT).collect();
+            active_children(&first_child).filter(|n| n.kind() == SyntaxKind::IDENT).collect();
         if idents.len() == 1 {
             Some(idents[0].text().to_string())
         } else {
@@ -1158,8 +1173,7 @@ fn lower_new_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
         }
     }
 
-    let args = node
-        .children()
+    let args = active_children(node)
         .find(|n| n.kind() == SyntaxKind::ARG_LIST)
         .map(|arg_list| lower_arg_list(ctx, &arg_list))
         .unwrap_or_default();
@@ -1219,7 +1233,7 @@ fn is_write_log_event_method(name: &str) -> bool {
 }
 
 fn check_write_log_event_call(ctx: &mut LoweringCtx, node: &SyntaxNode) {
-    let arg_list = match node.children().find(|n| n.kind() == SyntaxKind::ARG_LIST) {
+    let arg_list = match active_children(node).find(|n| n.kind() == SyntaxKind::ARG_LIST) {
         Some(al) => al,
         None => return,
     };
@@ -1263,7 +1277,7 @@ fn collect_arguments(arg_list: &SyntaxNode) -> Vec<Option<SyntaxNode>> {
     let mut current_arg: Option<SyntaxNode> = None;
     let mut has_content = false;
 
-    for child in arg_list.children_with_tokens() {
+    for child in active_children_with_tokens(arg_list) {
         match child.kind() {
             SyntaxKind::COMMA => {
                 args.push(current_arg.take());
@@ -1314,11 +1328,11 @@ fn resolve_comment_in_except_block(arg: &SyntaxNode, call_node: &SyntaxNode) -> 
 
     let except_clause = call_node.ancestors().find(|n| n.kind() == SyntaxKind::EXCEPT_CLAUSE)?;
 
-    let stmt_list = except_clause.children().find(|n| n.kind() == SyntaxKind::STMT_LIST)?;
+    let stmt_list = active_children(&except_clause).find(|n| n.kind() == SyntaxKind::STMT_LIST)?;
 
-    for child in stmt_list.children() {
+    for child in active_children(&stmt_list) {
         if child.kind() == SyntaxKind::ASSIGN_STMT {
-            let lhs_node = match child.children().next() {
+            let lhs_node = match active_children(&child).next() {
                 Some(n) => n,
                 None => continue,
             };
@@ -1337,8 +1351,8 @@ fn resolve_comment_in_except_block(arg: &SyntaxNode, call_node: &SyntaxNode) -> 
 }
 
 fn extract_type_name_from_first_arg(node: &SyntaxNode) -> Option<String> {
-    let arg_list = node.children().find(|n| n.kind() == SyntaxKind::ARG_LIST)?;
-    let first_arg = arg_list.children().next()?;
+    let arg_list = active_children(node).find(|n| n.kind() == SyntaxKind::ARG_LIST)?;
+    let first_arg = active_children(&arg_list).next()?;
 
     let string_token = first_arg
         .descendants_with_tokens()
@@ -1748,7 +1762,7 @@ fn is_unsafe_safe_mode_context(call_node: &SyntaxNode) -> bool {
             }
             SyntaxKind::PAREN_EXPR | SyntaxKind::EXPR => {}
             SyntaxKind::IF_STMT | SyntaxKind::ELSIF_CLAUSE => {
-                if let Some(cond) = node.children().find(|n| n.kind() == SyntaxKind::EXPR) {
+                if let Some(cond) = active_children(&node).find(|n| n.kind() == SyntaxKind::EXPR) {
                     let call_range = call_node.text_range();
                     let contains_call = cond
                         .descendants()
@@ -1776,13 +1790,13 @@ fn is_unsafe_safe_mode_context(call_node: &SyntaxNode) -> bool {
                 return false;
             }
             SyntaxKind::ASSIGN_STMT => {
-                if let Some(rhs_node) = node.children().nth(1) {
+                if let Some(rhs_node) = active_children(&node).nth(1) {
                     let call_range = call_node.text_range();
                     if rhs_node.text_range() == call_range {
                         return false;
                     }
                     if rhs_node.kind() == SyntaxKind::EXPR {
-                        if let Some(inner) = rhs_node.children().next() {
+                        if let Some(inner) = active_children(&rhs_node).next() {
                             if inner.text_range() == call_range {
                                 return false;
                             }

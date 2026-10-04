@@ -1,5 +1,6 @@
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsConfig, DiagnosticsContext};
-use syntax::{SyntaxKind, SyntaxNode, TextRange};
+use syntax::sdbl_query::LiteralTextMap;
+use syntax::{SyntaxKind, SyntaxNode, TextRange, TextSize};
 
 /// Takes the configuration rather than a [`DiagnosticsContext`]: every SDBL rule needs the
 /// project's severities, tags and parameters, and none of them needs the file. That is what
@@ -84,6 +85,11 @@ pub struct EmbeddedMapper<'a> {
     line_starts: Vec<usize>,
 
     quote_corrections: Vec<(usize, usize)>,
+
+    /// Where the literal starts and how its query lies in it, for a literal
+    /// torn by extension markers. Line arithmetic cannot place such a query:
+    /// its lines are not the literal's lines of the same number.
+    torn_literal: Option<(TextSize, LiteralTextMap)>,
 }
 
 impl<'a> SdblPositionMapper<'a> {
@@ -103,6 +109,7 @@ impl<'a> SdblPositionMapper<'a> {
             bsl_literal_col,
             line_starts,
             quote_corrections,
+            torn_literal: None,
         })
     }
 
@@ -126,6 +133,7 @@ impl<'a> SdblPositionMapper<'a> {
             bsl_literal_col,
             line_starts,
             quote_corrections,
+            torn_literal: None,
         })
     }
 
@@ -140,10 +148,36 @@ impl<'a> SdblPositionMapper<'a> {
             line_starts,
             query_info.quote_corrections.clone(),
         )
+        .with_literal_map(query_info)
+    }
+
+    /// The same as [`Self::from_query_info`] for a caller without a line index
+    /// of the file.
+    pub fn from_query_info_without_line_index(
+        query_info: &syntax::SdblQueryInfo,
+        bsl_source: &'a str,
+    ) -> Self {
+        Self::new_from_range(
+            query_info.bsl_literal_range,
+            bsl_source,
+            query_info.quote_corrections.clone(),
+        )
+        .with_literal_map(query_info)
+    }
+
+    fn with_literal_map(mut self, query_info: &syntax::SdblQueryInfo) -> Self {
+        if let (Self::Embedded(this), Some(map)) = (&mut self, &query_info.literal_map) {
+            this.torn_literal = Some((query_info.bsl_literal_range.start(), map.clone()));
+        }
+        self
     }
 
     pub fn map_range(&self, sdbl_range: TextRange, sdbl_text: &str) -> TextRange {
         let Self::Embedded(this) = self else { return sdbl_range };
+
+        if let Some((literal_start, map)) = &this.torn_literal {
+            return map.map_range_to_literal(sdbl_range) + *literal_start;
+        }
 
         let sdbl_line_starts = build_line_index(sdbl_text);
 
@@ -330,6 +364,9 @@ fn line_col_to_byte_offset_fast(
 }
 
 pub fn extract_string_content(node: &SyntaxNode) -> Option<String> {
+    if let Some((text, _)) = syntax::sdbl_query::extract_torn_literal(node) {
+        return Some(text);
+    }
     let mut result = String::new();
     let mut tokens = node.children_with_tokens().filter_map(|it| it.into_token());
 

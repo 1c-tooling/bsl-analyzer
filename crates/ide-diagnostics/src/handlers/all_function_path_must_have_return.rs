@@ -32,9 +32,9 @@ pub fn from_hir(
 
     let every_path_returns = ctx
         .method_cfg(*method_id)
-        .entry_point()
-        .and_then(|entry| {
-            ctx.method_path_terminates(*method_id).map(|pt| !pt.may_fallthrough_at_block(entry))
+        .start()
+        .and_then(|start| {
+            ctx.method_path_terminates(*method_id).map(|pt| !pt.may_fallthrough_at_block(start))
         })
         .unwrap_or(false);
 

@@ -1,16 +1,17 @@
 use crate::{CfgEdgeType, CfgVertex, ControlFlowGraph};
+use hir_def::{Body, Stmt};
 use petgraph::algo::dominators::simple_fast;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rustc_hash::FxHashMap;
 
-pub fn format_cfg(cfg: &ControlFlowGraph) -> String {
+pub fn format_cfg(cfg: &ControlFlowGraph, body: &Body) -> String {
     let depths = dominator_depths(cfg);
     let mut base_fingerprints = FxHashMap::default();
     let mut base_counts = FxHashMap::default();
 
     for (idx, vertex) in cfg.vertices() {
-        let base = base_fingerprint(cfg, idx, vertex, *depths.get(&idx).unwrap_or(&0));
+        let base = base_fingerprint(cfg, body, idx, vertex, *depths.get(&idx).unwrap_or(&0));
         *base_counts.entry(base.clone()).or_insert(0usize) += 1;
         base_fingerprints.insert(idx, base);
     }
@@ -69,14 +70,14 @@ pub fn format_cfg(cfg: &ControlFlowGraph) -> String {
 
 fn dominator_depths(cfg: &ControlFlowGraph) -> FxHashMap<NodeIndex, usize> {
     let mut depths = FxHashMap::default();
-    let Some(entry) = cfg.entry_point() else {
+    let Some(start) = cfg.start() else {
         return depths;
     };
-    if !cfg.contains_vertex(entry) {
+    if !cfg.contains_vertex(start) {
         return depths;
     }
 
-    let dominators = simple_fast(cfg.graph(), entry);
+    let dominators = simple_fast(cfg.graph(), start);
     for (idx, _) in cfg.vertices() {
         let depth = dominators.strict_dominators(idx).map_or(0, Iterator::count);
         depths.insert(idx, depth);
@@ -86,70 +87,50 @@ fn dominator_depths(cfg: &ControlFlowGraph) -> FxHashMap<NodeIndex, usize> {
 
 fn base_fingerprint(
     cfg: &ControlFlowGraph,
+    body: &Body,
     idx: NodeIndex,
     vertex: &CfgVertex,
     dom_depth: usize,
 ) -> String {
-    format!("{}:{}:{dom_depth}", role(cfg, idx), first_stmt_kind(cfg, idx, vertex))
+    format!("{}:{}:{dom_depth}", role(cfg, idx), first_stmt_kind(body, vertex))
 }
 
 fn role(cfg: &ControlFlowGraph, idx: NodeIndex) -> &'static str {
-    if cfg.entry_point() == Some(idx) {
+    if cfg.start() == Some(idx) {
         "ENTRY"
-    } else if cfg.exit_point() == idx {
+    } else if cfg.exit() == idx {
         "EXIT"
     } else {
         "NORMAL"
     }
 }
 
-fn first_stmt_kind(cfg: &ControlFlowGraph, idx: NodeIndex, vertex: &CfgVertex) -> &'static str {
+/// A block is named by the jump that ends it, else by a label that heads it.
+fn first_stmt_kind(body: &Body, vertex: &CfgVertex) -> &'static str {
     match vertex {
         CfgVertex::BasicBlock(block) => {
-            if block.is_empty() {
-                "EMPTY"
-            } else if has_outgoing_edge(cfg, idx, CfgEdgeType::LoopBreak) {
-                "BREAK_STMT"
-            } else if has_outgoing_edge(cfg, idx, CfgEdgeType::LoopContinue) {
-                "CONTINUE_STMT"
-            } else if has_adjacent_fallthrough(cfg, idx) && has_direct_label_target(cfg, idx) {
-                "GOTO_STMT"
-            } else if has_adjacent_fallthrough(cfg, idx) && has_direct_exit_target(cfg, idx) {
-                "RETURN_STMT"
-            } else if has_adjacent_fallthrough(cfg, idx) {
-                "RAISE_STMT"
-            } else {
-                "CALL_STMT"
+            let (Some(first), Some(last)) = (block.first_statement(), block.last_statement())
+            else {
+                return "EMPTY";
+            };
+            match body.stmt(last) {
+                Stmt::Break => "BREAK_STMT",
+                Stmt::Continue => "CONTINUE_STMT",
+                Stmt::Goto(_) => "GOTO_STMT",
+                Stmt::Return { .. } => "RETURN_STMT",
+                Stmt::Raise { .. } => "RAISE_STMT",
+                _ if matches!(body.stmt(first), Stmt::Label(_)) => "LABEL_STMT",
+                _ => "CALL_STMT",
             }
         }
         CfgVertex::Conditional(_) => "IF_STMT",
-        CfgVertex::WhileLoop(_) => "WHILE_STMT",
-        CfgVertex::ForLoop(_) => "FOR_STMT",
-        CfgVertex::ForEachLoop(_) => "FOR_EACH_STMT",
-        CfgVertex::TryExcept(_) => "TRY_STMT",
-        CfgVertex::Label(_) => "LABEL_STMT",
+        CfgVertex::WhileHeader(_) => "WHILE_STMT",
+        CfgVertex::ForHeader(_) => "FOR_STMT",
+        CfgVertex::ForEachHeader(_) => "FOR_EACH_STMT",
+        CfgVertex::Try => "TRY_STMT",
         CfgVertex::PreprocCondition(_) => "PRE_IF_DIR",
         CfgVertex::Exit => "EMPTY",
     }
-}
-
-fn has_outgoing_edge(cfg: &ControlFlowGraph, idx: NodeIndex, kind: CfgEdgeType) -> bool {
-    cfg.outgoing_edges(idx).any(|(_, edge)| *edge == kind)
-}
-
-fn has_adjacent_fallthrough(cfg: &ControlFlowGraph, idx: NodeIndex) -> bool {
-    has_outgoing_edge(cfg, idx, CfgEdgeType::AdjacentCode)
-}
-
-fn has_direct_label_target(cfg: &ControlFlowGraph, idx: NodeIndex) -> bool {
-    cfg.outgoing_edges(idx).any(|(target, edge)| {
-        *edge == CfgEdgeType::Direct && matches!(cfg.vertex(target), Some(CfgVertex::Label(_)))
-    })
-}
-
-fn has_direct_exit_target(cfg: &ControlFlowGraph, idx: NodeIndex) -> bool {
-    cfg.outgoing_edges(idx)
-        .any(|(target, edge)| *edge == CfgEdgeType::Direct && target == cfg.exit_point())
 }
 
 fn predecessor_hash(
@@ -179,13 +160,11 @@ fn predecessor_hash(
 
 fn edge_kind_name(kind: CfgEdgeType) -> &'static str {
     match kind {
-        CfgEdgeType::Direct => "Direct",
+        CfgEdgeType::Unconditional => "Unconditional",
         CfgEdgeType::TrueBranch => "TrueBranch",
         CfgEdgeType::FalseBranch => "FalseBranch",
-        CfgEdgeType::LoopIteration => "LoopIteration",
-        CfgEdgeType::LoopBreak => "LoopBreak",
-        CfgEdgeType::LoopContinue => "LoopContinue",
-        CfgEdgeType::AdjacentCode => "AdjacentCode",
+        CfgEdgeType::Exception => "Exception",
+        CfgEdgeType::Unexecutable => "Unexecutable",
     }
 }
 
@@ -202,12 +181,12 @@ mod tests {
             let left = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
             let right = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
             let merge = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            cfg.set_entry_point(entry);
-            cfg.add_edge(entry, left, CfgEdgeType::TrueBranch).unwrap();
-            cfg.add_edge(entry, right, CfgEdgeType::FalseBranch).unwrap();
-            cfg.add_edge(left, merge, CfgEdgeType::Direct).unwrap();
-            cfg.add_edge(right, merge, CfgEdgeType::Direct).unwrap();
-            cfg.add_edge(merge, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+            cfg.set_start(entry);
+            cfg.add_edge(entry, left, CfgEdgeType::TrueBranch);
+            cfg.add_edge(entry, right, CfgEdgeType::FalseBranch);
+            cfg.add_edge(left, merge, CfgEdgeType::Unconditional);
+            cfg.add_edge(right, merge, CfgEdgeType::Unconditional);
+            cfg.add_edge(merge, cfg.exit(), CfgEdgeType::Unconditional);
             cfg
         }
 
@@ -217,15 +196,16 @@ mod tests {
             let right = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
             let left = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
             let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            cfg.set_entry_point(entry);
-            cfg.add_edge(entry, right, CfgEdgeType::FalseBranch).unwrap();
-            cfg.add_edge(entry, left, CfgEdgeType::TrueBranch).unwrap();
-            cfg.add_edge(right, merge, CfgEdgeType::Direct).unwrap();
-            cfg.add_edge(left, merge, CfgEdgeType::Direct).unwrap();
-            cfg.add_edge(merge, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+            cfg.set_start(entry);
+            cfg.add_edge(entry, right, CfgEdgeType::FalseBranch);
+            cfg.add_edge(entry, left, CfgEdgeType::TrueBranch);
+            cfg.add_edge(right, merge, CfgEdgeType::Unconditional);
+            cfg.add_edge(left, merge, CfgEdgeType::Unconditional);
+            cfg.add_edge(merge, cfg.exit(), CfgEdgeType::Unconditional);
             cfg
         }
 
-        assert_eq!(format_cfg(&graph_a()), format_cfg(&graph_b()));
+        let body = Body::default();
+        assert_eq!(format_cfg(&graph_a(), &body), format_cfg(&graph_b(), &body));
     }
 }

@@ -88,13 +88,33 @@ struct ScopeCliArgs {
     diff_filter: Option<PathBuf>,
 }
 
-/// The analysis file universe: every module body under the source roots,
-/// first spelling wins across overlapping roots.
+#[cfg(test)]
 fn collect_bsl_files(source_roots: &[PathBuf]) -> Result<Vec<PathBuf>, walkdir::Error> {
+    collect_bsl_files_in_scope(source_roots, &project_model::ExcludedPaths::default())
+}
+
+/// The analysis file universe: every module body under the source roots, first
+/// spelling wins across overlapping roots. A directory the project excluded is not
+/// entered, under whatever spelling the walk reaches it.
+fn collect_bsl_files_in_scope(
+    source_roots: &[PathBuf],
+    exclusions: &project_model::ExcludedPaths,
+) -> Result<Vec<PathBuf>, walkdir::Error> {
+    let exclusions = exclusions.respelled_under(source_roots);
     let mut bsl_files = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for root in source_roots {
-        for entry in walkdir::WalkDir::new(root).follow_links(true) {
+        let mut resolved = project_model::ResolvedDirs::default();
+        let walk =
+            walkdir::WalkDir::new(root).follow_links(true).into_iter().filter_entry(|entry| {
+                !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
+                    || !exclusions.prunes_walked_dir(
+                        entry.path(),
+                        entry.path_is_symlink(),
+                        &mut resolved,
+                    )
+            });
+        for entry in walk {
             let entry = entry?;
             if entry.file_type().is_file() && project_model::is_bsl_source_path(entry.path()) {
                 let path = entry.path().to_path_buf();
@@ -449,7 +469,7 @@ fn analyze_salsa(
     ));
 
     tracing::info!("Finding BSL files in {:?}", source_roots);
-    let bsl_files = collect_bsl_files(&source_roots)?;
+    let bsl_files = collect_bsl_files_in_scope(&source_roots, project.source_exclusions())?;
 
     tracing::info!(
         "Found {} BSL files across {} source root(s)",
@@ -1173,5 +1193,43 @@ mod analyze_walk_tests {
         std::fs::write(dir.path().join("CommonModules/X/Ext/Module.BSL"), "").unwrap();
         let files = super::collect_bsl_files(&[dir.path().to_path_buf()]).unwrap();
         assert_eq!(files.len(), 1, "Module.BSL — тело модуля и входит во вселенную обхода");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_analysis_walk_prunes_an_excluded_symlink_cycle_before_descent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hidden = root.join(".tmp");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(root.join("Allowed.bsl"), "").unwrap();
+        std::fs::write(hidden.join("Hidden.bsl"), "").unwrap();
+        std::os::unix::fs::symlink(&hidden, hidden.join("loop")).unwrap();
+
+        let files = super::collect_bsl_files_in_scope(
+            &[root.to_path_buf()],
+            &project_model::ExcludedPaths::new([hidden]),
+        )
+        .expect("an excluded cycle must never be entered");
+
+        assert_eq!(files, [root.join("Allowed.bsl")]);
+    }
+
+    #[test]
+    fn the_analysis_walk_honours_project_exclusions_before_descent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for path in ["Allowed.bsl", ".tmp/Hidden.bsl", ".tmp2/Visible.bsl"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let excluded = project_model::ExcludedPaths::new([root.join(".tmp")]);
+
+        let files = super::collect_bsl_files_in_scope(&[root.to_path_buf()], &excluded).unwrap();
+
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.iter().all(|path| !path.starts_with(root.join(".tmp"))));
+        assert!(files.iter().any(|path| path.ends_with(".tmp2/Visible.bsl")));
     }
 }

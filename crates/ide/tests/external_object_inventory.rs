@@ -70,6 +70,7 @@ fn two_roots() -> (RootDatabaseImpl, tempfile::TempDir) {
         closures: vec![vec![], vec![]],
         topological_order: vec![0, 1],
         fingerprint: None,
+        source_exclusions: Default::default(),
     });
     db.set_metadata_listing(
         &base.to_string_lossy(),

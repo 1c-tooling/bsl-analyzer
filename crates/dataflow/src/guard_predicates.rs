@@ -114,7 +114,7 @@ pub fn is_stmt_guarded(
     let Some(start) = find_block_containing(cfg, stmt) else {
         return false;
     };
-    if cfg.entry_point().is_none() {
+    if cfg.start().is_none() {
         return false;
     }
     let mut visited = FxHashSet::default();
@@ -128,7 +128,7 @@ fn is_guarded_dfs(
     current: NodeIndex,
     visited: &mut FxHashSet<NodeIndex>,
 ) -> bool {
-    if cfg.entry_point() == Some(current) {
+    if cfg.start() == Some(current) {
         return false;
     }
     if !visited.insert(current) {
@@ -137,7 +137,7 @@ fn is_guarded_dfs(
 
     let mut any_predecessor = false;
     for (pred, edge_type) in cfg.incoming_edges(current) {
-        if edge_type.is_dead_code_edge() {
+        if !edge_type.is_executable() {
             continue;
         }
         any_predecessor = true;
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_entry_point_returns_false() {
+    fn missing_start_returns_false() {
         let mut cfg = ControlFlowGraph::new();
         let stmt = synthetic_stmt(1);
         let _idx = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
@@ -248,11 +248,11 @@ mod tests {
     fn unguarded_linear_path_returns_false() {
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let stmt = synthetic_stmt(1);
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
-        cfg.add_edge(entry, call_block, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, call_block, CfgEdgeType::Unconditional);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let (body, _) = body_with_literal_true();
         let registry = default_registry();
@@ -266,15 +266,15 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -287,15 +287,15 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let then_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(then_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, then_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, call_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(then_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(!is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -308,15 +308,15 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -329,15 +329,15 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(cond_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(!is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -361,15 +361,15 @@ mod tests {
         let stmt = synthetic_stmt(1);
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(and_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -382,13 +382,13 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, call_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(!is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -401,15 +401,15 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let dead_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, cfg.exit_point(), CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(dead_block, call_block, CfgEdgeType::AdjacentCode).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, cfg.exit(), CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(dead_block, call_block, CfgEdgeType::Unexecutable);
 
         let registry = default_registry();
         assert!(is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -422,16 +422,16 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let loop_header = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, loop_header, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, cfg.exit_point(), CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(loop_header, call_block, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(call_block, loop_header, CfgEdgeType::LoopIteration).unwrap();
-        cfg.add_edge(loop_header, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, loop_header, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, cfg.exit(), CfgEdgeType::FalseBranch);
+        cfg.add_edge(loop_header, call_block, CfgEdgeType::Unconditional);
+        cfg.add_edge(call_block, loop_header, CfgEdgeType::Unconditional);
+        cfg.add_edge(loop_header, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -552,15 +552,15 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -584,15 +584,15 @@ mod tests {
         let stmt = synthetic_stmt(1);
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(or_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(!is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -610,15 +610,15 @@ mod tests {
         let stmt = synthetic_stmt(1);
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(not_expr)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(!is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -640,16 +640,16 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let loop_header =
             cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(header_cond)));
         let loop_body = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
-        cfg.add_edge(entry, loop_header, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(loop_header, loop_body, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(loop_header, call_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(loop_body, loop_header, CfgEdgeType::LoopIteration).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, loop_header, CfgEdgeType::Unconditional);
+        cfg.add_edge(loop_header, loop_body, CfgEdgeType::TrueBranch);
+        cfg.add_edge(loop_header, call_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(loop_body, loop_header, CfgEdgeType::Unconditional);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(!is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -662,22 +662,22 @@ mod tests {
 
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
-        let try_vertex = cfg.add_vertex(CfgVertex::TryExcept(cfg::TryExceptVertex::new()));
+        cfg.set_start(entry);
+        let try_vertex = cfg.add_vertex(CfgVertex::Try);
         let try_body_guard =
             cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(guard_expr)));
         let try_else = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let except_handler = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
 
-        cfg.add_edge(entry, try_vertex, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_vertex, try_body_guard, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_body_guard, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(try_body_guard, try_else, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(try_else, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(try_vertex, except_handler, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(except_handler, call_block, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, try_vertex, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, try_body_guard, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_body_guard, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(try_body_guard, try_else, CfgEdgeType::FalseBranch);
+        cfg.add_edge(try_else, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, except_handler, CfgEdgeType::Exception);
+        cfg.add_edge(except_handler, call_block, CfgEdgeType::Unconditional);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(!is_stmt_guarded(&cfg, &body, stmt, &registry));
@@ -694,15 +694,15 @@ mod tests {
         let stmt = synthetic_stmt(1);
         let mut cfg = ControlFlowGraph::new();
         let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.set_entry_point(entry);
+        cfg.set_start(entry);
         let cond = cfg.add_vertex(CfgVertex::Conditional(ConditionalVertex::new(call)));
         let call_block = cfg.add_vertex(CfgVertex::BasicBlock(make_block_with_stmt(stmt)));
         let other_block = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        cfg.add_edge(entry, cond, CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch).unwrap();
-        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch).unwrap();
-        cfg.add_edge(call_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
-        cfg.add_edge(other_block, cfg.exit_point(), CfgEdgeType::Direct).unwrap();
+        cfg.add_edge(entry, cond, CfgEdgeType::Unconditional);
+        cfg.add_edge(cond, call_block, CfgEdgeType::TrueBranch);
+        cfg.add_edge(cond, other_block, CfgEdgeType::FalseBranch);
+        cfg.add_edge(call_block, cfg.exit(), CfgEdgeType::Unconditional);
+        cfg.add_edge(other_block, cfg.exit(), CfgEdgeType::Unconditional);
 
         let registry = default_registry();
         assert!(is_stmt_guarded(&cfg, &body, stmt, &registry));

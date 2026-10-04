@@ -2,8 +2,8 @@ use cfg::{CfgBuilder, ControlFlowGraph};
 use expect_test::{expect, Expect};
 use hir_def::{Body, Expr, IfStmt, Literal, Stmt};
 
-fn snapshot(cfg: ControlFlowGraph, expect: Expect) {
-    expect.assert_eq(&cfg::test_utils::format_cfg(&cfg));
+fn snapshot(body: &Body, expect: Expect) {
+    expect.assert_eq(&cfg::test_utils::format_cfg(&build(body), body));
 }
 
 fn build(body: &Body) -> ControlFlowGraph {
@@ -27,7 +27,7 @@ fn if_branches_inside_loop_model_switch_like_jumps() {
     body.set_body_stmts(vec![while_stmt].into());
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:EMPTY:0
@@ -36,7 +36,7 @@ fn if_branches_inside_loop_model_switch_like_jumps() {
               NORMAL:CALL_STMT:5
               NORMAL:CONTINUE_STMT:5
               NORMAL:EMPTY:2:#45e4262f
-              NORMAL:EMPTY:2:#dcf9fcf4
+              NORMAL:EMPTY:2:#dfef8bcc
               NORMAL:EMPTY:4
               NORMAL:EMPTY:5
               NORMAL:EMPTY:6
@@ -44,23 +44,23 @@ fn if_branches_inside_loop_model_switch_like_jumps() {
               NORMAL:IF_STMT:4
               NORMAL:WHILE_STMT:1
             edges:
-              ENTRY:EMPTY:0 -> NORMAL:WHILE_STMT:1 [Direct]
-              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:2:#dcf9fcf4 [LoopBreak]
-              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:5 [AdjacentCode]
-              NORMAL:CALL_STMT:5 -> NORMAL:EMPTY:4 [Direct]
-              NORMAL:CONTINUE_STMT:5 -> NORMAL:EMPTY:6 [AdjacentCode]
-              NORMAL:CONTINUE_STMT:5 -> NORMAL:WHILE_STMT:1 [LoopContinue]
-              NORMAL:EMPTY:2:#45e4262f -> NORMAL:IF_STMT:3 [Direct]
-              NORMAL:EMPTY:2:#dcf9fcf4 -> EXIT:EMPTY:3 [Direct]
-              NORMAL:EMPTY:4 -> NORMAL:WHILE_STMT:1 [LoopIteration]
-              NORMAL:EMPTY:5 -> NORMAL:EMPTY:4 [AdjacentCode]
-              NORMAL:EMPTY:6 -> NORMAL:EMPTY:4 [AdjacentCode]
+              ENTRY:EMPTY:0 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:2:#dfef8bcc [Unconditional]
+              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:5 [Unexecutable]
+              NORMAL:CALL_STMT:5 -> NORMAL:EMPTY:4 [Unconditional]
+              NORMAL:CONTINUE_STMT:5 -> NORMAL:EMPTY:6 [Unexecutable]
+              NORMAL:CONTINUE_STMT:5 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:EMPTY:2:#45e4262f -> NORMAL:IF_STMT:3 [Unconditional]
+              NORMAL:EMPTY:2:#dfef8bcc -> EXIT:EMPTY:3 [Unconditional]
+              NORMAL:EMPTY:4 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:EMPTY:5 -> NORMAL:EMPTY:4 [Unexecutable]
+              NORMAL:EMPTY:6 -> NORMAL:EMPTY:4 [Unexecutable]
               NORMAL:IF_STMT:3 -> NORMAL:BREAK_STMT:4 [TrueBranch]
               NORMAL:IF_STMT:3 -> NORMAL:IF_STMT:4 [FalseBranch]
               NORMAL:IF_STMT:4 -> NORMAL:CALL_STMT:5 [FalseBranch]
               NORMAL:IF_STMT:4 -> NORMAL:CONTINUE_STMT:5 [TrueBranch]
               NORMAL:WHILE_STMT:1 -> NORMAL:EMPTY:2:#45e4262f [TrueBranch]
-              NORMAL:WHILE_STMT:1 -> NORMAL:EMPTY:2:#dcf9fcf4 [FalseBranch]
+              NORMAL:WHILE_STMT:1 -> NORMAL:EMPTY:2:#dfef8bcc [FalseBranch]
         "#]],
     );
 }
@@ -80,7 +80,7 @@ fn break_and_continue_in_try_body_use_enclosing_loop_targets() {
     body.set_body_stmts(vec![while_stmt].into());
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:EMPTY:0
@@ -89,26 +89,26 @@ fn break_and_continue_in_try_body_use_enclosing_loop_targets() {
               NORMAL:CALL_STMT:4
               NORMAL:CONTINUE_STMT:5
               NORMAL:EMPTY:2:#45e4262f
-              NORMAL:EMPTY:2:#dcf9fcf4
+              NORMAL:EMPTY:2:#dfef8bcc
               NORMAL:EMPTY:4
               NORMAL:EMPTY:6
               NORMAL:TRY_STMT:3
               NORMAL:WHILE_STMT:1
             edges:
-              ENTRY:EMPTY:0 -> NORMAL:WHILE_STMT:1 [Direct]
-              NORMAL:BREAK_STMT:4 -> NORMAL:CONTINUE_STMT:5 [AdjacentCode]
-              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:2:#dcf9fcf4 [LoopBreak]
-              NORMAL:CALL_STMT:4 -> NORMAL:EMPTY:4 [Direct]
-              NORMAL:CONTINUE_STMT:5 -> NORMAL:EMPTY:6 [AdjacentCode]
-              NORMAL:CONTINUE_STMT:5 -> NORMAL:WHILE_STMT:1 [LoopContinue]
-              NORMAL:EMPTY:2:#45e4262f -> NORMAL:TRY_STMT:3 [Direct]
-              NORMAL:EMPTY:2:#dcf9fcf4 -> EXIT:EMPTY:3 [Direct]
-              NORMAL:EMPTY:4 -> NORMAL:WHILE_STMT:1 [LoopIteration]
-              NORMAL:EMPTY:6 -> NORMAL:EMPTY:4 [AdjacentCode]
-              NORMAL:TRY_STMT:3 -> NORMAL:BREAK_STMT:4 [TrueBranch]
-              NORMAL:TRY_STMT:3 -> NORMAL:CALL_STMT:4 [FalseBranch]
+              ENTRY:EMPTY:0 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:BREAK_STMT:4 -> NORMAL:CONTINUE_STMT:5 [Unexecutable]
+              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:2:#dfef8bcc [Unconditional]
+              NORMAL:CALL_STMT:4 -> NORMAL:EMPTY:4 [Unconditional]
+              NORMAL:CONTINUE_STMT:5 -> NORMAL:EMPTY:6 [Unexecutable]
+              NORMAL:CONTINUE_STMT:5 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:EMPTY:2:#45e4262f -> NORMAL:TRY_STMT:3 [Unconditional]
+              NORMAL:EMPTY:2:#dfef8bcc -> EXIT:EMPTY:3 [Unconditional]
+              NORMAL:EMPTY:4 -> NORMAL:WHILE_STMT:1 [Unconditional]
+              NORMAL:EMPTY:6 -> NORMAL:EMPTY:4 [Unexecutable]
+              NORMAL:TRY_STMT:3 -> NORMAL:BREAK_STMT:4 [Unconditional]
+              NORMAL:TRY_STMT:3 -> NORMAL:CALL_STMT:4 [Exception]
               NORMAL:WHILE_STMT:1 -> NORMAL:EMPTY:2:#45e4262f [TrueBranch]
-              NORMAL:WHILE_STMT:1 -> NORMAL:EMPTY:2:#dcf9fcf4 [FalseBranch]
+              NORMAL:WHILE_STMT:1 -> NORMAL:EMPTY:2:#dfef8bcc [FalseBranch]
         "#]],
     );
 }

@@ -1,0 +1,78 @@
+complexity: 4
+live: {0, 1, 2, 3, 5, 7, 8, 9, 10}
+dead: [4, 6]
+evaluations: {"s7": {"condition=ExprId(11)", "condition=ExprId(16)"}, "s9": {"condition=ExprId(4)"}}
+expr ExprId(0): Some(LocalRange(27..31))
+expr ExprId(1): Some(LocalRange(34..46))
+expr ExprId(2): Some(LocalRange(48..49))
+expr ExprId(3): Some(LocalRange(52..53))
+expr ExprId(4): Some(LocalRange(64..68))
+expr ExprId(5): Some(LocalRange(79..80))
+expr ExprId(6): Some(LocalRange(83..84))
+expr ExprId(7): Some(LocalRange(87..88))
+expr ExprId(8): Some(LocalRange(83..88))
+expr ExprId(9): Some(LocalRange(100..101))
+expr ExprId(10): Some(LocalRange(104..105))
+expr ExprId(11): Some(LocalRange(100..105))
+expr ExprId(12): Some(LocalRange(143..155))
+expr ExprId(13): Some(LocalRange(158..159))
+expr ExprId(14): Some(LocalRange(181..182))
+expr ExprId(15): Some(LocalRange(185..186))
+expr ExprId(16): Some(LocalRange(181..186))
+expr ExprId(17): Some(LocalRange(220..229))
+expr ExprId(18): Some(LocalRange(232..233))
+expr ExprId(19): Some(LocalRange(257..261))
+expr ExprId(20): Some(LocalRange(264..272))
+expr ExprId(21): Some(LocalRange(296..297))
+expr ExprId(22): Some(LocalRange(300..301))
+transitions:
+  s0 -> s1
+  s1 -> s9
+  s10 -> exit
+  s2 -> s7
+  s3 -> s9
+  s5 -> s10
+  s7 F -> s7
+  s7 F -> s8
+  s7 T -> s3
+  s7 T -> s5
+  s8 -> s9
+  s9 F -> s10
+  s9 T -> s2
+definitions (limit 3):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some(["Definition { var_name: \"a\", def_site: Assignment(1) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s3: Some([])
+  s4: Some([])
+  s5: Some([])
+  s6: Some([])
+  s7: None
+  s8: Some([])
+  s9: None
+  s10: Some([])
+definitions (limit 10000):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some(["Definition { var_name: \"a\", def_site: Assignment(1) }", "Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"deadbreak\", def_site: Assignment(6) }", "Definition { var_name: \"deadcontinue\", def_site: Assignment(4) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(8) }"])
+  s3: Some(["Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"deadbreak\", def_site: Assignment(6) }", "Definition { var_name: \"deadcontinue\", def_site: Assignment(4) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(8) }"])
+  s4: Some(["Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"deadbreak\", def_site: Assignment(6) }", "Definition { var_name: \"deadcontinue\", def_site: Assignment(4) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(8) }"])
+  s5: Some(["Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"deadbreak\", def_site: Assignment(6) }", "Definition { var_name: \"deadcontinue\", def_site: Assignment(4) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(8) }"])
+  s6: Some(["Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"deadbreak\", def_site: Assignment(6) }", "Definition { var_name: \"deadcontinue\", def_site: Assignment(4) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(8) }"])
+  s7: None
+  s8: Some(["Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"deadbreak\", def_site: Assignment(6) }", "Definition { var_name: \"deadcontinue\", def_site: Assignment(4) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(8) }"])
+  s9: None
+  s10: Some(["Definition { var_name: \"a\", def_site: Assignment(1) }", "Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"deadbreak\", def_site: Assignment(6) }", "Definition { var_name: \"deadcontinue\", def_site: Assignment(4) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(8) }"])
+source states:
+  s0: range=Some(LocalRange(27..46)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(48..53)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s2: range=Some(LocalRange(79..88)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s3: range=Some(LocalRange(119..140)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s4: range=Some(LocalRange(143..159)); fallthrough=false; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s5: range=Some(LocalRange(200..217)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s6: range=Some(LocalRange(220..233)); fallthrough=false; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s7: range=Some(LocalRange(91..255)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s8: range=Some(LocalRange(257..272)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s9: range=Some(LocalRange(55..295)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s10: range=Some(LocalRange(296..301)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

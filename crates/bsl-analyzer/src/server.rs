@@ -594,6 +594,13 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
         }
         vfs::loader::Message::WatchOnly { files } => {
             const VFS_WATCH_ONLY_BATCH: usize = 64;
+            // A batch the loader produced under the previous configuration can still
+            // arrive after a reload; the current exclusions decide.
+            let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+            let files: Vec<_> = files
+                .into_iter()
+                .filter(|path| !state.is_source_excluded(path.as_ref(), &mut resolved))
+                .collect();
             let count = files.len();
             let baseline_paths = state.diagnostics_baseline.observation_paths();
             for chunk in files.chunks(VFS_WATCH_ONLY_BATCH) {
@@ -742,6 +749,16 @@ fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Resu
             // than park the event loop in the bounded job queue.
             if !state.task_pool.pool.has_capacity() {
                 tracing::debug!("task pool saturated; external preload skipped");
+                return Ok(());
+            }
+            // Queued before a reload may have excluded some of them: an excluded file is
+            // not warmed, whatever id it still carries.
+            let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+            let files: Vec<_> = files
+                .into_iter()
+                .filter(|&file_id| !state.is_file_id_excluded(file_id, &mut resolved))
+                .collect();
+            if files.is_empty() {
                 return Ok(());
             }
             let file_count = files.len();
@@ -1085,8 +1102,14 @@ fn handle_vfs_msg(
     const VFS_WRITE_MINI_BATCH: usize = 16;
 
     let mut converted: Vec<(vfs::VfsPath, Option<Arc<str>>)> = Vec::with_capacity(files.len());
+    let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
     for (path, contents) in files {
         let std_path: &std::path::Path = path.as_ref();
+        // Decided by the current exclusions, not by the configuration the loader was
+        // running under when it produced the batch: a reload may have narrowed it since.
+        if state.is_source_excluded(std_path, &mut resolved) {
+            continue;
+        }
         let vfs_path = vfs::VfsPath::new(std_path);
 
         // An open editor buffer is authoritative for unsaved content, so a
@@ -1566,6 +1589,90 @@ mod tests {
         );
         assert_eq!(state.diagnostics_generation.get(&uri).copied(), Some(1));
         assert!(state.diagnostics_tokens.contains_key(&uri));
+    }
+
+    #[test]
+    fn late_loader_batches_cannot_admit_files_under_the_current_exclusions() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_dir = dir.path().join("generated");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let hidden_bsl = hidden_dir.join("Hidden.bsl");
+        let hidden_xml = hidden_dir.join("Hidden.xml");
+        let allowed_bsl = dir.path().join("Allowed.bsl");
+        let allowed_xml = dir.path().join("Allowed.xml");
+        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        let abs = |path: std::path::PathBuf| paths::AbsPathBuf::assert_utf8(path);
+
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::Loaded {
+                files: vec![
+                    (abs(hidden_bsl.clone()), Some(b"hidden".to_vec())),
+                    (abs(allowed_bsl.clone()), Some(b"allowed".to_vec())),
+                ],
+            },
+        )
+        .unwrap();
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::Changed {
+                files: vec![(abs(hidden_bsl.clone()), Some(b"late".to_vec()))],
+            },
+        )
+        .unwrap();
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::WatchOnly {
+                files: vec![abs(hidden_xml.clone()), abs(allowed_xml.clone())],
+            },
+        )
+        .unwrap();
+
+        let vfs = state.vfs.read();
+        assert!(vfs.file_id(&vfs::VfsPath::new(hidden_bsl)).is_none());
+        assert!(vfs.file_id(&vfs::VfsPath::new(hidden_xml)).is_none());
+        assert!(vfs.file_id(&vfs::VfsPath::new(allowed_bsl)).is_some());
+        assert!(vfs.file_id(&vfs::VfsPath::new(allowed_xml)).is_some());
+    }
+
+    #[test]
+    fn late_external_preload_cannot_warm_an_excluded_file_id() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_dir = dir.path().join("generated");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let hidden = hidden_dir.join("Hidden.bsl");
+        std::fs::write(&hidden, "Процедура Т() КонецПроцедуры").unwrap();
+        let hidden_vfs = vfs::VfsPath::new(hidden.clone());
+        let hidden_id = {
+            let mut vfs = state.vfs.write();
+            vfs.set_file_contents(
+                hidden_vfs.clone(),
+                Some(Arc::from("Процедура Т() КонецПроцедуры")),
+            );
+            vfs.file_id(&hidden_vfs).unwrap()
+        };
+        state.process_changes(false);
+
+        handle_task(&mut state, Task::PreloadExternalFiles { files: vec![hidden_id] }).unwrap();
+        let allowed_token = state
+            .preload_external_tokens
+            .remove(&hidden_id)
+            .expect("positive control: an allowed file starts cache warming");
+        allowed_token.cancel();
+
+        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        handle_task(&mut state, Task::PreloadExternalFiles { files: vec![hidden_id] }).unwrap();
+
+        assert!(
+            state.preload_external_tokens.is_empty(),
+            "a late preload task started analysis for an excluded stale FileId"
+        );
     }
 
     #[test]

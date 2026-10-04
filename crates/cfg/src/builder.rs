@@ -1,6 +1,9 @@
 use crate::edge::CfgEdgeType;
 use crate::graph::ControlFlowGraph;
-use crate::vertex::{BasicBlockVertex, CfgVertex};
+use crate::vertex::{
+    BasicBlockVertex, CfgVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex,
+    PreprocConditionVertex, WhileHeaderVertex,
+};
 use cfg_types::{BindingId, ExprId, IdConversion, StmtId};
 use hir_def::hir::StmtIdx;
 use hir_def::{Body, Name, Stmt};
@@ -16,8 +19,6 @@ pub struct CfgBuilder {
     cfg: ControlFlowGraph,
     current_block: Option<NodeIndex>,
 
-    produce_loop_iterations: bool,
-
     except_stack: Vec<NodeIndex>,
 
     loop_stack: Vec<LoopFrame>,
@@ -32,7 +33,6 @@ impl CfgBuilder {
         Self {
             cfg: ControlFlowGraph::new(),
             current_block: None,
-            produce_loop_iterations: true,
             except_stack: Vec::new(),
             loop_stack: Vec::new(),
             label_table: FxHashMap::default(),
@@ -40,21 +40,17 @@ impl CfgBuilder {
         }
     }
 
-    pub fn produce_loop_iterations(&mut self, value: bool) {
-        self.produce_loop_iterations = value;
-    }
-
     pub fn build_graph_from_hir(mut self, body_stmts: &[StmtIdx], body: &Body) -> ControlFlowGraph {
-        let entry = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        self.cfg.set_entry_point(entry);
-        self.current_block = Some(entry);
+        let start = self.new_block();
+        self.cfg.set_start(start);
+        self.current_block = Some(start);
 
         for &stmt_id in body_stmts {
             self.walk_statement_hir(stmt_id, body);
         }
 
         if let Some(block_idx) = self.current_block {
-            let exit = self.cfg.exit_point();
+            let exit = self.cfg.exit();
             let ends_with_terminator =
                 if let Some(CfgVertex::BasicBlock(bb)) = self.cfg.vertex(block_idx) {
                     bb.statements().last().is_some_and(|&stmt_id| {
@@ -65,11 +61,7 @@ impl CfgBuilder {
                 };
 
             if !ends_with_terminator {
-                if self.block_has_live_incoming(block_idx) {
-                    let _ = self.cfg.add_edge(block_idx, exit, CfgEdgeType::Direct);
-                } else {
-                    let _ = self.cfg.add_edge(block_idx, exit, CfgEdgeType::AdjacentCode);
-                }
+                self.link_to(block_idx, exit);
             }
         }
 
@@ -84,13 +76,35 @@ impl CfgBuilder {
             }
         }
         match stmt {
-            Stmt::Return { .. } => self.walk_return_statement_hir(stmt_id, body),
-            Stmt::Raise { .. } => self.walk_raise_statement_hir(stmt_id, body),
+            Stmt::Return { .. } => self.walk_return_statement_hir(stmt_id),
+            Stmt::Raise { .. } => self.walk_raise_statement_hir(stmt_id),
             Stmt::If(_) => self.walk_if_statement_hir(stmt_id, body),
             Stmt::PreprocIf(_) => self.walk_preproc_if_statement_hir(stmt_id, body),
-            Stmt::While { .. } => self.walk_while_statement_hir(stmt_id, body),
-            Stmt::For { .. } => self.walk_for_statement_hir(stmt_id, body),
-            Stmt::ForEach { .. } => self.walk_foreach_statement_hir(stmt_id, body),
+            Stmt::While { condition, body: loop_body } => self.walk_loop(
+                stmt_id,
+                CfgVertex::WhileHeader(WhileHeaderVertex::new(ExprId::from_idx(*condition))),
+                loop_body,
+                body,
+            ),
+            Stmt::For { var, from, to, body: loop_body } => self.walk_loop(
+                stmt_id,
+                CfgVertex::ForHeader(ForHeaderVertex::new(
+                    BindingId::from_idx(*var),
+                    ExprId::from_idx(*from),
+                    ExprId::from_idx(*to),
+                )),
+                loop_body,
+                body,
+            ),
+            Stmt::ForEach { var, collection, body: loop_body } => self.walk_loop(
+                stmt_id,
+                CfgVertex::ForEachHeader(ForEachHeaderVertex::new(
+                    BindingId::from_idx(*var),
+                    ExprId::from_idx(*collection),
+                )),
+                loop_body,
+                body,
+            ),
             Stmt::Try { .. } => self.walk_try_statement_hir(stmt_id, body),
             Stmt::Break => self.walk_break_statement_hir(stmt_id),
             Stmt::Continue => self.walk_continue_statement_hir(stmt_id),
@@ -102,6 +116,10 @@ impl CfgBuilder {
         }
     }
 
+    fn new_block(&mut self) -> NodeIndex {
+        self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()))
+    }
+
     fn add_to_current_block_hir(&mut self, stmt_id: StmtIdx) {
         if let Some(block_idx) = self.current_block {
             if let Some(CfgVertex::BasicBlock(block)) = self.cfg.vertex_mut(block_idx) {
@@ -110,138 +128,128 @@ impl CfgBuilder {
         }
     }
 
-    fn walk_return_statement_hir(&mut self, stmt_id: StmtIdx, _body: &Body) {
+    /// Continues the text after a statement that never falls through: what
+    /// follows lands in a fresh block that execution cannot enter from here.
+    fn seal_jump(&mut self) {
+        let dead_block = self.new_block();
+        if let Some(block_idx) = self.current_block {
+            self.cfg.add_edge(block_idx, dead_block, CfgEdgeType::Unexecutable);
+        }
+        self.current_block = Some(dead_block);
+    }
+
+    /// Falls through from `from` to `to`; the link stays unexecutable when
+    /// nothing executes `from` in the first place.
+    fn link_to(&mut self, from: NodeIndex, to: NodeIndex) {
+        let kind = if self.block_has_live_incoming(from) {
+            CfgEdgeType::Unconditional
+        } else {
+            CfgEdgeType::Unexecutable
+        };
+        self.cfg.add_edge(from, to, kind);
+    }
+
+    fn walk_return_statement_hir(&mut self, stmt_id: StmtIdx) {
         self.add_to_current_block_hir(stmt_id);
 
         if let Some(block_idx) = self.current_block {
-            let exit = self.cfg.exit_point();
-
-            let _ = self.cfg.add_edge(block_idx, exit, CfgEdgeType::Direct);
-
-            let dead_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-
-            let _ = self.cfg.add_edge(block_idx, dead_block, CfgEdgeType::AdjacentCode);
-
-            self.current_block = Some(dead_block);
+            let exit = self.cfg.exit();
+            self.cfg.add_edge(block_idx, exit, CfgEdgeType::Unconditional);
+            self.seal_jump();
         }
     }
 
-    fn walk_raise_statement_hir(&mut self, stmt_id: StmtIdx, _body: &Body) {
+    /// The nearest enclosing handler receives the exception; with none active
+    /// the method terminates.
+    fn walk_raise_statement_hir(&mut self, stmt_id: StmtIdx) {
         self.add_to_current_block_hir(stmt_id);
 
         if let Some(block_idx) = self.current_block {
-            let target = if let Some(&except_block) = self.except_stack.last() {
-                except_block
-            } else {
-                self.cfg.exit_point()
-            };
-
-            let _ = self.cfg.add_edge(block_idx, target, CfgEdgeType::Direct);
-
-            let dead_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-
-            let _ = self.cfg.add_edge(block_idx, dead_block, CfgEdgeType::AdjacentCode);
-
-            self.current_block = Some(dead_block);
+            let target = self.except_stack.last().copied().unwrap_or_else(|| self.cfg.exit());
+            self.cfg.add_edge(block_idx, target, CfgEdgeType::Exception);
+            self.seal_jump();
         }
     }
 
     fn walk_break_statement_hir(&mut self, stmt_id: StmtIdx) {
         self.add_to_current_block_hir(stmt_id);
 
-        if let Some(block_idx) = self.current_block {
-            if let Some(frame) = self.loop_stack.last() {
-                let _ = self.cfg.add_edge(block_idx, frame.exit, CfgEdgeType::LoopBreak);
-            }
+        if let (Some(block_idx), Some(frame)) = (self.current_block, self.loop_stack.last()) {
+            self.cfg.add_edge(block_idx, frame.exit, CfgEdgeType::Unconditional);
         }
-
-        let dead_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        if let Some(block_idx) = self.current_block {
-            let _ = self.cfg.add_edge(block_idx, dead_block, CfgEdgeType::AdjacentCode);
-        }
-        self.current_block = Some(dead_block);
+        self.seal_jump();
     }
 
     fn walk_continue_statement_hir(&mut self, stmt_id: StmtIdx) {
         self.add_to_current_block_hir(stmt_id);
 
-        if let Some(block_idx) = self.current_block {
-            if let Some(frame) = self.loop_stack.last() {
-                let _ = self.cfg.add_edge(block_idx, frame.header, CfgEdgeType::LoopContinue);
-            }
+        if let (Some(block_idx), Some(frame)) = (self.current_block, self.loop_stack.last()) {
+            self.cfg.add_edge(block_idx, frame.header, CfgEdgeType::Unconditional);
         }
-
-        let dead_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        if let Some(block_idx) = self.current_block {
-            let _ = self.cfg.add_edge(block_idx, dead_block, CfgEdgeType::AdjacentCode);
-        }
-        self.current_block = Some(dead_block);
+        self.seal_jump();
     }
 
+    /// A jump to a label not seen yet waits for it; a label never seen leaves
+    /// the jump without a target.
     fn walk_goto_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
         self.add_to_current_block_hir(stmt_id);
 
         if let (Some(block_idx), Stmt::Goto(name)) = (self.current_block, body.stmt_idx(stmt_id)) {
-            if let Some(&label_vertex) = self.label_table.get(name) {
-                let _ = self.cfg.add_edge(block_idx, label_vertex, CfgEdgeType::Direct);
+            if let Some(&target) = self.label_table.get(name) {
+                self.cfg.add_edge(block_idx, target, CfgEdgeType::Unconditional);
             } else {
                 self.pending_gotos.push((block_idx, name.clone()));
             }
         }
-
-        let dead_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-        if let Some(block_idx) = self.current_block {
-            let _ = self.cfg.add_edge(block_idx, dead_block, CfgEdgeType::AdjacentCode);
-        }
-        self.current_block = Some(dead_block);
+        self.seal_jump();
     }
 
+    /// A label starts a new basic block: jumps and the preceding text both
+    /// enter it, and the label is its only statement. The text after the label
+    /// continues in a block of its own: solvers spend their iteration budget
+    /// per vertex, so keeping that split keeps a partial result under a given
+    /// limit the same.
     fn walk_label_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
-        use crate::vertex::LabelVertex;
-
         if let Stmt::Label(name) = body.stmt_idx(stmt_id) {
-            let label_vertex = self.cfg.add_vertex_with_origin(
-                CfgVertex::Label(LabelVertex::new(name.clone())),
-                StmtId::from_idx(stmt_id),
-            );
+            let label_block = self.new_block();
 
             if let Some(current) = self.current_block {
-                let _ = self.cfg.add_edge(current, label_vertex, CfgEdgeType::Direct);
+                self.cfg.add_edge(current, label_block, CfgEdgeType::Unconditional);
             }
 
             let pending = std::mem::take(&mut self.pending_gotos);
             let (matched, leftover): (Vec<_>, Vec<_>) =
                 pending.into_iter().partition(|(_, n)| n == name);
             for (source, _) in matched {
-                let _ = self.cfg.add_edge(source, label_vertex, CfgEdgeType::Direct);
+                self.cfg.add_edge(source, label_block, CfgEdgeType::Unconditional);
             }
             self.pending_gotos = leftover;
 
-            self.label_table.insert(name.clone(), label_vertex);
+            self.label_table.insert(name.clone(), label_block);
 
-            let after_label = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            let _ = self.cfg.add_edge(label_vertex, after_label, CfgEdgeType::Direct);
+            self.current_block = Some(label_block);
+            self.add_to_current_block_hir(stmt_id);
 
+            let after_label = self.new_block();
+            self.cfg.add_edge(label_block, after_label, CfgEdgeType::Unconditional);
             self.current_block = Some(after_label);
         }
     }
 
     fn is_block_reachable(&self, block: NodeIndex) -> bool {
         let has_incoming = self.cfg.incoming_edges(block).next().is_some();
-        let is_entry = self.cfg.entry_point() == Some(block);
-        has_incoming || is_entry
+        let is_start = self.cfg.start() == Some(block);
+        has_incoming || is_start
     }
 
     fn block_has_live_incoming(&self, block: NodeIndex) -> bool {
-        if self.cfg.entry_point() == Some(block) {
+        if self.cfg.start() == Some(block) {
             return true;
         }
-        self.cfg.incoming_edges(block).any(|(_, edge_type)| !edge_type.is_dead_code_edge())
+        self.cfg.incoming_edges(block).any(|(_, edge_type)| edge_type.is_executable())
     }
 
     fn walk_if_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
-        use crate::vertex::ConditionalVertex;
-
         if let Stmt::If(if_stmt) = body.stmt_idx(stmt_id) {
             let cond_vertex = self.cfg.add_vertex_with_origin(
                 CfgVertex::Conditional(ConditionalVertex::new(ExprId::from_idx(if_stmt.condition))),
@@ -249,26 +257,21 @@ impl CfgBuilder {
             );
 
             if let Some(current) = self.current_block {
-                let _ = self.cfg.add_edge(current, cond_vertex, CfgEdgeType::Direct);
+                self.cfg.add_edge(current, cond_vertex, CfgEdgeType::Unconditional);
             }
 
-            let merge_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+            let merge_block = self.new_block();
 
-            let then_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            let _ = self.cfg.add_edge(cond_vertex, then_block, CfgEdgeType::TrueBranch);
+            let then_block = self.new_block();
+            self.cfg.add_edge(cond_vertex, then_block, CfgEdgeType::TrueBranch);
             self.current_block = Some(then_block);
 
             for &then_stmt_id in if_stmt.then_branch.iter() {
                 self.walk_statement_hir(then_stmt_id, body);
             }
 
-            let then_exit = self.current_block;
-            if let Some(exit) = then_exit {
-                if self.block_has_live_incoming(exit) {
-                    let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::Direct);
-                } else {
-                    let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::AdjacentCode);
-                }
+            if let Some(exit) = self.current_block {
+                self.link_to(exit, merge_block);
             }
 
             let mut current_cond = cond_vertex;
@@ -281,57 +284,46 @@ impl CfgBuilder {
                     StmtId::from_idx(stmt_id),
                 );
 
-                let _ = self.cfg.add_edge(current_cond, elsif_cond, CfgEdgeType::FalseBranch);
+                self.cfg.add_edge(current_cond, elsif_cond, CfgEdgeType::FalseBranch);
 
-                let elsif_block =
-                    self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-                let _ = self.cfg.add_edge(elsif_cond, elsif_block, CfgEdgeType::TrueBranch);
+                let elsif_block = self.new_block();
+                self.cfg.add_edge(elsif_cond, elsif_block, CfgEdgeType::TrueBranch);
                 self.current_block = Some(elsif_block);
 
                 for &elsif_stmt_id in elsif_body.iter() {
                     self.walk_statement_hir(elsif_stmt_id, body);
                 }
 
-                let elsif_exit = self.current_block;
-                if let Some(exit) = elsif_exit {
-                    if self.block_has_live_incoming(exit) {
-                        let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::Direct);
-                    } else {
-                        let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::AdjacentCode);
-                    }
+                if let Some(exit) = self.current_block {
+                    self.link_to(exit, merge_block);
                 }
 
                 current_cond = elsif_cond;
             }
 
             if let Some(ref else_stmts) = if_stmt.else_branch {
-                let else_block =
-                    self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-                let _ = self.cfg.add_edge(current_cond, else_block, CfgEdgeType::FalseBranch);
+                let else_block = self.new_block();
+                self.cfg.add_edge(current_cond, else_block, CfgEdgeType::FalseBranch);
                 self.current_block = Some(else_block);
 
                 for &else_stmt_id in else_stmts.iter() {
                     self.walk_statement_hir(else_stmt_id, body);
                 }
 
-                let else_exit = self.current_block;
-                if let Some(exit) = else_exit {
-                    if self.block_has_live_incoming(exit) {
-                        let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::Direct);
-                    } else {
-                        let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::AdjacentCode);
-                    }
+                if let Some(exit) = self.current_block {
+                    self.link_to(exit, merge_block);
                 }
             } else {
-                let _ = self.cfg.add_edge(current_cond, merge_block, CfgEdgeType::FalseBranch);
+                self.cfg.add_edge(current_cond, merge_block, CfgEdgeType::FalseBranch);
             }
 
             self.current_block = Some(merge_block);
         }
     }
 
+    /// Every alternative is analysed: the build environment that selects one
+    /// is not known here.
     fn walk_preproc_if_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
-        use crate::vertex::PreprocConditionVertex;
         use hir_def::hir::HirPreBranchKind;
 
         if let Stmt::PreprocIf(preproc_if) = body.stmt_idx(stmt_id) {
@@ -344,10 +336,10 @@ impl CfgBuilder {
             ));
 
             if let Some(current) = self.current_block {
-                let _ = self.cfg.add_edge(current, cond_vertex, CfgEdgeType::Direct);
+                self.cfg.add_edge(current, cond_vertex, CfgEdgeType::Unconditional);
             }
 
-            let merge_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+            let merge_block = self.new_block();
 
             let mut current_cond = cond_vertex;
             let mut saw_else = false;
@@ -355,9 +347,8 @@ impl CfgBuilder {
             for branch in preproc_if.branches() {
                 match branch.kind {
                     HirPreBranchKind::Then => {
-                        let then_block =
-                            self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-                        let _ = self.cfg.add_edge(cond_vertex, then_block, CfgEdgeType::TrueBranch);
+                        let then_block = self.new_block();
+                        self.cfg.add_edge(cond_vertex, then_block, CfgEdgeType::TrueBranch);
                         self.current_block = Some(then_block);
                     }
                     HirPreBranchKind::ElsIf(_) => {
@@ -368,21 +359,17 @@ impl CfgBuilder {
                             ),
                         ));
 
-                        let _ =
-                            self.cfg.add_edge(current_cond, elsif_cond, CfgEdgeType::FalseBranch);
+                        self.cfg.add_edge(current_cond, elsif_cond, CfgEdgeType::FalseBranch);
 
-                        let elsif_block =
-                            self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-                        let _ = self.cfg.add_edge(elsif_cond, elsif_block, CfgEdgeType::TrueBranch);
+                        let elsif_block = self.new_block();
+                        self.cfg.add_edge(elsif_cond, elsif_block, CfgEdgeType::TrueBranch);
                         self.current_block = Some(elsif_block);
 
                         current_cond = elsif_cond;
                     }
                     HirPreBranchKind::Else => {
-                        let else_block =
-                            self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-                        let _ =
-                            self.cfg.add_edge(current_cond, else_block, CfgEdgeType::FalseBranch);
+                        let else_block = self.new_block();
+                        self.cfg.add_edge(current_cond, else_block, CfgEdgeType::FalseBranch);
                         self.current_block = Some(else_block);
                         saw_else = true;
                     }
@@ -392,195 +379,76 @@ impl CfgBuilder {
                     self.walk_statement_hir(branch_stmt_id, body);
                 }
 
-                let branch_exit = self.current_block;
-                if let Some(exit) = branch_exit {
-                    if self.block_has_live_incoming(exit) {
-                        let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::Direct);
-                    } else {
-                        let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::AdjacentCode);
-                    }
+                if let Some(exit) = self.current_block {
+                    self.link_to(exit, merge_block);
                 }
             }
 
             if !saw_else {
-                let _ = self.cfg.add_edge(current_cond, merge_block, CfgEdgeType::FalseBranch);
+                self.cfg.add_edge(current_cond, merge_block, CfgEdgeType::FalseBranch);
             }
 
             self.current_block = Some(merge_block);
         }
     }
 
-    fn walk_while_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
-        use crate::vertex::WhileLoopVertex;
+    /// The header holds what the loop computes before each pass and tests the
+    /// continuation. The block after the loop exists before the body is walked
+    /// because `Прервать` inside the body needs it as a target.
+    fn walk_loop(
+        &mut self,
+        stmt_id: StmtIdx,
+        header: CfgVertex,
+        loop_body: &[StmtIdx],
+        body: &Body,
+    ) {
+        let header = self.cfg.add_vertex_with_origin(header, StmtId::from_idx(stmt_id));
 
-        if let Stmt::While { condition, body: loop_body } = body.stmt_idx(stmt_id) {
-            let loop_vertex = self.cfg.add_vertex_with_origin(
-                CfgVertex::WhileLoop(WhileLoopVertex::new(ExprId::from_idx(*condition))),
-                StmtId::from_idx(stmt_id),
-            );
-
-            if let Some(current) = self.current_block {
-                if self.block_has_live_incoming(current) {
-                    let _ = self.cfg.add_edge(current, loop_vertex, CfgEdgeType::Direct);
-                } else {
-                    let _ = self.cfg.add_edge(current, loop_vertex, CfgEdgeType::AdjacentCode);
-                }
-            }
-
-            let body_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-
-            let _ = self.cfg.add_edge(loop_vertex, body_block, CfgEdgeType::TrueBranch);
-
-            let after_loop = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            self.loop_stack.push(LoopFrame { header: loop_vertex, exit: after_loop });
-
-            self.current_block = Some(body_block);
-
-            for &loop_stmt_id in loop_body.iter() {
-                self.walk_statement_hir(loop_stmt_id, body);
-            }
-
-            self.loop_stack.pop();
-
-            let body_exit = self.current_block;
-
-            if self.produce_loop_iterations {
-                if let Some(exit) = body_exit {
-                    if self.is_block_reachable(exit) {
-                        let _ = self.cfg.add_edge(exit, loop_vertex, CfgEdgeType::LoopIteration);
-                    }
-                }
-            }
-
-            let _ = self.cfg.add_edge(loop_vertex, after_loop, CfgEdgeType::FalseBranch);
-
-            self.current_block = Some(after_loop);
+        if let Some(current) = self.current_block {
+            self.link_to(current, header);
         }
+
+        let body_block = self.new_block();
+        self.cfg.add_edge(header, body_block, CfgEdgeType::TrueBranch);
+
+        let after_loop = self.new_block();
+        self.loop_stack.push(LoopFrame { header, exit: after_loop });
+
+        self.current_block = Some(body_block);
+
+        for &loop_stmt_id in loop_body.iter() {
+            self.walk_statement_hir(loop_stmt_id, body);
+        }
+
+        self.loop_stack.pop();
+
+        if let Some(exit) = self.current_block {
+            if self.is_block_reachable(exit) {
+                self.cfg.add_edge(exit, header, CfgEdgeType::Unconditional);
+            }
+        }
+
+        self.cfg.add_edge(header, after_loop, CfgEdgeType::FalseBranch);
+
+        self.current_block = Some(after_loop);
     }
 
-    fn walk_for_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
-        use crate::vertex::ForLoopVertex;
-
-        if let Stmt::For { var, from, to, body: loop_body } = body.stmt_idx(stmt_id) {
-            let loop_vertex = self.cfg.add_vertex_with_origin(
-                CfgVertex::ForLoop(ForLoopVertex::with_stmt_id(
-                    BindingId::from_idx(*var),
-                    ExprId::from_idx(*from),
-                    ExprId::from_idx(*to),
-                    StmtId::from_idx(stmt_id),
-                )),
-                StmtId::from_idx(stmt_id),
-            );
-
-            if let Some(current) = self.current_block {
-                if self.block_has_live_incoming(current) {
-                    let _ = self.cfg.add_edge(current, loop_vertex, CfgEdgeType::Direct);
-                } else {
-                    let _ = self.cfg.add_edge(current, loop_vertex, CfgEdgeType::AdjacentCode);
-                }
-            }
-
-            let body_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-
-            let _ = self.cfg.add_edge(loop_vertex, body_block, CfgEdgeType::TrueBranch);
-
-            let after_loop = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            self.loop_stack.push(LoopFrame { header: loop_vertex, exit: after_loop });
-
-            self.current_block = Some(body_block);
-
-            for &loop_stmt_id in loop_body.iter() {
-                self.walk_statement_hir(loop_stmt_id, body);
-            }
-
-            self.loop_stack.pop();
-
-            let body_exit = self.current_block;
-
-            if self.produce_loop_iterations {
-                if let Some(exit) = body_exit {
-                    if self.is_block_reachable(exit) {
-                        let _ = self.cfg.add_edge(exit, loop_vertex, CfgEdgeType::LoopIteration);
-                    }
-                }
-            }
-
-            let _ = self.cfg.add_edge(loop_vertex, after_loop, CfgEdgeType::FalseBranch);
-
-            self.current_block = Some(after_loop);
-        }
-    }
-
-    fn walk_foreach_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
-        use crate::vertex::ForEachLoopVertex;
-
-        if let Stmt::ForEach { var, collection, body: loop_body } = body.stmt_idx(stmt_id) {
-            let loop_vertex = self.cfg.add_vertex_with_origin(
-                CfgVertex::ForEachLoop(ForEachLoopVertex::with_stmt_id(
-                    BindingId::from_idx(*var),
-                    ExprId::from_idx(*collection),
-                    StmtId::from_idx(stmt_id),
-                )),
-                StmtId::from_idx(stmt_id),
-            );
-
-            if let Some(current) = self.current_block {
-                if self.block_has_live_incoming(current) {
-                    let _ = self.cfg.add_edge(current, loop_vertex, CfgEdgeType::Direct);
-                } else {
-                    let _ = self.cfg.add_edge(current, loop_vertex, CfgEdgeType::AdjacentCode);
-                }
-            }
-
-            let body_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-
-            let _ = self.cfg.add_edge(loop_vertex, body_block, CfgEdgeType::TrueBranch);
-
-            let after_loop = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            self.loop_stack.push(LoopFrame { header: loop_vertex, exit: after_loop });
-
-            self.current_block = Some(body_block);
-
-            for &loop_stmt_id in loop_body.iter() {
-                self.walk_statement_hir(loop_stmt_id, body);
-            }
-
-            self.loop_stack.pop();
-
-            let body_exit = self.current_block;
-
-            if self.produce_loop_iterations {
-                if let Some(exit) = body_exit {
-                    if self.is_block_reachable(exit) {
-                        let _ = self.cfg.add_edge(exit, loop_vertex, CfgEdgeType::LoopIteration);
-                    }
-                }
-            }
-
-            let _ = self.cfg.add_edge(loop_vertex, after_loop, CfgEdgeType::FalseBranch);
-
-            self.current_block = Some(after_loop);
-        }
-    }
-
+    /// The handler is taken as reachable from the entry of `Попытка`: an error
+    /// may interrupt the protected statements before any of them completes.
     fn walk_try_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
-        use crate::vertex::TryExceptVertex;
-
         if let Stmt::Try { body: try_body, except } = body.stmt_idx(stmt_id) {
-            let try_vertex = self.cfg.add_vertex_with_origin(
-                CfgVertex::TryExcept(TryExceptVertex::new()),
-                StmtId::from_idx(stmt_id),
-            );
+            let try_vertex =
+                self.cfg.add_vertex_with_origin(CfgVertex::Try, StmtId::from_idx(stmt_id));
 
             if let Some(current) = self.current_block {
-                let _ = self.cfg.add_edge(current, try_vertex, CfgEdgeType::Direct);
+                self.cfg.add_edge(current, try_vertex, CfgEdgeType::Unconditional);
             }
 
-            let try_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            let _ = self.cfg.add_edge(try_vertex, try_block, CfgEdgeType::TrueBranch);
+            let try_block = self.new_block();
+            self.cfg.add_edge(try_vertex, try_block, CfgEdgeType::Unconditional);
 
-            let except_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
-            let _ = self.cfg.add_edge(try_vertex, except_block, CfgEdgeType::FalseBranch);
+            let except_block = self.new_block();
+            self.cfg.add_edge(try_vertex, except_block, CfgEdgeType::Exception);
 
             self.except_stack.push(except_block);
 
@@ -600,21 +468,13 @@ impl CfgBuilder {
 
             let except_exit = self.current_block;
 
-            let merge_block = self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+            let merge_block = self.new_block();
 
             if let Some(exit) = try_exit {
-                if self.block_has_live_incoming(exit) {
-                    let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::Direct);
-                } else {
-                    let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::AdjacentCode);
-                }
+                self.link_to(exit, merge_block);
             }
             if let Some(exit) = except_exit {
-                if self.block_has_live_incoming(exit) {
-                    let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::Direct);
-                } else {
-                    let _ = self.cfg.add_edge(exit, merge_block, CfgEdgeType::AdjacentCode);
-                }
+                self.link_to(exit, merge_block);
             }
 
             self.current_block = Some(merge_block);
@@ -636,14 +496,6 @@ mod tests {
     fn test_builder_creation() {
         let builder = CfgBuilder::new();
         assert!(builder.current_block.is_none());
-        assert!(builder.produce_loop_iterations);
-    }
-
-    #[test]
-    fn test_produce_loop_iterations() {
-        let mut builder = CfgBuilder::new();
-        builder.produce_loop_iterations(false);
-        assert!(!builder.produce_loop_iterations);
     }
 
     #[test]
@@ -667,8 +519,8 @@ mod tests {
 
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
-        assert!(cfg.entry_point().is_some(), "CFG should have entry point");
-        assert!(cfg.exit_point() != cfg.entry_point().unwrap(), "Exit should differ from entry");
+        assert!(cfg.start().is_some(), "CFG should have a start");
+        assert!(cfg.exit() != cfg.start().unwrap(), "Exit should differ from entry");
 
         let vertex_count = cfg.graph().node_count();
         assert!(
@@ -677,7 +529,7 @@ mod tests {
             vertex_count
         );
 
-        let exit = cfg.exit_point();
+        let exit = cfg.exit();
         let incoming_to_exit: Vec<_> = cfg.incoming_edges(exit).collect();
         assert!(!incoming_to_exit.is_empty(), "Exit should have incoming edges");
     }
@@ -745,6 +597,27 @@ mod tests {
         cfg.vertex(idx).is_some_and(predicate)
     }
 
+    fn block_ends_with(
+        cfg: &ControlFlowGraph,
+        body: &Body,
+        idx: NodeIndex,
+        predicate: impl Fn(&Stmt) -> bool,
+    ) -> bool {
+        matches!(
+            cfg.vertex(idx),
+            Some(CfgVertex::BasicBlock(bb)) if bb.last_statement().is_some_and(|s| predicate(body.stmt(s)))
+        )
+    }
+
+    fn label_block_of(cfg: &ControlFlowGraph, label: StmtIdx) -> NodeIndex {
+        cfg.vertices()
+            .find(|(_, v)| {
+                matches!(v, CfgVertex::BasicBlock(bb) if bb.first_statement() == Some(StmtId::from_idx(label)))
+            })
+            .map(|(idx, _)| idx)
+            .expect("the label must head a basic block")
+    }
+
     fn source_stmt_id_of_kind(
         cfg: &ControlFlowGraph,
         predicate: impl Fn(&CfgVertex) -> bool,
@@ -788,7 +661,7 @@ mod tests {
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
         assert_eq!(
-            source_stmt_id_of_kind(&cfg, |vertex| matches!(vertex, CfgVertex::WhileLoop(_))),
+            source_stmt_id_of_kind(&cfg, |vertex| matches!(vertex, CfgVertex::WhileHeader(_))),
             Some(StmtId::from_idx(while_stmt))
         );
     }
@@ -805,13 +678,13 @@ mod tests {
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
         assert_eq!(
-            source_stmt_id_of_kind(&cfg, |vertex| matches!(vertex, CfgVertex::TryExcept(_))),
+            source_stmt_id_of_kind(&cfg, |vertex| matches!(vertex, CfgVertex::Try)),
             Some(StmtId::from_idx(try_stmt))
         );
     }
 
     #[test]
-    fn label_vertex_exposes_originating_statement_id() {
+    fn label_starts_a_block_it_heads() {
         use hir_def::{Body, Name, Stmt};
 
         let mut body = Body::default();
@@ -820,14 +693,12 @@ mod tests {
 
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
-        assert_eq!(
-            source_stmt_id_of_kind(&cfg, |vertex| matches!(vertex, CfgVertex::Label(_))),
-            Some(StmtId::from_idx(label_stmt))
-        );
+        let label_block = label_block_of(&cfg, label_stmt);
+        assert_ne!(Some(label_block), cfg.start(), "a label opens a block of its own");
     }
 
     #[test]
-    fn break_in_while_wires_live_loop_break_edge_to_after_loop() {
+    fn break_in_while_jumps_to_after_loop() {
         use hir_def::{Body, Expr, Literal, Stmt};
 
         let mut body = Body::default();
@@ -843,24 +714,27 @@ mod tests {
         let while_vertex = cfg
             .graph()
             .node_indices()
-            .find(|&idx| vertex_is(&cfg, idx, |v| matches!(v, CfgVertex::WhileLoop(_))))
-            .expect("WhileLoop vertex must exist");
+            .find(|&idx| vertex_is(&cfg, idx, |v| matches!(v, CfgVertex::WhileHeader(_))))
+            .expect("WhileHeader vertex must exist");
         let after_loop = cfg
             .outgoing_edges(while_vertex)
             .find(|(_, e)| **e == CfgEdgeType::FalseBranch)
             .map(|(target, _)| target)
-            .expect("WhileLoop must have a FalseBranch successor");
+            .expect("WhileHeader must have a FalseBranch successor");
 
-        let breaks = edges_of_kind(&cfg, CfgEdgeType::LoopBreak);
-        assert!(!breaks.is_empty(), "LoopBreak edge missing for `Прервать`");
+        let breaks: Vec<_> = edges_of_kind(&cfg, CfgEdgeType::Unconditional)
+            .into_iter()
+            .filter(|(src, _)| block_ends_with(&cfg, &body, *src, |s| matches!(s, Stmt::Break)))
+            .collect();
+        assert!(!breaks.is_empty(), "jump edge missing for `Прервать`");
         assert!(
             breaks.iter().any(|(_, dst)| *dst == after_loop),
-            "LoopBreak must target the after-loop merge block, got {breaks:?}",
+            "`Прервать` must target the after-loop merge block, got {breaks:?}",
         );
     }
 
     #[test]
-    fn continue_in_while_wires_live_loop_continue_edge_to_header() {
+    fn continue_in_while_jumps_to_header() {
         use hir_def::{Body, Expr, Literal, Stmt};
 
         let mut body = Body::default();
@@ -876,19 +750,22 @@ mod tests {
         let while_vertex = cfg
             .graph()
             .node_indices()
-            .find(|&idx| vertex_is(&cfg, idx, |v| matches!(v, CfgVertex::WhileLoop(_))))
-            .expect("WhileLoop vertex must exist");
+            .find(|&idx| vertex_is(&cfg, idx, |v| matches!(v, CfgVertex::WhileHeader(_))))
+            .expect("WhileHeader vertex must exist");
 
-        let continues = edges_of_kind(&cfg, CfgEdgeType::LoopContinue);
-        assert!(!continues.is_empty(), "LoopContinue edge missing for `Продолжить`");
+        let continues: Vec<_> = edges_of_kind(&cfg, CfgEdgeType::Unconditional)
+            .into_iter()
+            .filter(|(src, _)| block_ends_with(&cfg, &body, *src, |s| matches!(s, Stmt::Continue)))
+            .collect();
+        assert!(!continues.is_empty(), "jump edge missing for `Продолжить`");
         assert!(
             continues.iter().any(|(_, dst)| *dst == while_vertex),
-            "LoopContinue must target the loop header, got {continues:?}",
+            "`Продолжить` must target the loop header, got {continues:?}",
         );
     }
 
     #[test]
-    fn break_outside_loop_emits_no_loop_break_edge() {
+    fn break_outside_loop_emits_no_executable_edge() {
         use hir_def::{Body, Stmt};
 
         let mut body = Body::default();
@@ -897,9 +774,10 @@ mod tests {
 
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
+        let start = cfg.start().expect("start block");
         assert!(
-            edges_of_kind(&cfg, CfgEdgeType::LoopBreak).is_empty(),
-            "Bare `Прервать` outside a loop must not produce a LoopBreak edge",
+            cfg.outgoing_edges(start).all(|(_, kind)| !kind.is_executable()),
+            "Bare `Прервать` outside a loop must not produce an executable edge",
         );
     }
 
@@ -914,18 +792,14 @@ mod tests {
 
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
-        let label_vertex = cfg
-            .graph()
-            .node_indices()
-            .find(|&idx| vertex_is(&cfg, idx, |v| matches!(v, CfgVertex::Label(_))))
-            .expect("Label vertex must exist");
-        let direct: Vec<_> = edges_of_kind(&cfg, CfgEdgeType::Direct)
+        let label_block = label_block_of(&cfg, label);
+        let jumps: Vec<_> = edges_of_kind(&cfg, CfgEdgeType::Unconditional)
             .into_iter()
-            .filter(|(_, dst)| *dst == label_vertex)
+            .filter(|(_, dst)| *dst == label_block)
             .collect();
         assert!(
-            direct.len() >= 2,
-            "Backward `Перейти` must add a Direct edge to the existing label, got {direct:?}",
+            jumps.len() >= 2,
+            "Backward `Перейти` must add an edge to the existing label block, got {jumps:?}",
         );
     }
 
@@ -940,23 +814,20 @@ mod tests {
 
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
-        let label_vertex = cfg
-            .graph()
-            .node_indices()
-            .find(|&idx| vertex_is(&cfg, idx, |v| matches!(v, CfgVertex::Label(_))))
-            .expect("Label vertex must exist");
-        let direct_into_label: Vec<_> = edges_of_kind(&cfg, CfgEdgeType::Direct)
-            .into_iter()
-            .filter(|(_, dst)| *dst == label_vertex)
-            .collect();
+        let label_block = label_block_of(&cfg, label);
+        let jump_from_goto =
+            edges_of_kind(&cfg, CfgEdgeType::Unconditional).into_iter().any(|(src, dst)| {
+                dst == label_block
+                    && block_ends_with(&cfg, &body, src, |s| matches!(s, Stmt::Goto(_)))
+            });
         assert!(
-            !direct_into_label.is_empty(),
-            "Forward `Перейти` must be patched with a Direct edge once the label arrives",
+            jump_from_goto,
+            "Forward `Перейти` must be patched with an edge once the label arrives",
         );
     }
 
     #[test]
-    fn unresolved_goto_leaves_no_live_edge_to_label() {
+    fn unresolved_goto_leaves_no_executable_edge() {
         use hir_def::{Body, Name, Stmt};
 
         let mut body = Body::default();
@@ -965,10 +836,10 @@ mod tests {
 
         let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
 
-        let label_vertex_exists = cfg
-            .graph()
-            .node_indices()
-            .any(|idx| vertex_is(&cfg, idx, |v| matches!(v, CfgVertex::Label(_))));
-        assert!(!label_vertex_exists, "Unresolved goto must NOT fabricate a Label vertex");
+        let start = cfg.start().expect("start block");
+        assert!(
+            cfg.outgoing_edges(start).all(|(_, kind)| !kind.is_executable()),
+            "Unresolved goto must NOT fabricate a jump target",
+        );
     }
 }

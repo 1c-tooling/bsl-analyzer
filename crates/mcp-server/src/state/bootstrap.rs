@@ -728,9 +728,12 @@ impl SharedState {
         // server's own output, which by default lives at `<workspace>/.build` inside the
         // recursive watch, where every index write would otherwise come back as an event
         // about the tree being analyzed — and the service directories of the workspace root.
-        let change_hub = WorkspaceChangeHub::start_targets_excluding(
+        // The user's `[source].exclude` is kept apart from that list: it follows the
+        // project on every re-declaration, and nothing declared inside it is carved out.
+        let change_hub = WorkspaceChangeHub::start_targets_scoped(
             crate::change_hub::watch_targets_for(&project.root, &scan_roots),
             source_exclusions.clone(),
+            project.source_exclusions().clone(),
         );
 
         // Subscribed here, synchronously, before the thread that reads disk even exists —
@@ -3710,6 +3713,21 @@ mod tests {
             matches!(error, crate::WorkspaceInitError::ScanRootInsideServiceDirectory { .. }),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn a_user_exclusion_covering_the_source_root_is_not_mistaken_for_a_cache_hole() {
+        let workspace = tempdir().unwrap();
+        fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\".\"]\n",
+        )
+        .unwrap();
+        let cache_dir = tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::from_root(cache_dir.path().to_path_buf());
+
+        SharedState::workspace_with_cache(workspace.path().to_path_buf(), cache)
+            .expect("an intentionally empty user source scope must remain a valid workspace");
     }
 
     #[test]

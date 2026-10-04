@@ -49,6 +49,9 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
     let start = Instant::now();
 
     let snapshot = db.workspace_configs_snapshot();
+    // Discovery reads through the user's exclusions, so nothing inside them is listed,
+    // probed or registered.
+    let tree = bsl_metadata::ScopedFs::new(&snapshot.source_exclusions);
     let config_paths = db.all_config_paths();
     if config_paths.is_empty() {
         return;
@@ -76,57 +79,31 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
         .iter()
         .zip(&snapshot.kinds)
         .map(|((_, root_path), kind)| {
-            let mut mdos =
-                bsl_metadata::discover_metadata_structure(root_path, &bsl_conventions::RealFs);
-            mdos.extend(bsl_metadata::discover_register_structure(
-                root_path,
-                &bsl_conventions::RealFs,
-            ));
+            let mut mdos = bsl_metadata::discover_metadata_structure(root_path, &tree);
+            mdos.extend(bsl_metadata::discover_register_structure(root_path, &tree));
             // An export root lists nothing by collection: its one object is
             // discovered by the kind the project established for the root.
             if let ide_db::metadata::RootKind::External(external) = kind {
                 mdos.extend(bsl_metadata::discover_external_object_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
-                    *external,
+                    root_path, &tree, *external,
                 ));
             }
             RootDiscovery {
                 root_string: root_path.to_string_lossy().to_string(),
                 mdos,
-                defined_types: bsl_metadata::discover_defined_type_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
-                ),
-                common_modules: bsl_metadata::discover_common_module_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
-                ),
+                defined_types: bsl_metadata::discover_defined_type_structure(root_path, &tree),
+                common_modules: bsl_metadata::discover_common_module_structure(root_path, &tree),
                 event_subscriptions: bsl_metadata::discover_event_subscription_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
+                    root_path, &tree,
                 ),
-                scheduled_jobs: bsl_metadata::discover_scheduled_job_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
-                ),
-                roles: bsl_metadata::discover_role_structure(root_path, &bsl_conventions::RealFs),
-                http_services: bsl_metadata::discover_http_service_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
-                ),
-                web_services: bsl_metadata::discover_web_service_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
-                ),
+                scheduled_jobs: bsl_metadata::discover_scheduled_job_structure(root_path, &tree),
+                roles: bsl_metadata::discover_role_structure(root_path, &tree),
+                http_services: bsl_metadata::discover_http_service_structure(root_path, &tree),
+                web_services: bsl_metadata::discover_web_service_structure(root_path, &tree),
                 integration_services: bsl_metadata::discover_integration_service_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
+                    root_path, &tree,
                 ),
-                subsystems: bsl_metadata::discover_subsystem_structure(
-                    root_path,
-                    &bsl_conventions::RealFs,
-                ),
+                subsystems: bsl_metadata::discover_subsystem_structure(root_path, &tree),
             }
         })
         .collect();
@@ -433,6 +410,9 @@ pub fn refresh_metadata_substrate(
     }
 
     let snapshot = db.workspace_configs_snapshot();
+    // Discovery reads through the user's exclusions, so nothing inside them is listed,
+    // probed or registered.
+    let tree = bsl_metadata::ScopedFs::new(&snapshot.source_exclusions);
     let config_paths = db.all_config_paths();
     let mut affected: Vec<(PathBuf, ide_db::metadata::RootKind)> = Vec::new();
     for ((_, root), kind) in config_paths.iter().zip(&snapshot.kinds) {
@@ -460,15 +440,11 @@ pub fn refresh_metadata_substrate(
 
     vfs.with_write(|vfs| {
         for (root, kind) in &affected {
-            let mut discovered =
-                bsl_metadata::discover_metadata_structure(root, &bsl_conventions::RealFs);
-            discovered
-                .extend(bsl_metadata::discover_register_structure(root, &bsl_conventions::RealFs));
+            let mut discovered = bsl_metadata::discover_metadata_structure(root, &tree);
+            discovered.extend(bsl_metadata::discover_register_structure(root, &tree));
             if let ide_db::metadata::RootKind::External(external) = kind {
                 discovered.extend(bsl_metadata::discover_external_object_structure(
-                    root,
-                    &bsl_conventions::RealFs,
-                    *external,
+                    root, &tree, *external,
                 ));
             }
             let mut entries = Vec::with_capacity(discovered.len());
@@ -496,7 +472,7 @@ pub fn refresh_metadata_substrate(
                 entries.push(MdoEntry { kind: d.mdo_type, name: d.name, main, predefined });
             }
             let mut defined_types = Vec::new();
-            for d in bsl_metadata::discover_defined_type_structure(root, &bsl_conventions::RealFs) {
+            for d in bsl_metadata::discover_defined_type_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -510,8 +486,7 @@ pub fn refresh_metadata_substrate(
                 defined_types.push(DefinedTypeEntry { name: d.name, main });
             }
             let mut common_modules = Vec::new();
-            for d in bsl_metadata::discover_common_module_structure(root, &bsl_conventions::RealFs)
-            {
+            for d in bsl_metadata::discover_common_module_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -545,9 +520,7 @@ pub fn refresh_metadata_substrate(
                 });
             }
             let mut event_subscriptions = Vec::new();
-            for d in
-                bsl_metadata::discover_event_subscription_structure(root, &bsl_conventions::RealFs)
-            {
+            for d in bsl_metadata::discover_event_subscription_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -561,8 +534,7 @@ pub fn refresh_metadata_substrate(
                 event_subscriptions.push(EventSubscriptionEntry { name: d.name, main });
             }
             let mut scheduled_jobs = Vec::new();
-            for d in bsl_metadata::discover_scheduled_job_structure(root, &bsl_conventions::RealFs)
-            {
+            for d in bsl_metadata::discover_scheduled_job_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -576,7 +548,7 @@ pub fn refresh_metadata_substrate(
                 scheduled_jobs.push(ScheduledJobEntry { name: d.name, main });
             }
             let mut roles = Vec::new();
-            for d in bsl_metadata::discover_role_structure(root, &bsl_conventions::RealFs) {
+            for d in bsl_metadata::discover_role_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -600,7 +572,7 @@ pub fn refresh_metadata_substrate(
                 roles.push(RoleEntry { name: d.name, main, rights });
             }
             let mut http_services = Vec::new();
-            for d in bsl_metadata::discover_http_service_structure(root, &bsl_conventions::RealFs) {
+            for d in bsl_metadata::discover_http_service_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -616,7 +588,7 @@ pub fn refresh_metadata_substrate(
                 http_services.push(HTTPServiceEntry { name: d.name, main, module_file });
             }
             let mut web_services = Vec::new();
-            for d in bsl_metadata::discover_web_service_structure(root, &bsl_conventions::RealFs) {
+            for d in bsl_metadata::discover_web_service_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -632,9 +604,7 @@ pub fn refresh_metadata_substrate(
                 web_services.push(WebServiceEntry { name: d.name, main, module_file });
             }
             let mut integration_services = Vec::new();
-            for d in
-                bsl_metadata::discover_integration_service_structure(root, &bsl_conventions::RealFs)
-            {
+            for d in bsl_metadata::discover_integration_service_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -654,7 +624,7 @@ pub fn refresh_metadata_substrate(
                 });
             }
             let mut subsystems = Vec::new();
-            for d in bsl_metadata::discover_subsystem_structure(root, &bsl_conventions::RealFs) {
+            for d in bsl_metadata::discover_subsystem_structure(root, &tree) {
                 let Some(main) = enroll_refresh(
                     vfs,
                     &d.main,
@@ -902,6 +872,80 @@ mod tests {
     </Catalog>
 </MetaDataObject>"#
         )
+    }
+
+    #[test]
+    fn bootstrap_and_refresh_never_register_metadata_inside_source_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let catalogs = root.join("Catalogs");
+        let common = root.join("CommonModules/Hidden");
+        std::fs::create_dir_all(&catalogs).unwrap();
+        std::fs::create_dir_all(common.join("Ext")).unwrap();
+        let catalog = catalogs.join("Allowed.xml");
+        let hidden_xml = root.join("CommonModules/Hidden.xml");
+        let hidden_module = common.join("Ext/Module.bsl");
+        std::fs::write(&catalog, catalog_xml("Allowed", "00000000-0000-0000-0000-000000000051"))
+            .unwrap();
+        std::fs::write(
+            &hidden_xml,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000052">
+        <Properties><Name>Hidden</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+        std::fs::write(&hidden_module, "Процедура Скрытая()\nКонецПроцедуры").unwrap();
+
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        let mut snapshot =
+            ide_db::metadata::WorkspaceConfigsSnapshot::from_paths(vec![(None, root.clone())]);
+        snapshot.source_exclusions =
+            project_model::ExcludedPaths::new([root.join("CommonModules")]);
+        host.raw_database_mut().set_workspace_configs_snapshot(snapshot);
+        let vfs = TestVfs(RefCell::new(Vfs::default()));
+        host.bootstrap_metadata_substrate(&vfs);
+
+        let root_key = root.to_string_lossy().to_string();
+        let listing = host.raw_database().metadata_listing(&root_key).unwrap();
+        assert!(
+            resolve_metadata_object(
+                host.raw_database(),
+                listing,
+                bsl_metadata::MdoType::Catalog,
+                "Allowed".to_owned(),
+            )
+            .is_some(),
+            "allowed metadata did not reach the substrate"
+        );
+        assert!(listing.common_modules(host.raw_database()).is_empty());
+        vfs.with_write(|vfs| {
+            assert!(vfs.file_id(&VfsPath::new(catalog.clone())).is_some());
+            assert!(vfs.file_id(&VfsPath::new(hidden_xml.clone())).is_none());
+            assert!(vfs.file_id(&VfsPath::new(hidden_module.clone())).is_none());
+        });
+
+        std::fs::write(&hidden_module, "Процедура Новая()\nКонецПроцедуры").unwrap();
+        assert!(
+            !host.refresh_metadata_substrate(&vfs, &[hidden_xml.clone(), hidden_module.clone()],)
+        );
+        vfs.with_write(|vfs| {
+            assert!(vfs.file_id(&VfsPath::new(hidden_xml.clone())).is_none());
+            assert!(vfs.file_id(&VfsPath::new(hidden_module.clone())).is_none());
+        });
+
+        host.raw_database_mut().set_workspace_configs_snapshot(
+            ide_db::metadata::WorkspaceConfigsSnapshot::from_paths(vec![(None, root)]),
+        );
+        host.bootstrap_metadata_substrate(&vfs);
+        let listing = host.raw_database().metadata_listing(&root_key).unwrap();
+        assert_eq!(listing.common_modules(host.raw_database()).len(), 1);
+        vfs.with_write(|vfs| {
+            assert!(vfs.file_id(&VfsPath::new(hidden_xml)).is_some());
+        });
     }
 
     /// The shared policy works on a bare `AnalysisHost` with a caller-owned VFS — the

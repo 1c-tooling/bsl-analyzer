@@ -241,6 +241,9 @@ pub struct GlobalState {
     pub mem_docs: MemDocs,
     pub workspace_root: Option<PathBuf>,
     pub project: Option<Project>,
+    /// The project's `[source].exclude`, also spelled under each source root the
+    /// loader walks — the one test every way into the VFS asks.
+    pub(crate) source_exclusions: stdx::path_exclusion::ExcludedPaths,
     pub diagnostics_baseline: Arc<ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot>,
     pub(crate) diagnostics_baseline_notification_ledger: BTreeSet<String>,
     pub shutdown_requested: bool,
@@ -458,6 +461,7 @@ impl GlobalState {
             mem_docs: MemDocs::default(),
             workspace_root: None,
             project: None,
+            source_exclusions: Default::default(),
             diagnostics_baseline: Arc::new(
                 ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::Disabled,
             ),
@@ -851,6 +855,11 @@ impl GlobalStateSnapshot {
         if !project_model::is_bsl_source_path(&path) {
             return Err(anyhow::anyhow!("File is not BSL, request unsupported: {}", url));
         }
+        // An excluded document keeps the FileId it had before the exclusion, tombstoned;
+        // it must not be answered for as if it were still analysed.
+        if self.project.as_ref().is_some_and(|project| project.is_source_excluded(&path)) {
+            return Err(anyhow::anyhow!("File is excluded by [source].exclude: {}", url));
+        }
 
         let vfs_path = vfs::VfsPath::new(path);
 
@@ -915,6 +924,186 @@ mod vfs_race_tests {
         assert!(
             state.analysis_host.raw_database().workspace_load_complete(),
             "a live workspace reload must keep the gate open"
+        );
+    }
+
+    #[test]
+    fn reload_evicts_closed_bsl_and_watch_only_xml_newly_excluded_from_the_vfs() {
+        use base_db::SourceDatabase;
+        use salsa::Database as _;
+
+        #[derive(Debug)]
+        struct SilentLoader;
+        impl loader::Handle for SilentLoader {
+            fn spawn(_sender: loader::Sender) -> Self
+            where
+                Self: Sized,
+            {
+                unreachable!("injected loader")
+            }
+            fn set_config(&mut self, _config: loader::Config) {}
+            fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
+            fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        std::fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n").unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        let hidden_bsl = root.join("generated/Hidden.bsl");
+        let open_hidden_bsl = root.join("generated/OpenHidden.bsl");
+        let hidden_xml = root.join("generated/Hidden.xml");
+        let allowed_bsl = root.join("Allowed.bsl");
+        for path in [&hidden_bsl, &open_hidden_bsl, &hidden_xml, &allowed_bsl] {
+            std::fs::write(path, "x").unwrap();
+        }
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let (_loader_tx, loader_receiver) = crossbeam_channel::bounded(4);
+        let mut state = GlobalState::with_loader(sender, Box::new(SilentLoader), loader_receiver);
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+        let (hidden_bsl_id, open_hidden_id, hidden_xml_id, allowed_id) = {
+            let mut vfs = state.vfs.write();
+            vfs.set_file_contents(vfs::VfsPath::new(hidden_bsl.clone()), Some(Arc::from("x")));
+            let hidden_bsl_id = vfs.file_id(&vfs::VfsPath::new(hidden_bsl.clone())).unwrap();
+            vfs.set_file_contents(
+                vfs::VfsPath::new(open_hidden_bsl.clone()),
+                Some(Arc::from("disk")),
+            );
+            let open_hidden_id = vfs.file_id(&vfs::VfsPath::new(open_hidden_bsl.clone())).unwrap();
+            let hidden_xml_id = vfs.register_watch_only(vfs::VfsPath::new(hidden_xml.clone()));
+            vfs.set_file_contents(vfs::VfsPath::new(allowed_bsl.clone()), Some(Arc::from("x")));
+            let allowed_id = vfs.file_id(&vfs::VfsPath::new(allowed_bsl.clone())).unwrap();
+            (hidden_bsl_id, open_hidden_id, hidden_xml_id, allowed_id)
+        };
+        state.process_changes(false);
+        state.init_source_root();
+        let open_uri = Url::from_file_path(&open_hidden_bsl).unwrap();
+        state.mem_docs.insert(open_uri.clone(), "unsaved buffer".to_owned(), 1);
+        state.open_files.insert(open_hidden_id);
+        state.vfs.write().set_file_contents(
+            vfs::VfsPath::new(open_hidden_bsl.clone()),
+            Some(Arc::from("unsaved buffer")),
+        );
+        state.process_changes(false);
+        assert!(state.vfs.read().exists(hidden_bsl_id));
+        assert!(state.vfs.read().exists(hidden_xml_id));
+        let diagnostics_db = state.analysis_host.raw_database().clone();
+        let diagnostics_token = diagnostics_db.cancellation_token();
+        drop(diagnostics_db);
+        state.diagnostics_tokens.insert(open_uri.clone(), diagnostics_token.clone());
+        let preload_db = state.analysis_host.raw_database().clone();
+        let preload_token = preload_db.cancellation_token();
+        drop(preload_db);
+        state.preload_external_tokens.insert(hidden_bsl_id, preload_token.clone());
+
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\"generated\"]\n",
+        )
+        .unwrap();
+        assert!(state.reload_project_config());
+
+        let vfs = state.vfs.read();
+        assert!(!vfs.exists(hidden_bsl_id), "excluded BSL remained live");
+        assert!(!vfs.exists(open_hidden_id), "excluded open BSL remained live");
+        assert!(!vfs.exists(hidden_xml_id), "excluded watch-only XML remained registered");
+        assert!(vfs.exists(allowed_id), "allowed sibling was evicted");
+        drop(vfs);
+        let db = state.analysis_host.raw_database();
+        let root0 = db.source_root_input(base_db::BSL_SOURCE_ROOT).root(db);
+        assert!(
+            root0.file_set().file_for_path(&vfs::VfsPath::new(hidden_bsl)).is_none(),
+            "excluded BSL remained in FileSet"
+        );
+        assert!(
+            root0.file_set().file_for_path(&vfs::VfsPath::new(allowed_bsl)).is_some(),
+            "allowed BSL left FileSet"
+        );
+        assert!(state.mem_docs.contains(&open_uri), "reload discarded the editor buffer");
+        assert!(!state.open_files.contains(&open_hidden_id));
+        assert!(!state.diagnostics_tokens.contains_key(&open_uri));
+        assert!(diagnostics_token.is_cancelled(), "excluded diagnostics kept running");
+        assert!(!state.preload_external_tokens.contains_key(&hidden_bsl_id));
+        assert!(preload_token.is_cancelled(), "excluded preload kept running");
+        assert!(
+            state.vfs_file_for_url(&open_uri).is_err(),
+            "the event-loop lookup readmitted an excluded editor URI"
+        );
+        assert!(
+            state.snapshot().file_id_for_url(&open_uri).is_err(),
+            "an async request snapshot admitted an excluded editor URI"
+        );
+
+        std::fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n").unwrap();
+        assert!(state.reload_project_config());
+        let readmitted_id = state.vfs_file_for_url(&open_uri).unwrap();
+        assert_eq!(readmitted_id, open_hidden_id, "the tombstoned file identity changed");
+        assert!(state.vfs.read().exists(readmitted_id));
+        assert!(state.open_files.contains(&readmitted_id));
+        assert_eq!(
+            &*state.analysis_host.raw_database_mut().file_text(readmitted_id),
+            "unsaved buffer",
+            "removing the exclusion did not restore the editor overlay"
+        );
+
+        let diagnostics_db = state.analysis_host.raw_database().clone();
+        let empty_diagnostics_token = diagnostics_db.cancellation_token();
+        drop(diagnostics_db);
+        state.diagnostics_tokens.insert(open_uri.clone(), empty_diagnostics_token.clone());
+        let preload_db = state.analysis_host.raw_database().clone();
+        let empty_preload_token = preload_db.cancellation_token();
+        drop(preload_db);
+        state.preload_external_tokens.insert(allowed_id, empty_preload_token.clone());
+
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\".\"]\n",
+        )
+        .unwrap();
+        assert!(state.reload_project_config());
+        assert!(state.project.as_ref().unwrap().source_roots().is_empty());
+        let vfs = state.vfs.read();
+        for file_id in [hidden_bsl_id, open_hidden_id, hidden_xml_id, allowed_id] {
+            assert!(!vfs.exists(file_id), "a stale VFS entry survived the empty universe");
+        }
+        drop(vfs);
+        {
+            let db = state.analysis_host.raw_database();
+            let root0 = db.source_root_input(base_db::BSL_SOURCE_ROOT).root(db);
+            assert!(root0.file_set().iter().next().is_none(), "the empty universe kept a FileSet");
+        }
+        assert!(state.mem_docs.contains(&open_uri), "the empty universe discarded the buffer");
+        assert!(!state.open_files.contains(&open_hidden_id));
+        assert!(empty_diagnostics_token.is_cancelled());
+        assert!(empty_preload_token.is_cancelled());
+
+        std::fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n").unwrap();
+        assert!(
+            state.project.as_ref().unwrap().source_roots().is_empty(),
+            "an unwatched config reloaded without didSave"
+        );
+        crate::handlers::handle_did_save(
+            &mut state,
+            lsp_types::DidSaveTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: lsp_types::Url::from_file_path(root.join("bsl-analyzer.toml")).unwrap(),
+                },
+                text: None,
+            },
+        )
+        .expect("didSave must restore a fully excluded workspace");
+        let readmitted_id = state.vfs_file_for_url(&open_uri).unwrap();
+        assert_eq!(readmitted_id, open_hidden_id);
+        assert!(state.open_files.contains(&readmitted_id));
+        assert_eq!(
+            &*state.analysis_host.raw_database_mut().file_text(readmitted_id),
+            "unsaved buffer",
+            "didSave did not restore the preserved editor overlay"
         );
     }
 
@@ -1037,7 +1226,14 @@ mod vfs_race_tests {
         let ext_tmp = tempfile::tempdir().expect("tempdir");
         let ext = ext_tmp.path();
         std::fs::write(ext.join("Configuration.xml"), "<Configuration/>").unwrap();
-        std::fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n").unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        let descriptorless_hidden = root.join("generated/Hidden.bsl");
+        std::fs::write(&descriptorless_hidden, "").unwrap();
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\"generated\"]\n",
+        )
+        .unwrap();
 
         let (configs_tx, configs_rx) = std::sync::mpsc::channel();
         let (sender, _receiver) = crossbeam_channel::unbounded();
@@ -1047,6 +1243,7 @@ mod vfs_race_tests {
             Box::new(RecordingLoader(configs_tx)),
             loader_receiver,
         );
+        state.init_empty_source_root();
 
         state.set_workspace_root(root.to_path_buf()).expect("initial load");
         let first = configs_rx.try_recv().expect("the initial load emits a loader config");
@@ -1059,6 +1256,59 @@ mod vfs_race_tests {
             }),
             "project-local .env must stay watched even before it exists"
         );
+        let source_entry = first
+            .load
+            .iter()
+            .find_map(|entry| match entry {
+                loader::Entry::Directories(dirs) => Some(dirs),
+                _ => None,
+            })
+            .expect("descriptorless fallback still emits a directory scan");
+        assert!(source_entry.extensions.iter().any(|ext| ext == "bsl"));
+        assert!(source_entry.rules.iter().any(|rule| {
+            rule.load_mode == loader::LoadMode::WatchOnly
+                && rule.extensions.iter().any(|ext| ext == "xml")
+        }));
+        for fixed in [".git", "build", ".vscode"] {
+            assert!(
+                source_entry
+                    .exclude
+                    .iter()
+                    .any(|path| AsRef::<std::path::Path>::as_ref(path) == root.join(fixed)),
+                "adding [source].exclude dropped the legacy LSP exclusion {fixed}"
+            );
+        }
+        assert!(
+            source_entry.hard_exclude.is_excluded(&root.join("generated/Hidden.bsl")),
+            "the descriptorless LSP loader dropped [source].exclude"
+        );
+        assert!(
+            !source_entry.hard_exclude.is_excluded(&root.join("generated2/Allowed.bsl")),
+            "the LSP loader widened a component-scoped exclusion"
+        );
+        assert!(
+            state.is_source_excluded_resolved(&descriptorless_hidden),
+            "the descriptorless loader received the scope but live LSP state did not"
+        );
+        let hidden_uri = Url::from_file_path(&descriptorless_hidden).unwrap();
+        crate::handlers::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: hidden_uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: "Процедура Несохраненная() КонецПроцедуры".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            state.vfs.read().file_id(&vfs::VfsPath::new(descriptorless_hidden.clone())).is_none(),
+            "descriptorless didOpen bypassed the project exclusion"
+        );
+        assert!(!state.diagnostics_tokens.contains_key(&hidden_uri));
+
         let ext_str = ext.to_string_lossy().into_owned();
         assert!(
             !includes(&first).iter().any(|p| p.contains(&ext_str)),
@@ -1067,7 +1317,9 @@ mod vfs_race_tests {
 
         std::fs::write(
             root.join("bsl-analyzer.toml"),
-            format!("[source]\nroot = \".\"\nextensions = [{{ name = \"a\", path = {ext:?} }}]\n"),
+            format!(
+                "[source]\nroot = \".\"\nexclude = [\"generated\"]\nextensions = [{{ name = \"a\", path = {ext:?} }}]\n"
+            ),
         )
         .unwrap();
         state.vfs_done = true;
@@ -1083,6 +1335,50 @@ mod vfs_race_tests {
             "the analyzer config files stay watched after the reload"
         );
         assert!(second.version > first.version, "each loader config carries a fresh version");
+
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\".\"]\n",
+        )
+        .unwrap();
+        state.set_workspace_root(root.to_path_buf()).expect("exclude the whole project");
+        let third = configs_rx.try_recv().expect("the whole-root exclusion emits a config");
+        assert!(
+            third.load.iter().all(|entry| !matches!(entry, loader::Entry::Files(_))),
+            "a config file below an excluded project root remained watched"
+        );
+        assert!(includes(&third).is_empty(), "an excluded source root remained in the loader");
+        assert!(
+            third.load.iter().all(|entry| matches!(
+                entry,
+                loader::Entry::Directories(dirs) if dirs.include.is_empty()
+            )),
+            "explicit Files or WatchOnlyFiles bypassed a whole-project exclusion: {:?}",
+            third.load
+        );
+        assert!(state.project.as_ref().unwrap().source_roots().is_empty());
+
+        std::fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n").unwrap();
+        assert!(
+            state.project.as_ref().unwrap().source_roots().is_empty(),
+            "a disk edit reloaded an unwatched excluded config without didSave"
+        );
+        crate::handlers::handle_did_save(
+            &mut state,
+            lsp_types::DidSaveTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: lsp_types::Url::from_file_path(root.join("bsl-analyzer.toml")).unwrap(),
+                },
+                text: None,
+            },
+        )
+        .expect("didSave of an unwatched excluded config must reload it");
+        let fourth = configs_rx.try_recv().expect("didSave emits a restored loader config");
+        assert!(!includes(&fourth).is_empty(), "removing exclude did not restore source scanning");
+        assert!(
+            fourth.load.iter().any(|entry| matches!(entry, loader::Entry::Files(_))),
+            "removing exclude did not restore config-file watching"
+        );
     }
 
     /// Every file the project is derived from must re-derive it when it changes.

@@ -1,6 +1,7 @@
 use std::fmt;
 
 use paths::{AbsPath, AbsPathBuf};
+use stdx::path_exclusion::ExcludedPaths;
 
 #[derive(Debug, Clone)]
 pub enum Entry {
@@ -26,6 +27,10 @@ pub struct Directories {
     pub extensions: Vec<String>,
     pub include: Vec<AbsPathBuf>,
     pub exclude: Vec<AbsPathBuf>,
+    /// Directories taken out whatever else is said about them: decided before
+    /// `include`, so an include root inside one — or equal to one — is out too.
+    /// `exclude`, by contrast, yields to a more specific include.
+    pub hard_exclude: ExcludedPaths,
     pub rules: Vec<FileRule>,
 }
 
@@ -137,7 +142,15 @@ impl Directories {
         self.includes_path(path)
     }
 
+    /// Whether `path` lies in a directory of [`Self::hard_exclude`].
+    pub fn is_hard_excluded(&self, path: &AbsPath) -> bool {
+        self.hard_exclude.is_excluded(path.as_ref())
+    }
+
     fn includes_path(&self, path: &AbsPath) -> bool {
+        if self.is_hard_excluded(path) {
+            return false;
+        }
         let mut include: Option<&AbsPathBuf> = None;
         for incl in &self.include {
             if path.starts_with(incl) {
@@ -163,6 +176,7 @@ fn dirs(base: AbsPathBuf, exclude: &[&str]) -> Directories {
         extensions: vec!["rs".to_owned()],
         include: vec![base],
         exclude,
+        hard_exclude: ExcludedPaths::default(),
         rules: Vec::new(),
     }
 }
@@ -196,4 +210,57 @@ impl fmt::Debug for Message {
 #[test]
 fn handle_is_dyn_compatible() {
     fn _assert(_: &dyn Handle) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn abs(path: &str) -> AbsPathBuf {
+        AbsPathBuf::assert_utf8(
+            std::path::absolute(std::path::Path::new("target/vfs-loader-tests").join(path))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_hard_exclusion_beats_equal_and_more_specific_includes() {
+        let root = abs("root");
+        let hidden = root.join(".tmp");
+        let nested = hidden.join("declared-root");
+        let dirs = Directories {
+            extensions: vec!["bsl".to_owned()],
+            include: vec![root.clone(), hidden.clone(), nested.clone()],
+            exclude: Vec::new(),
+            hard_exclude: ExcludedPaths::new([hidden.as_path()]),
+            rules: vec![FileRule {
+                extensions: vec!["xml".to_owned()],
+                load_mode: LoadMode::WatchOnly,
+            }],
+        };
+
+        assert!(!dirs.contains_dir(&hidden));
+        assert!(!dirs.contains_dir(&nested));
+        assert_eq!(dirs.classify_file(&nested.join("Module.bsl")), None);
+        assert_eq!(dirs.classify_file(&hidden.join("Object.xml")), None);
+        assert_eq!(dirs.classify_file(&root.join(".tmp2/Module.bsl")), Some(LoadMode::LoadContent));
+        assert_eq!(dirs.classify_file(&root.join("allowed/Object.xml")), Some(LoadMode::WatchOnly));
+    }
+
+    #[test]
+    fn the_legacy_exclude_still_yields_to_a_nested_include() {
+        let root = abs("legacy");
+        let hole = root.join("cache");
+        let carved = hole.join("vendor");
+        let dirs = Directories {
+            extensions: vec!["bsl".to_owned()],
+            include: vec![root.clone(), carved.clone()],
+            exclude: vec![hole.clone()],
+            hard_exclude: ExcludedPaths::default(),
+            rules: Vec::new(),
+        };
+
+        assert!(!dirs.contains_file(&hole.join("Index.bsl")));
+        assert!(dirs.contains_file(&carved.join("Module.bsl")));
+    }
 }

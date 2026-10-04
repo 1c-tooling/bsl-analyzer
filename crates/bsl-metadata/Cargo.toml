@@ -20,4 +20,5 @@ rayon = { workspace = true }
 bsl-platform = { path = "../bsl-platform" }
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true

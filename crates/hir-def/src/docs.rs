@@ -3,8 +3,8 @@ use crate::{MethodId, VariableId};
 use std::sync::Arc;
 use stdx::case::CaseExt;
 use syntax::{
-    extract_leading_comment_lines_at_offset, extract_variable_comments_at_offset, Parse,
-    SyntaxKind, SyntaxNode,
+    extract_leading_comment_lines_at_offset, extract_variable_comments_at_offset, CommentRun,
+    Parse, SyntaxKind, SyntaxNode,
 };
 
 mod fields;
@@ -156,8 +156,10 @@ impl TypeDoc {
     }
 }
 
+/// `comment_runs` are the comment runs of the module tree `file_text` was
+/// parsed into, computed once per module.
 pub fn compute_method_docs(
-    _parse: &syntax::Parse<SyntaxNode>,
+    comment_runs: &[CommentRun],
     tree: &crate::item_tree::ItemTree,
     method_id: MethodId,
     file_text: &str,
@@ -165,7 +167,7 @@ pub fn compute_method_docs(
     let source_range = tree.method(method_id.local_id)?.source_range();
 
     let offset: usize = source_range.start().into();
-    let comments = extract_leading_comment_lines_at_offset(offset, file_text)?;
+    let comments = extract_leading_comment_lines_at_offset(offset, file_text, comment_runs)?;
 
     let docs = parse_method_docs(&comments)?;
 
@@ -196,6 +198,7 @@ pub fn compute_variable_docs(
     tree: &crate::item_tree::ItemTree,
     variable_id: VariableId,
     file_text: &str,
+    comment_runs: &[CommentRun],
 ) -> Option<Arc<VariableDocs>> {
     let items = tree.top_level_items();
     let item = items.get(variable_id.local_id as usize)?;
@@ -210,13 +213,14 @@ pub fn compute_variable_docs(
         .descendants()
         .find(|n| n.kind() == SyntaxKind::VAR_DEF && n.text_range() == variable.source_range)?;
 
-    compute_variable_docs_with_node(&var_node, variable, file_text)
+    compute_variable_docs_with_node(&var_node, variable, file_text, comment_runs)
 }
 
 pub fn compute_variable_docs_with_node(
     var_node: &SyntaxNode,
     variable: &crate::item_tree::Variable,
     file_text: &str,
+    comment_runs: &[CommentRun],
 ) -> Option<Arc<VariableDocs>> {
     debug_assert_eq!(
         var_node.kind(),
@@ -244,6 +248,7 @@ pub fn compute_variable_docs_with_node(
         var_keyword_offset,
         var_end_offset,
         first_annotation_offset,
+        comment_runs,
     )?;
 
     parse_variable_docs(&comments).map(Arc::new)
@@ -1161,6 +1166,8 @@ fn parse_deprecated_section(keyword_line: &str, following_lines: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{item_tree::ItemTree, ModuleId};
+    use vfs::FileId;
 
     /// Presentation uses the same bilingual collection syntax as return-type parsing.
     #[test]
@@ -1219,6 +1226,26 @@ mod tests {
         let type_doc = TypeDoc::hyperlink("См. ДругойМетод()".to_string());
         assert!(type_doc.is_hyperlink);
         assert_eq!(type_doc.name, "См. ДругойМетод()");
+    }
+
+    #[test]
+    fn variable_docs_fallback_uses_module_comment_runs() {
+        let text = "// Назначение переменной.\nПерем Данные; // Дополнение.";
+        let parse = parser::parse_with_shared_cache(text);
+        let tree = ItemTree::from_parse(&parse);
+        let comment_runs = syntax::comment_runs(&parse.syntax_node());
+
+        let docs = compute_variable_docs(
+            &parse,
+            &tree,
+            VariableId { module: ModuleId::new(FileId(0)), local_id: 0 },
+            text,
+            &comment_runs,
+        )
+        .expect("variable documentation");
+
+        assert_eq!(docs.raw, ["Назначение переменной.", "Дополнение."]);
+        assert_eq!(docs.purpose.as_deref(), Some("Назначение переменной.\nДополнение."));
     }
 
     #[test]

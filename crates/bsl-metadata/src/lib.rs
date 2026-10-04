@@ -18,6 +18,7 @@ pub mod module_path;
 pub mod register;
 pub mod role;
 pub mod scheduled_job;
+pub mod scoped_fs;
 pub mod subsystem;
 pub mod tabular_section;
 pub mod traits;
@@ -54,7 +55,7 @@ pub use loader::{
     discover_integration_service_structure, discover_metadata_structure,
     discover_register_structure, discover_role_structure, discover_scheduled_job_structure,
     discover_subsystem_structure, discover_web_service_structure, load_from_directory,
-    parse_common_module_from_text, parse_defined_type_from_text,
+    load_from_directory_scoped, parse_common_module_from_text, parse_defined_type_from_text,
     parse_event_subscription_from_text, parse_http_service_from_text,
     parse_integration_service_from_text, parse_metadata_object_from_texts,
     parse_register_from_text, parse_role_from_texts, parse_scheduled_job_from_text,
@@ -76,6 +77,7 @@ pub use register::{
 };
 pub use role::{Role, RoleData, RoleObjectRef};
 pub use scheduled_job::{ScheduledJob, ScheduledJobHandler};
+pub use scoped_fs::ScopedFs;
 pub use subsystem::Subsystem;
 pub use tabular_section::{TabularSection, TabularSectionAttribute};
 pub use traits::{MdObject, Module};

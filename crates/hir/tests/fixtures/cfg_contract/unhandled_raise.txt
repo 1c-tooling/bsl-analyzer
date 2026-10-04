@@ -1,0 +1,19 @@
+complexity: 1
+live: {0}
+dead: [1]
+evaluations: {}
+expr ExprId(0): Some(LocalRange(62..73))
+expr ExprId(1): Some(LocalRange(75..79))
+expr ExprId(2): Some(LocalRange(82..83))
+transitions:
+  s0 -> exit
+definitions (limit 3):
+  s0: Some([])
+  s1: Some([])
+definitions (limit 10000):
+  s0: Some([])
+  s1: Some([])
+source states:
+  s0: range=Some(LocalRange(27..74)); fallthrough=false; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(75..83)); fallthrough=false; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

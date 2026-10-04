@@ -815,6 +815,7 @@ fn references_follow_the_declared_dependency_matrix() {
         closures: vec![Vec::new(), Vec::new(), vec![1], Vec::new()],
         topological_order: vec![0, 1, 2, 3],
         fingerprint: None,
+        source_exclusions: Default::default(),
     });
 
     let result = by_name(&db, "МодульЮнит.ЗапуститьТест");
@@ -911,6 +912,7 @@ fn manager_module_references_follow_the_declared_dependency_matrix() {
         closures: vec![Vec::new(), Vec::new(), vec![1], Vec::new()],
         topological_order: vec![0, 1, 2, 3],
         fingerprint: None,
+        source_exclusions: Default::default(),
     });
 
     let result = by_name(&db, "Справочник.Товары.ПодготовитьДанные");
@@ -998,6 +1000,7 @@ fn object_module_references_follow_the_declared_dependency_matrix() {
         closures: vec![Vec::new(), Vec::new(), vec![1], Vec::new()],
         topological_order: vec![0, 1, 2, 3],
         fingerprint: None,
+        source_exclusions: Default::default(),
     });
 
     let result = by_name(&db, "Справочник.Товары.ПодготовитьОбъект");
@@ -1099,6 +1102,7 @@ fn record_set_module_references_follow_the_declared_dependency_matrix() {
         closures: vec![Vec::new(), Vec::new(), vec![1], Vec::new()],
         topological_order: vec![0, 1, 2, 3],
         fingerprint: None,
+        source_exclusions: Default::default(),
     });
 
     let result = by_name(&db, "РегистрСведений.ЦеныТоваров.ПодготовитьНабор");
@@ -1186,6 +1190,7 @@ fn adopter_first_input() -> (RootDatabaseImpl, FileId, FileId, FileId) {
         closures: vec![Vec::new(), Vec::new()],
         topological_order: vec![0, 1],
         fingerprint: None,
+        source_exclusions: Default::default(),
     });
 
     (db, base_manager, adopter_manager, caller)

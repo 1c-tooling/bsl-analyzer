@@ -2,6 +2,7 @@ use intern::NormName;
 use stdx::case::CaseExt;
 use syntax::{
     ast::{AstNode, PreIfDir},
+    ast_utils::active_children,
     SyntaxKind, SyntaxNode,
 };
 use text_size::TextRange;
@@ -443,7 +444,7 @@ pub(crate) fn lower_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stm
 }
 
 fn lower_assign_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let mut children = node.children().peekable();
+    let mut children = active_children(node).peekable();
 
     let target_node = children.next()?;
     let target = lower_expr_node(ctx, &target_node);
@@ -591,7 +592,7 @@ fn expr_contains_cancel(
 }
 
 fn lower_call_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let expr_node = node.children().next()?;
+    let expr_node = active_children(node).next()?;
     let expr = lower_expr_node(ctx, &expr_node);
     Some(Stmt::Expr(expr))
 }
@@ -647,7 +648,7 @@ fn is_recoverable_expr(kind: SyntaxKind) -> bool {
 }
 
 fn lower_return_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let value = node.children().next().map(|n| lower_expr_node(ctx, &n));
+    let value = active_children(node).next().map(|n| lower_expr_node(ctx, &n));
     if !ctx.is_function && value.is_some() {
         ctx.emit(BodyDiagnostic::ProcedureReturnsValue { range: node.text_range() });
     }
@@ -673,7 +674,7 @@ fn has_extension_directive(stmt_list: &SyntaxNode) -> bool {
 }
 
 fn lower_if_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let mut children = node.children().peekable();
+    let mut children = active_children(node).peekable();
 
     let condition_node = children.next()?;
 
@@ -705,7 +706,7 @@ fn lower_if_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
 
     let mut elsif_branches = Vec::new();
     for elsif in node.children().filter(|n| n.kind() == SyntaxKind::ELSIF_CLAUSE) {
-        let mut elsif_children = elsif.children();
+        let mut elsif_children = active_children(&elsif);
         if let Some(cond_node) = elsif_children.next() {
             condition_nodes.push(cond_node.clone());
 
@@ -770,7 +771,7 @@ fn lower_if_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
 }
 
 fn lower_while_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let mut children = node.children();
+    let mut children = active_children(node);
 
     let condition_node = children.next()?;
     let condition = lower_expr_node(ctx, &condition_node);
@@ -808,7 +809,7 @@ fn lower_for_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
     ctx.register_local_var(name.clone(), range);
     let var = ctx.alloc_binding(Binding::var(name), range);
 
-    let mut expr_iter = node.children().filter(|n| {
+    let mut expr_iter = active_children(node).filter(|n| {
         matches!(
             n.kind(),
             SyntaxKind::EXPR
@@ -859,7 +860,7 @@ fn lower_for_each_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt>
     ctx.register_local_var(name.clone(), range);
     let var = ctx.alloc_binding(Binding::var(name), range);
 
-    let collection_node = node.children().find(|n| {
+    let collection_node = active_children(node).find(|n| {
         matches!(
             n.kind(),
             SyntaxKind::EXPR
@@ -987,8 +988,7 @@ fn lower_execute_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> 
         ctx.emit(BodyDiagnostic::ExecuteExternalCode { range });
     }
 
-    let expr = node
-        .children()
+    let expr = active_children(node)
         .next()
         .map(|n| lower_expr_node(ctx, &n))
         .unwrap_or_else(|| ctx.missing_expr());
@@ -997,7 +997,7 @@ fn lower_execute_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> 
 }
 
 fn lower_add_handler_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let mut expr_iter = node.children();
+    let mut expr_iter = active_children(node);
 
     let event =
         expr_iter.next().map(|n| lower_expr_node(ctx, &n)).unwrap_or_else(|| ctx.missing_expr());
@@ -1009,7 +1009,7 @@ fn lower_add_handler_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<St
 }
 
 fn lower_remove_handler_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let mut expr_iter = node.children();
+    let mut expr_iter = active_children(node);
 
     let event =
         expr_iter.next().map(|n| lower_expr_node(ctx, &n)).unwrap_or_else(|| ctx.missing_expr());
@@ -1132,7 +1132,7 @@ fn is_direct_function_call(token: &syntax::SyntaxToken) -> bool {
     }
 
     if parent.kind() == SyntaxKind::CALL_STMT {
-        for child in parent.children() {
+        for child in active_children(&parent) {
             if child.kind() == SyntaxKind::CALL_EXPR {
                 return is_direct_callee(&ident_node, &child);
             }
@@ -1143,9 +1143,9 @@ fn is_direct_function_call(token: &syntax::SyntaxToken) -> bool {
 }
 
 fn is_direct_callee(ident_node: &SyntaxNode, call_expr: &SyntaxNode) -> bool {
-    if let Some(first_child) = call_expr.first_child() {
+    if let Some(first_child) = active_children(call_expr).next() {
         if first_child.text_range() == ident_node.text_range() {
-            return !call_expr.children().any(|c| c.kind() == SyntaxKind::FIELD_EXPR);
+            return !active_children(call_expr).any(|c| c.kind() == SyntaxKind::FIELD_EXPR);
         }
     }
     false

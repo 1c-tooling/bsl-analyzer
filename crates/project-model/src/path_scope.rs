@@ -25,6 +25,9 @@
 
 use std::path::{Path, PathBuf};
 
+use stdx::path_exclusion::ExcludedPaths;
+pub use stdx::path_exclusion::ResolvedDirs;
+
 /// Every spelling one directory can appear under in a path handed to us.
 ///
 /// Two, because both are real: the watcher arms and reports the DECLARED path while
@@ -114,9 +117,21 @@ pub struct PathScope {
     /// root back out keeps the walk non-empty without re-opening the rest of the hole,
     /// which simply dropping the hole would.
     carve_outs: Vec<Spellings>,
+    /// Directories the user took out of the project. Unlike `holes`, nothing declared
+    /// inside one wins over it, a root included: a root the user excluded is excluded.
+    excluded: ExcludedPaths,
 }
 
 impl PathScope {
+    /// [`Self::new`] plus the user's hard exclusions, which are decided before the
+    /// roots-and-holes rule and are never reported by [`Self::hole_covering_a_root`]:
+    /// excluding a root is a choice the user made, not a contradiction to refuse.
+    pub fn with_exclusions(roots: &[PathBuf], holes: &[PathBuf], excluded: &ExcludedPaths) -> Self {
+        let mut scope = Self::new(roots, holes);
+        scope.excluded = excluded.respelled_under(roots);
+        scope
+    }
+
     pub fn new(roots: &[PathBuf], holes: &[PathBuf]) -> Self {
         let roots: Vec<Spellings> = roots.iter().map(|path| Spellings::of(path)).collect();
         let holes: Vec<Hole> = holes
@@ -144,7 +159,7 @@ impl PathScope {
             .filter(|root| holes.iter().any(|hole| hole.named.covers_dir(root)))
             .cloned()
             .collect();
-        Self { roots, holes, carve_outs }
+        Self { roots, holes, carve_outs, excluded: ExcludedPaths::default() }
     }
 
     /// Whether `path` lies at or under a declared root. Holes are NOT consulted: a
@@ -155,10 +170,32 @@ impl PathScope {
     }
 
     /// Whether `path` lies in a hole — that is, in a subtree the caller declared out of
-    /// scope and did not then declare a root inside.
+    /// scope and did not then declare a root inside — or in a directory the user
+    /// excluded, whatever is declared inside it.
     pub fn is_hole(&self, path: &Path) -> bool {
+        if self.excluded.is_excluded(path) {
+            return true;
+        }
         self.holes.iter().any(|hole| hole.spellings.iter().any(|hole| path.starts_with(hole)))
             && !self.carve_outs.iter().any(|root| root.covers(path))
+    }
+
+    /// Whether a user exclusion lies strictly beneath `dir`, so that a recursive watch
+    /// on `dir` would cover it.
+    pub fn has_exclusion_below(&self, dir: &Path) -> bool {
+        self.excluded.has_exclusion_below(dir)
+    }
+
+    /// Whether a walk must not enter the directory at `path`: [`Self::is_hole`], or
+    /// an exclusion reached under another spelling — see
+    /// [`ExcludedPaths::prunes_walked_dir`].
+    pub fn prunes_dir(&self, path: &Path, is_symlink: bool, resolved: &mut ResolvedDirs) -> bool {
+        self.is_hole(path) || self.excluded.prunes_walked_dir(path, is_symlink, resolved)
+    }
+
+    /// The user's hard exclusions, as this scope matches them.
+    pub fn exclusions(&self) -> &ExcludedPaths {
+        &self.excluded
     }
 
     /// A hole that swallows a whole root, if there is one, as `(hole, root)` in the
@@ -262,5 +299,47 @@ mod tests {
 
         assert!(!scope.is_hole(&vendored.join("Module.bsl")), "the declared root stayed cut off");
         assert!(scope.is_hole(&cache.join("bsl-graph.db")), "the rest of the hole re-opened");
+    }
+
+    #[test]
+    fn a_user_exclusion_beats_an_equal_or_nested_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let hidden = outer.path().join("hidden");
+        let nested_root = hidden.join("declared-root");
+        std::fs::create_dir_all(&nested_root).unwrap();
+        let excluded = ExcludedPaths::new([hidden.clone()]);
+        let scope = PathScope::with_exclusions(
+            &[outer.path().to_path_buf(), hidden.clone(), nested_root.clone()],
+            &[],
+            &excluded,
+        );
+
+        assert!(scope.is_hole(&hidden), "an equal root restored the exclusion");
+        assert!(
+            scope.is_hole(&nested_root.join("Module.bsl")),
+            "a more specific root restored the exclusion"
+        );
+        assert!(!scope.is_hole(&outer.path().join("hidden2/Module.bsl")));
+    }
+
+    #[test]
+    fn a_user_exclusion_does_not_change_the_legacy_cache_carve_out() {
+        let outer = tempfile::tempdir().unwrap();
+        let cache = outer.path().join(".build");
+        let cache_root = cache.join("vendor");
+        let user_hidden = cache_root.join("private");
+        std::fs::create_dir_all(&user_hidden).unwrap();
+        let scope = PathScope::with_exclusions(
+            &[outer.path().to_path_buf(), cache_root.clone()],
+            std::slice::from_ref(&cache),
+            &ExcludedPaths::new([user_hidden.clone()]),
+        );
+
+        assert!(!scope.is_hole(&cache_root.join("Public.bsl")), "legacy carve-out was lost");
+        assert!(scope.is_hole(&cache.join("index.db")), "legacy cache hole was reopened");
+        assert!(
+            scope.is_hole(&user_hidden.join("Secret.bsl")),
+            "hard exclusion yielded to the legacy carve-out"
+        );
     }
 }

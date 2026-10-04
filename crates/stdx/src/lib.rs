@@ -2,6 +2,7 @@ pub mod case;
 pub mod fs;
 pub mod heap;
 pub mod par_guard;
+pub mod path_exclusion;
 pub mod thread;
 
 pub use itertools::Itertools;

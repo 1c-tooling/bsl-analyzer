@@ -549,8 +549,7 @@ fn compute_method_size_lines(method_node: &SyntaxNode, line_index: Option<&LineI
     let method_range = method_node.text_range();
     let start_line = line_index.line_col(method_range.start()).line as usize;
     let end_line = line_index.line_col(method_range.end()).line as usize;
-    let total_span = end_line.saturating_sub(start_line);
-    total_span.saturating_sub(4) as u32
+    end_line.saturating_sub(start_line) as u32
 }
 
 fn is_compound_block_stmt(node: &SyntaxNode) -> bool {

@@ -1,0 +1,46 @@
+complexity: 2
+live: {0, 1, 2, 3, 4, 5}
+dead: []
+evaluations: {}
+expr ExprId(0): Some(LocalRange(27..31))
+expr ExprId(1): Some(LocalRange(34..46))
+expr ExprId(2): Some(LocalRange(48..112))
+expr ExprId(3): Some(LocalRange(113..117))
+expr ExprId(4): Some(LocalRange(48..118))
+expr ExprId(5): Some(LocalRange(136..137))
+expr ExprId(6): Some(LocalRange(140..141))
+expr ExprId(7): Some(LocalRange(165..166))
+expr ExprId(8): Some(LocalRange(169..170))
+expr ExprId(9): Some(LocalRange(198..262))
+expr ExprId(10): Some(LocalRange(263..271))
+expr ExprId(11): Some(LocalRange(198..272))
+transitions:
+  s0 -> s1
+  s1 -> s4
+  s2 -> s5
+  s3 -> s5
+  s4 -> s2
+  s4 -> s3
+  s5 -> exit
+definitions (limit 3):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some([])
+  s3: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s4: None
+  s5: Some([])
+definitions (limit 10000):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s3: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s4: None
+  s5: Some(["Definition { var_name: \"a\", def_site: Assignment(2) }", "Definition { var_name: \"a\", def_site: Assignment(3) }", "Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+source states:
+  s0: range=Some(LocalRange(27..46)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(48..118)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s2: range=Some(LocalRange(136..141)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(1), must: Exact(1) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s3: range=Some(LocalRange(165..170)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(1), must: Exact(1) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s4: range=Some(LocalRange(120..197)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(1), must: Exact(1) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s5: range=Some(LocalRange(198..272)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(1), must: Exact(1) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

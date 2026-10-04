@@ -372,6 +372,11 @@ impl NotifyActor {
                             let mut changed_files: Vec<(AbsPathBuf, Option<Vec<u8>>)> = Vec::new();
                             let mut watch_only_files: Vec<AbsPathBuf> = Vec::new();
                             let mut removed_recursive: Vec<AbsPathBuf> = Vec::new();
+                            let appeared = matches!(
+                                event.kind,
+                                EventKind::Create(_)
+                                    | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                            );
                             for path in event.paths {
                                 let Some(path) = Utf8PathBuf::from_path_buf(path)
                                     .ok()
@@ -381,7 +386,21 @@ impl NotifyActor {
                                 };
                                 self.release_watch_if_gone(&path);
                                 match self.classify_event_path(&path) {
-                                    EventPathAction::WatchDir => self.watch(path.as_ref()),
+                                    EventPathAction::WatchDir => {
+                                        if self.takes_dir(&path) {
+                                            self.watch(path.as_ref());
+                                        } else {
+                                            for root in self.include_roots_below(&path) {
+                                                self.watch(root.as_ref());
+                                            }
+                                        }
+                                        // Only a directory that appeared holds files no
+                                        // event will name; a chmod or touch on one that
+                                        // stood there all along must not re-read it.
+                                        if appeared {
+                                            self.scan_appeared_dir(&path);
+                                        }
+                                    }
                                     EventPathAction::LoadContent => {
                                         let contents = read(&path);
                                         changed_files.push((path, contents));
@@ -521,20 +540,30 @@ impl NotifyActor {
                     if shutdown.load(Ordering::Relaxed) {
                         break 'walk;
                     }
+                    if dirs.is_hard_excluded(root) {
+                        continue;
+                    }
                     if do_watch {
                         watch(root.as_ref());
                     }
 
                     send_message(root.clone());
+                    let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
                     let walkdir =
                         WalkDir::new(root).follow_links(true).into_iter().filter_entry(|entry| {
                             if shutdown.load(Ordering::Relaxed) {
                                 return false;
                             }
-                            if !entry.file_type().is_dir() {
-                                return true;
-                            }
                             let path = entry.path();
+                            if !entry.file_type().is_dir() {
+                                // A file symlink may point into an exclusion.
+                                return !entry.path_is_symlink()
+                                    || !dirs.hard_exclude.prunes_walked_dir(
+                                        path,
+                                        true,
+                                        &mut resolved,
+                                    );
+                            }
 
                             if entry.path_is_symlink() && symlink_might_be_cyclic(path) {
                                 return false;
@@ -542,6 +571,11 @@ impl NotifyActor {
 
                             dirs.exclude.iter().all(|it| it != path)
                                 && (root == path || dirs.include.iter().all(|it| it != path))
+                                && !dirs.hard_exclude.prunes_walked_dir(
+                                    path,
+                                    entry.path_is_symlink(),
+                                    &mut resolved,
+                                )
                         });
 
                     let files = walkdir.filter_map(|it| it.ok()).filter_map(|entry| {
@@ -669,12 +703,21 @@ impl NotifyActor {
         }) {
             Ok(meta) => {
                 if meta.file_type().is_dir() {
-                    if self.watched_dir_entries.iter().any(|dir| dir.contains_dir(path)) {
+                    // A directory the configuration does not take can still hold an include
+                    // root of its own — a source root under a legacy exclude — which the
+                    // load walks separately and which must not be lost when the tree
+                    // around it appears.
+                    if self.takes_dir(path) || !self.include_roots_below(path).is_empty() {
                         return EventPathAction::WatchDir;
                     }
                     return EventPathAction::Ignore;
                 }
                 if !meta.file_type().is_file() {
+                    return EventPathAction::Ignore;
+                }
+                // A link created under a watched directory may lead into an exclusion.
+                let is_link = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+                if is_link && self.is_hard_excluded(path.as_ref()) {
                     return EventPathAction::Ignore;
                 }
                 match self.classify_watched_path(path) {
@@ -757,6 +800,7 @@ impl NotifyActor {
                     &stdx::fs::WalkConfig {
                         extensions: &extensions,
                         excludes: &excludes,
+                        excluded: Some(&dirs.hard_exclude),
                         follow_links: true,
                     },
                     Some(cancel),
@@ -774,14 +818,21 @@ impl NotifyActor {
     /// every subdirectory — and the baseline lives in the project root by default,
     /// which is exactly such a directory. Events for the file arrive through the
     /// recursive watch anyway; `classify_event_path` recognises it by its own list.
+    ///
+    /// A directory with a hard exclusion anywhere beneath it — existing or not yet
+    /// created — is watched non-recursively: a recursive watch would reach into the
+    /// exclusion. [`Self::watch`] then covers its permitted children one by one.
     fn watch_target(&self, path: &Path) -> Option<(std::path::PathBuf, RecursiveMode)> {
+        if self.is_hard_excluded(path) {
+            return None;
+        }
         let exact = self
             .watched_file_entries
             .iter()
             .chain(&self.watched_only_file_entries)
             .any(|entry| entry.as_path() == path);
         if !exact {
-            return Some((path.to_path_buf(), RecursiveMode::Recursive));
+            return Some((path.to_path_buf(), self.directory_mode(path)));
         }
         let parent = path.parent().unwrap_or(path);
         let covered = Utf8PathBuf::from_path_buf(parent.to_path_buf())
@@ -801,16 +852,198 @@ impl NotifyActor {
     /// registered and never released, so the registration is in place on every
     /// backend and re-issuing it can only cost. On FSEvents it costs the tree —
     /// `watch` rebuilds the single stream and starts it from "now".
+    ///
+    /// A directory narrowed to a non-recursive watch because of an exclusion below it
+    /// replaces any recursive registration it had — the one case where a registration
+    /// already standing does not answer — and its permitted child directories are
+    /// watched in turn, each again recursively unless an exclusion lies below it too.
+    /// Only the branches leading to an exclusion are descended; the excluded directory
+    /// itself is never listed.
     fn watch(&self, path: &Path) {
+        self.watch_visiting(path, &mut FxHashSet::default());
+    }
+
+    /// [`Self::watch`], remembering in `visited` the resolved directories a narrowed
+    /// descent has entered: a symlink back into one of them — a loop — is not entered
+    /// again.
+    fn watch_visiting(&self, path: &Path, visited: &mut FxHashSet<PathBuf>) {
         let Some((target, mode)) = self.watch_target(path) else { return };
         let Some((state, _)) = &self.watcher else { return };
-        let mut state = state.borrow_mut();
-        if registration_stands(&state.registered, &target, mode) {
+        let narrowed = mode == RecursiveMode::NonRecursive && self.has_exclusion_below(&target);
+        if narrowed && !visited.insert(fs::canonicalize(&target).unwrap_or_else(|_| target.clone()))
+        {
             return;
         }
-        if log_notify_error(state.watcher.watch(&target, mode)).is_some() {
-            state.registered.insert(target, mode);
+        {
+            let mut state = state.borrow_mut();
+            let stands = if narrowed {
+                state.registered.get(&target) == Some(&RecursiveMode::NonRecursive)
+            } else {
+                registration_stands(&state.registered, &target, mode)
+            };
+            if !stands && log_notify_error(state.watcher.watch(&target, mode)).is_some() {
+                state.registered.insert(target.clone(), mode);
+            }
         }
+        if narrowed {
+            let Ok(entries) = fs::read_dir(&target) else { return };
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if fs::metadata(&child).is_ok_and(|meta| meta.is_dir())
+                    && !self.is_hard_excluded(&child)
+                {
+                    self.watch_visiting(&child, visited);
+                }
+            }
+        }
+    }
+
+    /// Deliver what a directory that just appeared under a watched root already holds.
+    ///
+    /// A tree created elsewhere and moved in arrives as one event for its top: the files
+    /// inside it were never created here, so no event will ever name them. The walk
+    /// prunes exactly what the load does — a directory the configuration does not take,
+    /// a hard exclusion under any spelling, a link that may lead back into itself, an
+    /// include root of its own, which is walked separately as the load walks it — and
+    /// classifies each file the way an event for it would be. Delivery is chunked like
+    /// the load's and stops with it on shutdown: a moved-in tree can be a whole
+    /// configuration.
+    fn scan_appeared_dir(&self, dir: &AbsPathBuf) {
+        let mut starts = if self.takes_dir(dir) { vec![dir.clone()] } else { Vec::new() };
+        for include in self.include_roots_below(dir) {
+            if !starts.contains(&include) {
+                starts.push(include);
+            }
+        }
+        let mut changed: Vec<(AbsPathBuf, Option<Vec<u8>>)> = Vec::new();
+        let mut changed_bytes = 0usize;
+        let mut watch_only: Vec<AbsPathBuf> = Vec::new();
+        for start in &starts {
+            let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+            let walk = WalkDir::new(start).follow_links(true).into_iter().filter_entry(|entry| {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    return false;
+                }
+                let path = entry.path();
+                if entry.depth() == 0 {
+                    return !self.watched_dir_entries.iter().any(|dirs| {
+                        dirs.hard_exclude.prunes_walked_dir(
+                            path,
+                            entry.path_is_symlink(),
+                            &mut resolved,
+                        )
+                    });
+                }
+                let is_dir = entry.file_type().is_dir();
+                if !is_dir && !entry.path_is_symlink() {
+                    return true;
+                }
+                if entry.path_is_symlink() && is_dir && symlink_might_be_cyclic(path) {
+                    return false;
+                }
+                let taken = Utf8PathBuf::from_path_buf(path.to_path_buf())
+                    .ok()
+                    .and_then(|path| AbsPathBuf::try_from(path).ok())
+                    .is_some_and(|path| {
+                        !is_dir
+                            || (!starts.contains(&path)
+                                && self.watched_dir_entries.iter().any(|dirs| {
+                                    dirs.contains_dir(&path) && !dirs.include.contains(&path)
+                                }))
+                    });
+                taken
+                    && !self.watched_dir_entries.iter().any(|dirs| {
+                        dirs.hard_exclude.prunes_walked_dir(
+                            path,
+                            entry.path_is_symlink(),
+                            &mut resolved,
+                        )
+                    })
+            });
+            for entry in walk.filter_map(Result::ok) {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let Some(path) = Utf8PathBuf::from_path_buf(entry.into_path())
+                    .ok()
+                    .and_then(|path| AbsPathBuf::try_from(path).ok())
+                else {
+                    continue;
+                };
+                match self.classify_watched_path(&path) {
+                    Some(loader::LoadMode::LoadContent) => {
+                        let contents = read(&path);
+                        changed_bytes += contents.as_ref().map_or(0, Vec::len);
+                        changed.push((path, contents));
+                        if changed_bytes >= LOADED_CHUNK_BYTES {
+                            self.send(loader::Message::Changed {
+                                files: std::mem::take(&mut changed),
+                            });
+                            changed_bytes = 0;
+                        }
+                    }
+                    Some(loader::LoadMode::WatchOnly) => {
+                        watch_only.push(path);
+                        if watch_only.len() >= WATCH_ONLY_CHUNK_PATHS {
+                            self.send(loader::Message::WatchOnly {
+                                files: std::mem::take(&mut watch_only),
+                            });
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        if !changed.is_empty() {
+            self.send(loader::Message::Changed { files: changed });
+        }
+        if !watch_only.is_empty() {
+            self.send(loader::Message::WatchOnly { files: watch_only });
+        }
+    }
+
+    /// Whether the configuration takes the directory at `dir`.
+    fn takes_dir(&self, dir: &AbsPathBuf) -> bool {
+        self.watched_dir_entries.iter().any(|dirs| dirs.contains_dir(dir))
+    }
+
+    /// The include roots strictly below `dir` that are not hard-excluded.
+    fn include_roots_below(&self, dir: &AbsPathBuf) -> Vec<AbsPathBuf> {
+        let mut roots: Vec<AbsPathBuf> = Vec::new();
+        for dirs in &self.watched_dir_entries {
+            for include in &dirs.include {
+                if include != dir
+                    && include.starts_with(dir)
+                    && !dirs.is_hard_excluded(include)
+                    && !roots.contains(include)
+                {
+                    roots.push(include.clone());
+                }
+            }
+        }
+        roots
+    }
+
+    /// The mode a directory under a watched root is registered with.
+    fn directory_mode(&self, dir: &Path) -> RecursiveMode {
+        if self.has_exclusion_below(dir) {
+            RecursiveMode::NonRecursive
+        } else {
+            RecursiveMode::Recursive
+        }
+    }
+
+    fn is_hard_excluded(&self, path: &Path) -> bool {
+        self.watched_dir_entries.iter().any(|dir| dir.hard_exclude.is_excluded_resolved(path))
+    }
+
+    fn has_exclusion_below(&self, dir: &Path) -> bool {
+        self.watched_dir_entries
+            .iter()
+            .any(|dirs| dirs.hard_exclude.has_exclusion_below_resolved(dir))
     }
 
     /// Give up the registrations at and beneath `path` once it is actually gone.
@@ -849,9 +1082,12 @@ impl NotifyActor {
         let stale: Vec<PathBuf> = state
             .borrow()
             .registered
-            .keys()
-            .filter(|target| !self.registration_is_requested(target))
-            .cloned()
+            .iter()
+            .filter(|(target, mode)| {
+                !self.registration_is_requested(target)
+                    || (**mode == RecursiveMode::Recursive && self.has_exclusion_below(target))
+            })
+            .map(|(target, _)| target.clone())
             .collect();
         if stale.is_empty() {
             return;
@@ -867,8 +1103,13 @@ impl NotifyActor {
     ///
     /// Every watch this actor places has one of two shapes, and the answer enumerates
     /// both: a directory under a watched root, or the directory holding an
-    /// exactly-listed file.
+    /// exactly-listed file. Neither may lie in a hard exclusion. The caller also drops
+    /// a recursive registration that now reaches one: an unchanged path is no proof of
+    /// an unchanged coverage.
     fn registration_is_requested(&self, target: &Path) -> bool {
+        if self.is_hard_excluded(target) {
+            return false;
+        }
         let Some(target) = Utf8PathBuf::from_path_buf(target.to_path_buf())
             .ok()
             .and_then(|path| AbsPathBuf::try_from(path).ok())
@@ -947,6 +1188,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Duration;
+    use stdx::path_exclusion::ExcludedPaths;
     use vfs::loader::Handle;
 
     fn fixture(count: usize, bytes_per_file: usize) -> (tempfile::TempDir, loader::Directories) {
@@ -960,6 +1202,7 @@ mod tests {
             extensions: vec!["txt".to_string()],
             include: vec![abs_root],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules: Vec::new(),
         };
         (dir, dirs)
@@ -969,6 +1212,7 @@ mod tests {
     struct LoadCapture {
         loaded: Vec<Vec<(AbsPathBuf, usize)>>,
         watch_only: Vec<Vec<AbsPathBuf>>,
+        walked_dirs: Vec<AbsPathBuf>,
     }
 
     fn run(dirs: loader::Directories, threshold: usize) -> Vec<Vec<(AbsPathBuf, usize)>> {
@@ -997,11 +1241,12 @@ mod tests {
     ) -> LoadCapture {
         let loaded: Mutex<Vec<Vec<(AbsPathBuf, usize)>>> = Mutex::new(Vec::new());
         let watch_only: Mutex<Vec<Vec<AbsPathBuf>>> = Mutex::new(Vec::new());
+        let walked_dirs: Mutex<Vec<AbsPathBuf>> = Mutex::new(Vec::new());
         NotifyActor::load_entry(
             |_| {},
             loader::Entry::Directories(dirs),
             false,
-            |_| {},
+            |path| walked_dirs.lock().unwrap().push(path),
             || {},
             |files| {
                 let summary =
@@ -1018,6 +1263,7 @@ mod tests {
         LoadCapture {
             loaded: loaded.into_inner().unwrap(),
             watch_only: watch_only.into_inner().unwrap(),
+            walked_dirs: walked_dirs.into_inner().unwrap(),
         }
     }
 
@@ -1155,6 +1401,7 @@ mod tests {
             extensions: vec!["txt".to_string()],
             include: vec![abs_root],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules: Vec::new(),
         };
 
@@ -1212,6 +1459,7 @@ mod tests {
             extensions: vec!["bsl".to_string()],
             include: vec![root],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules: vec![loader::FileRule {
                 extensions: vec!["xml".to_string()],
                 load_mode: loader::LoadMode::WatchOnly,
@@ -1243,6 +1491,7 @@ mod tests {
             extensions: vec![],
             include: vec![root],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules: vec![loader::FileRule {
                 extensions: vec!["xml".to_string()],
                 load_mode: loader::LoadMode::WatchOnly,
@@ -1285,6 +1534,7 @@ mod tests {
             extensions: vec![],
             include: vec![root],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules: vec![loader::FileRule {
                 extensions: vec!["xml".to_string()],
                 load_mode: loader::LoadMode::WatchOnly,
@@ -1308,6 +1558,7 @@ mod tests {
             extensions: vec!["xml".to_string()],
             include: vec![root],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules: vec![loader::FileRule {
                 extensions: vec!["xml".to_string()],
                 load_mode: loader::LoadMode::WatchOnly,
@@ -1327,6 +1578,7 @@ mod tests {
             extensions: vec!["bsl".to_string()],
             include: vec![root],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules: vec![loader::FileRule {
                 extensions: vec!["xml".to_string()],
                 load_mode: loader::LoadMode::WatchOnly,
@@ -1335,6 +1587,78 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let count = NotifyActor::count_files_in_entry(&loader::Entry::Directories(dirs), &cancel);
         assert_eq!(count, 8, "count must union extensions + rules");
+    }
+
+    #[test]
+    fn hard_exclusions_agree_across_count_and_initial_load() {
+        let guard = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::assert_utf8(guard.path().canonicalize().unwrap());
+        let write = |relative: &str| {
+            let path = AsRef::<Path>::as_ref(&root).join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        };
+        write("Allowed.bsl");
+        write(".tmp/Hidden.bsl");
+        write(".tmp/Hidden.xml");
+        write(".tmp2/Visible.bsl");
+        write(".git/Legacy.bsl");
+        write("build/Legacy.bsl");
+        write(".vscode/Legacy.bsl");
+        write(".buildfoo/Visible.bsl");
+        let root_path = AsRef::<Path>::as_ref(&root);
+        let dirs = loader::Directories {
+            extensions: vec!["bsl".to_owned()],
+            include: vec![root.clone()],
+            exclude: [".git", "build", ".vscode"]
+                .into_iter()
+                .map(|name| AbsPathBuf::assert_utf8(root_path.join(name)))
+                .collect(),
+            hard_exclude: ExcludedPaths::new([root_path.join(".tmp")]),
+            rules: vec![loader::FileRule {
+                extensions: vec!["xml".to_owned()],
+                load_mode: loader::LoadMode::WatchOnly,
+            }],
+        };
+
+        let count = NotifyActor::count_files_in_entry(
+            &loader::Entry::Directories(dirs.clone()),
+            &AtomicBool::new(false),
+        );
+        let cap = run_full(dirs, 1024 * 1024, 1024);
+        let loaded: Vec<_> = cap.loaded.into_iter().flatten().collect();
+        let watch_only: Vec<_> = cap.watch_only.into_iter().flatten().collect();
+
+        assert_eq!(count, 3);
+        assert_eq!(loaded.len(), 3, "{loaded:?}");
+        assert!(loaded.iter().all(|path| {
+            !AsRef::<Path>::as_ref(&path.0).starts_with(AsRef::<Path>::as_ref(&root).join(".tmp"))
+        }));
+        assert!(watch_only.is_empty(), "an excluded XML reached the watch-only batch");
+        assert!(loaded
+            .iter()
+            .any(|path| AsRef::<Path>::as_ref(&path.0).ends_with(".tmp2/Visible.bsl")));
+        assert!(loaded
+            .iter()
+            .any(|path| AsRef::<Path>::as_ref(&path.0).ends_with(".buildfoo/Visible.bsl")));
+        assert!(loaded.iter().all(|path| {
+            [".git", "build", ".vscode"]
+                .into_iter()
+                .all(|legacy| !AsRef::<Path>::as_ref(&path.0).starts_with(root_path.join(legacy)))
+        }));
+        assert!(cap.walked_dirs.iter().any(|path| path.as_path() == root_path));
+        assert!(
+            cap.walked_dirs
+                .iter()
+                .all(|path| { !AsRef::<Path>::as_ref(path).starts_with(root_path.join(".tmp")) }),
+            "the initial loader entered the hard-excluded directory: {:?}",
+            cap.walked_dirs
+        );
+        assert!(
+            cap.walked_dirs.iter().any(|path| AsRef::<Path>::as_ref(path).ends_with(".tmp2")),
+            "the initial loader did not visit the allowed prefix sibling: {:?}",
+            cap.walked_dirs
+        );
     }
 
     fn actor_with_watched_dirs(dirs: Vec<loader::Directories>) -> NotifyActor {
@@ -1361,6 +1685,7 @@ mod tests {
             extensions: content_ext.iter().map(|s| (*s).to_string()).collect(),
             include: vec![root.clone()],
             exclude: vec![],
+            hard_exclude: Default::default(),
             rules,
         }
     }
@@ -1446,6 +1771,136 @@ mod tests {
         assert_eq!(
             actor.watch_target(outside.as_ref() as &std::path::Path),
             Some((outside_dir.path().to_path_buf(), RecursiveMode::NonRecursive))
+        );
+    }
+
+    #[test]
+    fn a_future_hard_exclusion_narrows_ancestors_and_is_never_watched() {
+        let guard = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::assert_utf8(guard.path().canonicalize().unwrap());
+        let hidden = AsRef::<Path>::as_ref(&root).join("hidden");
+        let future = AsRef::<Path>::as_ref(&root).join("future/deep");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::create_dir_all(AsRef::<Path>::as_ref(&root).join("allowed")).unwrap();
+        let mut dirs = dirs_for(&root, &["bsl"], &["xml"]);
+        dirs.hard_exclude = ExcludedPaths::new([hidden.clone(), future.clone()]);
+        let mut actor = actor_with_watched_dirs(vec![dirs]);
+
+        assert_eq!(
+            actor.watch_target(AsRef::<Path>::as_ref(&root)),
+            Some((AsRef::<Path>::as_ref(&root).to_path_buf(), RecursiveMode::NonRecursive))
+        );
+        assert_eq!(actor.watch_target(&hidden), None);
+        assert_eq!(
+            actor.watch_target(&AsRef::<Path>::as_ref(&root).join("allowed")),
+            Some((AsRef::<Path>::as_ref(&root).join("allowed"), RecursiveMode::Recursive))
+        );
+
+        give_a_live_watcher(&mut actor);
+        actor.watch(AsRef::<Path>::as_ref(&root));
+        let registered = registered_of(&actor);
+        assert!(
+            registered.iter().all(|(path, mode)| {
+                *mode != RecursiveMode::Recursive
+                    || (!hidden.starts_with(path) && !future.starts_with(path))
+            }),
+            "recursive watch crosses an exclusion: {registered:?}"
+        );
+        assert!(registered.keys().all(|path| !path.starts_with(&hidden)));
+
+        let hidden_runtime = hidden.join("RuntimeHidden.bsl");
+        let allowed_runtime = AsRef::<Path>::as_ref(&root).join("allowed/RuntimeAllowed.bsl");
+        std::fs::write(&hidden_runtime, "").unwrap();
+        std::fs::write(&allowed_runtime, "").unwrap();
+        let (_, receiver) = actor.watcher.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut delivered = Vec::new();
+        while std::time::Instant::now() < deadline
+            && !delivered.iter().any(|path: &PathBuf| path.ends_with("RuntimeAllowed.bsl"))
+        {
+            if let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_millis(50)) {
+                delivered.extend(event.paths);
+            }
+        }
+        while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_millis(100)) {
+            delivered.extend(event.paths);
+        }
+        assert!(
+            delivered.iter().any(|path| path.ends_with("RuntimeAllowed.bsl")),
+            "positive control: the real loader watcher missed the allowed write: {delivered:?}"
+        );
+        assert!(
+            delivered.iter().all(|path| !path.ends_with("RuntimeHidden.bsl")),
+            "the real loader watcher delivered an excluded write: {delivered:?}"
+        );
+    }
+
+    #[test]
+    fn a_hard_exclusion_equal_to_the_watch_root_registers_nothing() {
+        let guard = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::assert_utf8(guard.path().canonicalize().unwrap());
+        let root_path = AsRef::<Path>::as_ref(&root);
+        let mut dirs = dirs_for(&root, &["bsl"], &["xml"]);
+        dirs.hard_exclude = ExcludedPaths::new([root_path.to_path_buf()]);
+        let mut actor = actor_with_watched_dirs(vec![dirs.clone()]);
+        give_a_live_watcher(&mut actor);
+
+        actor.watch(root.as_path().as_ref());
+
+        assert!(registered_of(&actor).is_empty(), "an excluded root was watched");
+        assert_eq!(
+            NotifyActor::count_files_in_entry(
+                &loader::Entry::Directories(dirs.clone()),
+                &AtomicBool::new(false),
+            ),
+            0
+        );
+        let loaded = run_full(dirs, 1024 * 1024, 1024);
+        assert!(loaded.loaded.is_empty());
+        assert!(loaded.watch_only.is_empty());
+        assert!(loaded.walked_dirs.is_empty(), "an excluded root was traversed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_excluded_v8_import_directory_can_be_deleted_and_recreated_on_windows() {
+        let guard = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::assert_utf8(guard.path().canonicalize().unwrap());
+        let root_path = AsRef::<Path>::as_ref(&root);
+        let service_parent = root_path.join(".v8vscedit");
+        let import = service_parent.join("import-temp");
+        let allowed = root_path.join("allowed");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::create_dir_all(&allowed).unwrap();
+        let mut dirs = dirs_for(&root, &["bsl"], &[]);
+        dirs.hard_exclude = ExcludedPaths::new([import.clone()]);
+        let mut actor = actor_with_watched_dirs(vec![dirs]);
+        give_a_live_watcher(&mut actor);
+        actor.watch(root_path);
+
+        for round in 0..3 {
+            std::fs::write(import.join(format!("Hidden{round}.bsl")), "").unwrap();
+            std::fs::remove_dir_all(&service_parent)
+                .expect("the server must not hold a handle inside the excluded service tree");
+            std::fs::create_dir_all(&import).unwrap();
+        }
+
+        let allowed_file = allowed.join("StillWatched.bsl");
+        std::fs::write(&allowed_file, "").unwrap();
+        let (_, receiver) = actor.watcher.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut delivered = Vec::new();
+        while std::time::Instant::now() < deadline
+            && !delivered.iter().any(|path: &PathBuf| path == &allowed_file)
+        {
+            if let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_millis(50)) {
+                delivered.extend(event.paths);
+            }
+        }
+        assert!(delivered.iter().any(|path| path == &allowed_file), "{delivered:?}");
+        assert!(
+            delivered.iter().all(|path| path == &import || !path.starts_with(&import)),
+            "{delivered:?}"
         );
     }
 
@@ -1656,6 +2111,7 @@ mod tests {
                 extensions: vec!["txt".to_string()],
                 include: vec![AbsPathBuf::assert_utf8(root.to_path_buf())],
                 exclude: vec![],
+                hard_exclude: Default::default(),
                 rules: Vec::new(),
             })],
             watch: vec![0],

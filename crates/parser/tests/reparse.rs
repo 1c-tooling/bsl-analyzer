@@ -315,6 +315,50 @@ fn each_guard_refuses_an_input_that_would_otherwise_splice_wrong() {
 }
 
 #[test]
+fn inline_directive_edit_is_reparsed_locally_and_matches_full_parse() {
+    let old_text = r#"Функция Тест(Данные)
+    Возврат Новый Структура(
+        "Ссылка",
+        #Удаление
+        Данные.Ссылка,
+        #КонецУдаления
+        #Вставка
+        Данные.НоваяСсылка);
+        #КонецВставки
+КонецФункции"#;
+    let new_text = old_text.replace("НоваяСсылка", "АктуальнаяСсылка");
+    let old = parser::parse_with_shared_cache(old_text);
+    let edit = edit_between(old_text, &new_text).expect("name edit");
+    let spliced = reparse_method(&old, old_text, &new_text, edit)
+        .expect("an active-name edit inside balanced markers must use local reparse");
+    let full = parser::parse_with_shared_cache(&new_text);
+    assert_same(&spliced, &full, &new_text, "inline active-name edit");
+    assert!(spliced.syntax_node().text().to_string().contains("АктуальнаяСсылка"));
+}
+
+#[test]
+fn deleting_inline_closing_marker_refuses_local_reparse() {
+    let old_text = r#"Функция Тест()
+    Возврат 1
+    #Вставка
+    + 2
+    #КонецВставки;
+КонецФункции"#;
+    let new_text = old_text.replace("#КонецВставки", "");
+    let old = parser::parse_with_shared_cache(old_text);
+    let edit = edit_between(old_text, &new_text).expect("marker deletion");
+    assert_eq!(
+        reparse_method(&old, old_text, &new_text, edit).err(),
+        Some(Refusal::Preprocessor),
+        "an unbalanced method must fall back to the authoritative full parse"
+    );
+    assert!(
+        parser::parse_with_shared_cache(&new_text).has_errors(),
+        "the full parse must expose the now-unclosed insertion"
+    );
+}
+
+#[test]
 fn edit_between_finds_the_change() {
     assert_eq!(edit_between("абв", "абв"), None);
     let e = edit_between("aa", "aaa").unwrap();

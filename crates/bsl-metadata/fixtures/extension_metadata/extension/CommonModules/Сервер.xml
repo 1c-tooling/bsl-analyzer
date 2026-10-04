@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+  <CommonModule uuid="15500000-0000-0000-0000-000000000120">
+    <Properties>
+      <Name>Сервер</Name>
+      <ObjectBelonging>Adopted</ObjectBelonging>
+      <ExtendedConfigurationObject>15500000-0000-0000-0000-000000000020</ExtendedConfigurationObject>
+      <Server>false</Server>
+      <Global>false</Global>
+      <ExternalConnection>false</ExternalConnection>
+      <ServerCall>false</ServerCall>
+    </Properties>
+  </CommonModule>
+</MetaDataObject>

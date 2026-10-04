@@ -96,8 +96,8 @@ pub use hir_def::metrics;
 pub mod cfg {
     pub use ::cfg::{
         cyclomatic_complexity, BasicBlockVertex, CfgBuilder, CfgEdgeType, CfgVertex,
-        ConditionalVertex, ControlFlowGraph, ForEachLoopVertex, ForLoopVertex, LabelVertex,
-        NodeIndex, PreprocConditionVertex, TryExceptVertex, WhileLoopVertex,
+        ConditionalVertex, ControlFlowGraph, ForEachHeaderVertex, ForHeaderVertex, NodeIndex,
+        PreprocConditionVertex, WhileHeaderVertex,
     };
 }
 

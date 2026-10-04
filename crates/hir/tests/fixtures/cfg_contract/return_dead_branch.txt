@@ -1,0 +1,37 @@
+complexity: 1
+live: {0, 1}
+dead: [2, 3, 4]
+evaluations: {"s4": {"condition=ExprId(2)"}}
+expr ExprId(0): Some(LocalRange(27..31))
+expr ExprId(1): Some(LocalRange(34..46))
+expr ExprId(2): Some(LocalRange(73..77))
+expr ExprId(3): Some(LocalRange(90..91))
+expr ExprId(4): Some(LocalRange(94..95))
+expr ExprId(5): Some(LocalRange(109..110))
+expr ExprId(6): Some(LocalRange(113..114))
+transitions:
+  s0 -> s1
+  s1 -> exit
+  s2 -> exit
+  s3 -> exit
+  s4 F -> s3
+  s4 T -> s2
+definitions (limit 3):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some([])
+  s3: Some([])
+  s4: None
+definitions (limit 10000):
+  s0: Some([])
+  s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s3: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s4: None
+source states:
+  s0: range=Some(LocalRange(27..46)); fallthrough=false; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s1: range=Some(LocalRange(48..63)); fallthrough=false; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s2: range=Some(LocalRange(90..95)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s3: range=Some(LocalRange(109..114)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+  s4: range=Some(LocalRange(64..135)); fallthrough=true; value=(true,Some(Bool(true))); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
+exit security: Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

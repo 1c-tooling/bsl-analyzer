@@ -390,14 +390,11 @@ impl Configuration {
 
     pub fn merge_extension_overlay(&mut self, extension: &Configuration) {
         for ext_module in &extension.common_modules {
-            if ext_module.object_belonging() == crate::ObjectBelonging::Adopted {
-                if let Some(base_module) = self.common_modules.iter_mut().find(|module| {
-                    Some(module.uuid()) == ext_module.extends_uuid()
-                        && module.name().eq_ignore_ascii_case(ext_module.name())
-                }) {
-                    base_module.apply_extension_overlay(ext_module);
-                    continue;
-                }
+            if let Some(base_module) =
+                self.common_modules.iter_mut().find(|module| ext_module.adopts(module))
+            {
+                base_module.apply_extension_overlay(ext_module);
+                continue;
             }
             self.add_common_module(ext_module.clone());
         }
@@ -417,7 +414,7 @@ impl Configuration {
         for ext_reg in &extension.registers {
             if let Some(idx) = self.registers.iter().position(|base| {
                 base.mdo_type() == ext_reg.mdo_type()
-                    && base.name().eq_ignore_ascii_case(ext_reg.name())
+                    && stdx::case::eq_ignore_case(base.name(), ext_reg.name())
             }) {
                 // An extension can add measurements/resources/attributes to a
                 // borrowed register, so merge rather than ignore the adopted copy.
@@ -431,7 +428,7 @@ impl Configuration {
             if let Some(idx) = self
                 .defined_types
                 .iter()
-                .position(|base| base.name().eq_ignore_ascii_case(ext_defined_type.name()))
+                .position(|base| stdx::case::eq_ignore_case(base.name(), ext_defined_type.name()))
             {
                 // An extension can refine a borrowed defined type's composition, so
                 // take the extension's underlying type rather than ignore it.
@@ -746,7 +743,7 @@ fn index_document_recorders(
     for (register_type, register_name) in object.register_records() {
         let key = (*register_type, register_name.fold_lower());
         let documents = recorders_by_register.entry(key).or_default();
-        if !documents.iter().any(|name| name.eq_ignore_ascii_case(&object.name)) {
+        if !documents.iter().any(|name| stdx::case::eq_ignore_case(name, &object.name)) {
             documents.push(object.name.clone());
         }
     }
@@ -913,6 +910,13 @@ mod tests {
         let mut base = Configuration::new("Base");
         let base_module = CommonModule::builder()
             .name("Shared")
+            .server(true)
+            .global(true)
+            .client_managed_application(true)
+            .client_ordinary_application(true)
+            .external_connection(true)
+            .server_call(true)
+            .privileged(true)
             .return_values_reuse(ReturnValueReuse::DontUse)
             .build();
         let base_uuid = *base_module.uuid();
@@ -927,10 +931,15 @@ mod tests {
                 .build(),
         );
         let inherited = base.merged_with_extension(&adopted);
-        assert_eq!(
-            inherited.find_common_module("Shared").unwrap().return_values_reuse(),
-            ReturnValueReuse::DontUse,
-        );
+        let inherited_module = inherited.find_common_module("Shared").unwrap();
+        assert_eq!(inherited_module.return_values_reuse(), ReturnValueReuse::DontUse);
+        assert!(inherited_module.is_server());
+        assert!(inherited_module.is_global());
+        assert!(inherited_module.is_client_managed_application());
+        assert!(inherited_module.is_client_ordinary_application());
+        assert!(inherited_module.is_external_connection());
+        assert!(inherited_module.is_server_call());
+        assert!(inherited_module.is_privileged());
 
         let mut explicit = Configuration::new("Explicit");
         explicit.add_common_module(
@@ -950,10 +959,45 @@ mod tests {
         let mut independent = Configuration::new("Independent");
         independent.add_common_module(CommonModule::builder().name("Shared").build());
         let not_merged = base.merged_with_extension(&independent);
-        assert_eq!(
-            not_merged.find_common_module("Shared").unwrap().return_values_reuse(),
-            ReturnValueReuse::Unknown,
+        assert_eq!(not_merged.common_modules().len(), 2, "an own namesake remains independent");
+        let own =
+            not_merged.common_modules().iter().find(|module| module.uuid() != &base_uuid).unwrap();
+        assert_eq!(own.return_values_reuse(), ReturnValueReuse::Unknown);
+        assert!(!own.is_server());
+        assert!(!own.is_global());
+        assert!(!own.is_client_managed_application());
+        assert!(!own.is_client_ordinary_application());
+        assert!(!own.is_external_connection());
+        assert!(!own.is_server_call());
+        assert!(!own.is_privileged());
+        let preserved_base =
+            not_merged.common_modules().iter().find(|module| module.uuid() == &base_uuid).unwrap();
+        assert!(preserved_base.is_server());
+        assert_eq!(preserved_base.return_values_reuse(), ReturnValueReuse::DontUse);
+
+        let mut wrong_target = Configuration::new("WrongTarget");
+        wrong_target.add_common_module(
+            CommonModule::builder()
+                .name("Shared")
+                .object_belonging(ObjectBelonging::Adopted)
+                .extends_uuid(uuid::Uuid::new_v4())
+                .build(),
         );
+        let wrong_target_result = base.merged_with_extension(&wrong_target);
+        assert_eq!(
+            wrong_target_result.common_modules().len(),
+            2,
+            "an adopted namesake targeting another UUID must not merge"
+        );
+        assert!(wrong_target_result
+            .common_modules()
+            .iter()
+            .any(|module| module.uuid() == &base_uuid && module.is_server()));
+        assert!(wrong_target_result.common_modules().iter().any(|module| {
+            module.uuid() != &base_uuid
+                && !module.is_server()
+                && module.return_values_reuse() == ReturnValueReuse::Unknown
+        }));
     }
 
     #[test]
@@ -1028,6 +1072,27 @@ mod tests {
             .unwrap()
             .find_attribute("СвоеПоле")
             .is_some());
+        let mut wrong_target = Configuration::new("WrongTarget");
+        let mut wrong_document = MetadataObject::new(MdoType::Document, "Заказ");
+        wrong_document.set_object_belonging(ObjectBelonging::Adopted);
+        wrong_document.set_extends_uuid(uuid::Uuid::new_v4());
+        wrong_document.add_attribute(Attribute {
+            name: "ЧужоеПоле".into(),
+            name_en: None,
+            attr_type: AttributeType::Boolean,
+        });
+        wrong_target.add_metadata_object(wrong_document);
+        let wrong_target_result = base.merged_with_extension(&wrong_target);
+        assert_eq!(
+            wrong_target_result.metadata_objects().len(),
+            2,
+            "an adopted namesake targeting another UUID must remain independent"
+        );
+        assert!(wrong_target_result.metadata_objects().iter().all(|object| {
+            !(object.find_attribute("Основание").is_some()
+                && object.find_attribute("ЧужоеПоле").is_some())
+        }));
+
         let second_extension = Configuration::new("SecondExtension");
         let after_second_merge = separate.merged_with_extension(&second_extension);
         assert!(
@@ -1095,6 +1160,330 @@ mod tests {
             merged.find_metadata_object(MdoType::Constant, "Флаг").unwrap().constant_type,
             Some(AttributeType::Boolean),
             "base constant type must survive an adopted copy without <Type>"
+        );
+    }
+
+    #[test]
+    fn extension_metadata_whole_configuration_merges_document_and_tabular_fields() {
+        use crate::enums::ObjectBelonging;
+        use crate::metadata_object::Attribute;
+        use crate::tabular_section::{TabularSection, TabularSectionAttribute};
+        use uuid::Uuid;
+
+        let mut base = Configuration::new("Base");
+        let base_document_uuid = Uuid::new_v4();
+        let mut base_document = MetadataObject::new(MdoType::Document, "Заказ");
+        base_document.set_uuid(base_document_uuid);
+        base_document.add_attribute(Attribute {
+            name: "БазовыйРеквизит".to_string(),
+            name_en: None,
+            attr_type: AttributeType::String { length: Some(20) },
+        });
+        let mut base_goods = TabularSection::new(Uuid::new_v4(), "Товары");
+        base_goods.set_name_en(Some("BaseGoods".to_string()));
+        base_goods.set_synonym(Some("Базовые товары".to_string()));
+        base_goods.set_use_mode(Some("ForItem".to_string()));
+        base_goods.set_attributes(vec![
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "Номенклатура",
+                AttributeType::String { length: Some(50) },
+            ),
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "Количество",
+                AttributeType::Number { precision: 10, scale: 0 },
+            ),
+        ]);
+        base_document.add_tabular_section(base_goods);
+        base.add_metadata_object(base_document);
+
+        let mut without_section = Configuration::new("WithoutSection");
+        let mut doc_without_section = MetadataObject::new(MdoType::Document, "Заказ");
+        doc_without_section.set_object_belonging(ObjectBelonging::Adopted);
+        doc_without_section.set_extends_uuid(base_document_uuid);
+        doc_without_section.add_attribute(Attribute {
+            name: "РасшРеквизит".to_string(),
+            name_en: None,
+            attr_type: AttributeType::String { length: Some(30) },
+        });
+        without_section.add_metadata_object(doc_without_section);
+        let inherited = base.merged_with_extension(&without_section);
+        let inherited_goods = inherited
+            .find_metadata_object(MdoType::Document, "Заказ")
+            .unwrap()
+            .find_tabular_section("Товары")
+            .unwrap();
+        assert_eq!(
+            inherited_goods
+                .attributes()
+                .iter()
+                .map(|attribute| (attribute.name(), attribute.attr_type()))
+                .collect::<Vec<_>>(),
+            [
+                ("Номенклатура", &AttributeType::String { length: Some(50) }),
+                ("Количество", &AttributeType::Number { precision: 10, scale: 0 }),
+            ],
+            "an extension without the borrowed section keeps the exact base shape"
+        );
+
+        let mut extension = Configuration::new("Extension");
+        let mut extension_document = MetadataObject::new(MdoType::Document, "Заказ");
+        extension_document.set_object_belonging(ObjectBelonging::Adopted);
+        extension_document.set_extends_uuid(base_document_uuid);
+        extension_document.add_attribute(Attribute {
+            name: "РасшРеквизит".to_string(),
+            name_en: None,
+            attr_type: AttributeType::String { length: Some(30) },
+        });
+        let mut extension_goods = TabularSection::new(Uuid::new_v4(), "Товары");
+        extension_goods.set_name_en(Some("ExtensionGoods".to_string()));
+        extension_goods.set_synonym(Some("Товары расширения".to_string()));
+        extension_goods.set_use_mode(Some("ForFolder".to_string()));
+        extension_goods.set_attributes(vec![
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "Количество",
+                AttributeType::String { length: Some(15) },
+            ),
+            TabularSectionAttribute::new(
+                Uuid::new_v4(),
+                "РасшПоле",
+                AttributeType::String { length: Some(25) },
+            ),
+        ]);
+        extension_document.add_tabular_section(extension_goods);
+        let mut new_section = TabularSection::new(Uuid::new_v4(), "РасшТаблица");
+        new_section.set_attributes(vec![TabularSectionAttribute::new(
+            Uuid::new_v4(),
+            "Добавлено",
+            AttributeType::String { length: None },
+        )]);
+        extension_document.add_tabular_section(new_section);
+        extension.add_metadata_object(extension_document);
+
+        let merged = base.merged_with_extension(&extension);
+        let document = merged.find_metadata_object(MdoType::Document, "Заказ").unwrap();
+        assert!(document.find_attribute("БазовыйРеквизит").is_some());
+        assert!(document.find_attribute("РасшРеквизит").is_some());
+        let goods = document.find_tabular_section("Товары").unwrap();
+        assert_eq!(goods.name_en(), Some("ExtensionGoods"));
+        assert_eq!(goods.synonym(), Some("Товары расширения"));
+        assert_eq!(goods.use_mode(), Some("ForFolder"));
+        assert_eq!(
+            goods.attributes().iter().map(TabularSectionAttribute::name).collect::<Vec<_>>(),
+            ["Номенклатура", "Количество", "РасшПоле"]
+        );
+        assert_eq!(
+            goods.attributes()[0].attr_type(),
+            &AttributeType::String { length: Some(50) },
+            "the inherited base column keeps its exact type"
+        );
+        assert!(matches!(
+            goods.attributes()[1].attr_type(),
+            AttributeType::String { length: Some(15) }
+        ));
+        assert_eq!(
+            goods.attributes().iter().filter(|attribute| attribute.name() == "Количество").count(),
+            1,
+            "the overlay replacement must not duplicate a same-named field"
+        );
+        let added = document.find_tabular_section("РасшТаблица").unwrap();
+        assert_eq!(added.attributes().len(), 1);
+        assert_eq!(added.attributes()[0].name(), "Добавлено");
+        assert_eq!(added.attributes()[0].attr_type(), &AttributeType::String { length: None });
+
+        for only in 0..3 {
+            let mut base_section = TabularSection::new(Uuid::new_v4(), "Товары");
+            base_section.set_name_en(Some("BaseGoods".to_string()));
+            base_section.set_synonym(Some("Базовые товары".to_string()));
+            base_section.set_use_mode(Some("ForItem".to_string()));
+            let base_uuid = Uuid::new_v4();
+            let mut base_document = MetadataObject::new(MdoType::Document, "Заказ");
+            base_document.set_uuid(base_uuid);
+            base_document.add_tabular_section(base_section);
+            let mut base_config = Configuration::new("Base");
+            base_config.add_metadata_object(base_document);
+
+            let mut overlay_section = TabularSection::new(Uuid::new_v4(), "Товары");
+            match only {
+                0 => overlay_section.set_name_en(Some("ExtensionGoods".to_string())),
+                1 => overlay_section.set_synonym(Some("Товары расширения".to_string())),
+                _ => overlay_section.set_use_mode(Some("ForFolder".to_string())),
+            }
+            let mut overlay_document = MetadataObject::new(MdoType::Document, "Заказ");
+            overlay_document.set_object_belonging(ObjectBelonging::Adopted);
+            overlay_document.set_extends_uuid(base_uuid);
+            overlay_document.add_tabular_section(overlay_section);
+            let mut overlay_config = Configuration::new("Extension");
+            overlay_config.add_metadata_object(overlay_document);
+
+            let merged = base_config.merged_with_extension(&overlay_config);
+            let section = merged
+                .find_metadata_object(MdoType::Document, "Заказ")
+                .unwrap()
+                .find_tabular_section("Товары")
+                .unwrap();
+            assert_eq!(
+                section.name_en(),
+                Some(if only == 0 { "ExtensionGoods" } else { "BaseGoods" })
+            );
+            assert_eq!(
+                section.synonym(),
+                Some(if only == 1 {
+                    "Товары расширения"
+                } else {
+                    "Базовые товары"
+                })
+            );
+            assert_eq!(section.use_mode(), Some(if only == 2 { "ForFolder" } else { "ForItem" }));
+        }
+    }
+
+    #[test]
+    fn extension_metadata_merge_is_cyrillic_case_insensitive() {
+        use crate::enums::ObjectBelonging;
+        use crate::metadata_object::Attribute;
+        use crate::tabular_section::{TabularSection, TabularSectionAttribute};
+
+        let document_uuid = Uuid::new_v4();
+        let common_module_uuid = Uuid::new_v4();
+        let mut base_document = MetadataObject::new(MdoType::Document, "Заказ");
+        base_document.set_uuid(document_uuid);
+        let mut base_section = TabularSection::new(Uuid::new_v4(), "Товары");
+        base_section.set_attributes(vec![TabularSectionAttribute::new(
+            Uuid::new_v4(),
+            "Номенклатура",
+            AttributeType::String { length: Some(20) },
+        )]);
+        base_document.add_tabular_section(base_section);
+        let mut base = Configuration::new("Base");
+        base.add_metadata_object(base_document);
+        base.add_common_module(
+            CommonModule::builder()
+                .uuid(common_module_uuid)
+                .name("Сервер")
+                .return_values_reuse(ReturnValueReuse::DontUse)
+                .build(),
+        );
+
+        let mut overlay_document = MetadataObject::new(MdoType::Document, "заказ");
+        overlay_document.set_object_belonging(ObjectBelonging::Adopted);
+        overlay_document.set_extends_uuid(document_uuid);
+        overlay_document.add_attribute(Attribute {
+            name: "Расширение".to_string(),
+            name_en: None,
+            attr_type: AttributeType::Boolean,
+        });
+        let mut overlay_section = TabularSection::new(Uuid::new_v4(), "товары");
+        overlay_section.set_attributes(vec![TabularSectionAttribute::new(
+            Uuid::new_v4(),
+            "номенклатура",
+            AttributeType::Number { precision: 10, scale: 0 },
+        )]);
+        overlay_document.add_tabular_section(overlay_section);
+        let mut extension = Configuration::new("Extension");
+        extension.add_metadata_object(overlay_document);
+        extension.add_common_module(
+            CommonModule::builder()
+                .name("сервер")
+                .object_belonging(ObjectBelonging::Adopted)
+                .extends_uuid(common_module_uuid)
+                .return_values_reuse(ReturnValueReuse::DuringRequest)
+                .build(),
+        );
+
+        let merged = base.merged_with_extension(&extension);
+        assert_eq!(merged.metadata_objects().len(), 1, "Заказ and заказ are one object");
+        assert_eq!(merged.common_modules().len(), 1, "Сервер and сервер are one module");
+        let document = merged.find_metadata_object(MdoType::Document, "ЗАКАЗ").unwrap();
+        assert!(document.find_attribute("РАСШИРЕНИЕ").is_some());
+        assert_eq!(document.tabular_sections.len(), 1, "Товары and товары are one section");
+        let section = document.find_tabular_section("ТОВАРЫ").unwrap();
+        assert_eq!(section.attributes().len(), 1, "field casing must not create a duplicate");
+        assert_eq!(
+            section.attributes()[0].attr_type(),
+            &AttributeType::Number { precision: 10, scale: 0 },
+            "the case-variant overlay field replaces the base field"
+        );
+        assert_eq!(
+            merged.find_common_module("СЕРВЕР").unwrap().return_values_reuse(),
+            ReturnValueReuse::DuringRequest
+        );
+    }
+
+    #[test]
+    fn extension_metadata_xml_empty_borrowed_sections_preserve_base_shape() {
+        let base_xml = include_str!("../fixtures/extension_metadata/base/Documents/Заказ.xml");
+        let base_document = crate::xml_parser::parse_document_xml(base_xml).unwrap();
+        let overlay_xml = |child_objects: &str| {
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+<Document uuid="15500000-0000-0000-0000-000000000400">
+<Properties><Name>Заказ</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>15500000-0000-0000-0000-000000000010</ExtendedConfigurationObject></Properties>
+<ChildObjects><TabularSection uuid="15500000-0000-0000-0000-000000000401">
+<Properties><Name>Товары</Name></Properties>{child_objects}
+</TabularSection></ChildObjects></Document></MetaDataObject>"#
+            )
+        };
+
+        for child_objects in ["", "<ChildObjects/>", "<ChildObjects></ChildObjects>"] {
+            let overlay_document =
+                crate::xml_parser::parse_document_xml(&overlay_xml(child_objects)).unwrap();
+            let standalone = overlay_document.find_tabular_section("Товары").unwrap();
+            assert!(standalone.attributes().is_empty(), "standalone empty section stays empty");
+
+            let mut base = Configuration::new("Base");
+            base.add_metadata_object(base_document.clone());
+            let mut extension = Configuration::new("Extension");
+            extension.add_metadata_object(overlay_document);
+            let merged = base.merged_with_extension(&extension);
+            let goods = merged
+                .find_metadata_object(MdoType::Document, "Заказ")
+                .unwrap()
+                .find_tabular_section("Товары")
+                .unwrap();
+            assert_eq!(goods.attributes().len(), 2);
+            assert_eq!(
+                goods.attributes()[0].attr_type(),
+                &AttributeType::String { length: Some(50) }
+            );
+            assert_eq!(
+                goods.attributes()[1].attr_type(),
+                &AttributeType::Number { precision: 10, scale: 0 }
+            );
+            assert_eq!(goods.synonym(), Some("Товары базы"));
+            assert_eq!(goods.use_mode(), Some("ForItem"));
+        }
+
+        let overlay_without_sections = crate::xml_parser::parse_document_xml(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+<Document uuid="15500000-0000-0000-0000-000000000402">
+<Properties><Name>Заказ</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>15500000-0000-0000-0000-000000000010</ExtendedConfigurationObject></Properties><ChildObjects/>
+</Document></MetaDataObject>"#,
+        )
+        .unwrap();
+        let mut base = Configuration::new("Base");
+        base.add_metadata_object(base_document);
+        let mut extension = Configuration::new("Extension");
+        extension.add_metadata_object(overlay_without_sections);
+        let merged = base.merged_with_extension(&extension);
+        let goods = merged
+            .find_metadata_object(MdoType::Document, "Заказ")
+            .unwrap()
+            .find_tabular_section("Товары")
+            .unwrap();
+        assert_eq!(
+            goods
+                .attributes()
+                .iter()
+                .map(|attribute| (attribute.name(), attribute.attr_type()))
+                .collect::<Vec<_>>(),
+            [
+                ("Номенклатура", &AttributeType::String { length: Some(50) }),
+                ("Количество", &AttributeType::Number { precision: 10, scale: 0 }),
+            ],
+            "a parsed document overlay without any tabular section keeps exact base types"
         );
     }
 

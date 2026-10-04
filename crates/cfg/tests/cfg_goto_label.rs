@@ -2,8 +2,8 @@ use cfg::{CfgBuilder, ControlFlowGraph};
 use expect_test::{expect, Expect};
 use hir_def::{Body, Expr, Literal, Name, Stmt};
 
-fn snapshot(cfg: ControlFlowGraph, expect: Expect) {
-    expect.assert_eq(&cfg::test_utils::format_cfg(&cfg));
+fn snapshot(body: &Body, expect: Expect) {
+    expect.assert_eq(&cfg::test_utils::format_cfg(&build(body), body));
 }
 
 fn build(body: &Body) -> ControlFlowGraph {
@@ -25,7 +25,7 @@ fn forward_and_backward_goto_edges() {
     );
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:GOTO_STMT:0
@@ -37,15 +37,15 @@ fn forward_and_backward_goto_edges() {
               NORMAL:LABEL_STMT:1
               NORMAL:LABEL_STMT:2
             edges:
-              ENTRY:GOTO_STMT:0 -> NORMAL:CALL_STMT:1 [AdjacentCode]
-              ENTRY:GOTO_STMT:0 -> NORMAL:LABEL_STMT:1 [Direct]
-              NORMAL:CALL_STMT:1 -> NORMAL:LABEL_STMT:2 [Direct]
-              NORMAL:CALL_STMT:2 -> EXIT:EMPTY:3 [Direct]
-              NORMAL:EMPTY:4 -> NORMAL:LABEL_STMT:1 [Direct]
-              NORMAL:GOTO_STMT:3 -> NORMAL:EMPTY:4 [AdjacentCode]
-              NORMAL:GOTO_STMT:3 -> NORMAL:LABEL_STMT:2 [Direct]
-              NORMAL:LABEL_STMT:1 -> NORMAL:CALL_STMT:2 [Direct]
-              NORMAL:LABEL_STMT:2 -> NORMAL:GOTO_STMT:3 [Direct]
+              ENTRY:GOTO_STMT:0 -> NORMAL:CALL_STMT:1 [Unexecutable]
+              ENTRY:GOTO_STMT:0 -> NORMAL:LABEL_STMT:1 [Unconditional]
+              NORMAL:CALL_STMT:1 -> NORMAL:LABEL_STMT:2 [Unconditional]
+              NORMAL:CALL_STMT:2 -> EXIT:EMPTY:3 [Unconditional]
+              NORMAL:EMPTY:4 -> NORMAL:LABEL_STMT:1 [Unconditional]
+              NORMAL:GOTO_STMT:3 -> NORMAL:EMPTY:4 [Unexecutable]
+              NORMAL:GOTO_STMT:3 -> NORMAL:LABEL_STMT:2 [Unconditional]
+              NORMAL:LABEL_STMT:1 -> NORMAL:CALL_STMT:2 [Unconditional]
+              NORMAL:LABEL_STMT:2 -> NORMAL:GOTO_STMT:3 [Unconditional]
         "#]],
     );
 }
@@ -64,7 +64,7 @@ fn adjacent_labels_and_multi_label_gotos() {
     );
 
     snapshot(
-        build(&body),
+        &body,
         expect![[r#"
             blocks:
               ENTRY:EMPTY:0
@@ -76,15 +76,15 @@ fn adjacent_labels_and_multi_label_gotos() {
               NORMAL:LABEL_STMT:1
               NORMAL:LABEL_STMT:3
             edges:
-              ENTRY:EMPTY:0 -> NORMAL:LABEL_STMT:1 [Direct]
-              NORMAL:EMPTY:2 -> NORMAL:LABEL_STMT:3 [Direct]
-              NORMAL:EMPTY:6 -> EXIT:EMPTY:7 [AdjacentCode]
-              NORMAL:GOTO_STMT:4 -> NORMAL:GOTO_STMT:5 [AdjacentCode]
-              NORMAL:GOTO_STMT:4 -> NORMAL:LABEL_STMT:3 [Direct]
-              NORMAL:GOTO_STMT:5 -> NORMAL:EMPTY:6 [AdjacentCode]
-              NORMAL:GOTO_STMT:5 -> NORMAL:LABEL_STMT:1 [Direct]
-              NORMAL:LABEL_STMT:1 -> NORMAL:EMPTY:2 [Direct]
-              NORMAL:LABEL_STMT:3 -> NORMAL:GOTO_STMT:4 [Direct]
+              ENTRY:EMPTY:0 -> NORMAL:LABEL_STMT:1 [Unconditional]
+              NORMAL:EMPTY:2 -> NORMAL:LABEL_STMT:3 [Unconditional]
+              NORMAL:EMPTY:6 -> EXIT:EMPTY:7 [Unexecutable]
+              NORMAL:GOTO_STMT:4 -> NORMAL:GOTO_STMT:5 [Unexecutable]
+              NORMAL:GOTO_STMT:4 -> NORMAL:LABEL_STMT:3 [Unconditional]
+              NORMAL:GOTO_STMT:5 -> NORMAL:EMPTY:6 [Unexecutable]
+              NORMAL:GOTO_STMT:5 -> NORMAL:LABEL_STMT:1 [Unconditional]
+              NORMAL:LABEL_STMT:1 -> NORMAL:EMPTY:2 [Unconditional]
+              NORMAL:LABEL_STMT:3 -> NORMAL:GOTO_STMT:4 [Unconditional]
         "#]],
     );
 }
