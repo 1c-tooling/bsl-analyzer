@@ -1622,7 +1622,7 @@ thread_local! {
 /// The cache is keyed by the WALKED directory, not the resolved one, for the same reason
 /// it is there: two links to one tree are two ways to reach the same files, and each file
 /// keeps the spelling the walk actually used to get to it.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn collect_subtree(dir: &Path, records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>) {
     collect_subtree_within(dir, records, &ExcludedPaths::default());
 }

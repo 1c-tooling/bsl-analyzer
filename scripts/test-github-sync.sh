@@ -81,6 +81,7 @@ chmod +x "$BIN_DIR/gh" "$BIN_DIR/codex"
 
 mkdir -p "$SRC/scripts" "$SRC/crates/bsl-launcher"
 cp "$SYNC_SCRIPT" "$SRC/scripts/github-sync.sh"
+cp "$(dirname "$SYNC_SCRIPT")/github-mirror-exclude.txt" "$SRC/scripts/"
 chmod +x "$SRC/scripts/github-sync.sh"
 
 cat > "$SRC/Cargo.toml" <<'EOF'
