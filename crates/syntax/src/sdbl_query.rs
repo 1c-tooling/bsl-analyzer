@@ -88,10 +88,10 @@ impl SdblQueryInfo {
 
 /// Every parse error of an SDBL query, in the coordinates of the query text itself.
 ///
-/// Two sources, and the second is not derivable from the tree: the parser's own
-/// [`ParseError`]s, plus a synthetic one for a reference path that ends on a dot. `ERROR`
-/// nodes carry no `ParseError`, so a consumer that walks the tree instead of calling this
-/// cannot render the same messages.
+/// The parser's own [`ParseError`]s, plus synthetic ones for shapes the tree accepts and the
+/// platform's grammar does not: a reference path that ends on a dot, and a nested query in a
+/// select list. `ERROR` nodes carry no `ParseError`, so a consumer that walks the tree instead
+/// of calling this cannot render the same messages.
 ///
 /// Callers embedding the query in a BSL literal map each range through
 /// [`map_range_query_to_literal`]; a caller validating a bare query text uses them as they are.
@@ -112,7 +112,42 @@ pub fn collect_query_parse_errors(query_ast: &Parse<SyntaxNode>) -> Vec<(TextRan
         }
     }
 
+    for subquery in root.descendants().filter(|node| node.kind() == SyntaxKind::SDBL_SUBQUERY_EXPR)
+    {
+        if is_in_select_list(&subquery) {
+            errors.push((
+                subquery.text_range(),
+                ParseError::Custom {
+                    message: "вложенный запрос в списке полей выборки недопустим: он возможен \
+                              только как источник в ИЗ и справа от В (...)",
+                    recovery: RecoveryKind::Custom,
+                },
+            ));
+        }
+    }
+
     errors
+}
+
+/// Whether a nested query sits in a select list rather than in one of the two places the
+/// platform accepts one inside an expression.
+///
+/// The parser reads `(ВЫБРАТЬ ...)` as an operand anywhere, as SQL does; 1C answers
+/// «Синтаксическая ошибка "ВЫБРАТЬ"» at run time (8.3.17 and 8.3.27). Only the select-list
+/// position is reported — the one attested. The walk up stops at the first `В (...)` /
+/// `В ИЕРАРХИИ (...)`, so the right side of `В` stays unreported wherever it appears, and at the
+/// first enclosing query, so a nested query in a condition of another nested query is judged by
+/// the query it belongs to rather than by the select list that query happens to sit in.
+fn is_in_select_list(subquery: &SyntaxNode) -> bool {
+    for ancestor in subquery.ancestors().skip(1) {
+        match ancestor.kind() {
+            SyntaxKind::SDBL_IN_EXPR | SyntaxKind::SDBL_IN_HIERARCHY_EXPR => return false,
+            SyntaxKind::SDBL_SELECTED_FIELD => return true,
+            SyntaxKind::SDBL_SUBQUERY => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn trailing_dot_range(refs: &SyntaxNode) -> Option<TextRange> {
