@@ -1,4 +1,4 @@
-use hir::{Builders, HirDatabase, InferenceDiagnostic, Name, TypeId, TypeKernelDb, TypeKind};
+use hir::{Builders, HirDatabase, InferenceDiagnostic, Name, Type, TypeId, TypeKernelDb, TypeKind};
 use ide::{Analysis, CompletionItem, CompletionItemKind};
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
@@ -396,6 +396,20 @@ fn value_table_row_column_assignment_no_diagnostic() {
 КонецФункции
 ";
     let (db, file_id) = setup_inline(code);
+    // Without a resolved column the assignment is silent for any readonly flag, so pin the
+    // receiver to a projected value-table row first.
+    let row = var_ty(&db, file_id, "стр").expect("стр must be inferred");
+    assert!(
+        matches!(db.lookup_type(row), TypeKind::ValueTableRow(ref f) if f.projection.is_some()),
+        "стр must be a projected value-table row, got {:?}",
+        db.lookup_type(row)
+    );
+    let fields = Type::from_id(&db, file_id, row).fields();
+    let code_col = fields
+        .iter()
+        .find(|f| f.name.as_str() == "Код")
+        .unwrap_or_else(|| panic!("row must enumerate column `Код`, got {fields:?}"));
+    assert!(!code_col.is_readonly, "enumerated value-table row column must be writable");
     let diags = readonly_diagnostics(&db, file_id);
     assert!(diags.is_empty(), "a value-table row column is writable, got: {diags:?}");
 }
