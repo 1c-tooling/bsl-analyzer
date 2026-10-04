@@ -2,6 +2,7 @@ pub mod capability;
 mod db;
 pub mod deprecation;
 mod global_catalog;
+mod parameter_series;
 pub mod security;
 pub mod standard_mdo_attributes;
 mod types;
@@ -34,6 +35,7 @@ pub use global_catalog::{
     PlatformGlobalKind, PlatformGlobalSymbol, PlatformSymbolCapabilities, PlatformVersion,
     PlatformVersionParseError,
 };
+pub use parameter_series::ParameterSeries;
 pub use types::*;
 
 pub fn split_type_alternatives(raw: &str) -> Vec<&str> {

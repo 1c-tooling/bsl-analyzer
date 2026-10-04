@@ -195,6 +195,7 @@ fn minimal_signature(
                 is_hyperlink: false,
             }],
             is_optional: param.has_default,
+            is_variadic: param.mode == hir::CallParamMode::Variadic,
             default_value: None,
             description: None,
             is_val: false,
