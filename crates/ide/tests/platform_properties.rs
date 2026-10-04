@@ -380,3 +380,44 @@ fn unload_column_string_arg_does_not_emit_type_mismatch() {
          Got: {mismatches:#?}",
     );
 }
+
+/// Columns of a row taken from an unloaded query result are ordinary value-table columns: the
+/// platform accepts `Стр.Код = ...` there, so only the query-result cursor is read-only.
+#[test]
+fn value_table_row_column_assignment_no_diagnostic() {
+    let code = "\
+Функция ДанныеСчетов()
+    Запрос = Новый Запрос(\"ВЫБРАТЬ \"\" 01 \"\" КАК Код\");
+    Т = Запрос.Выполнить().Выгрузить();
+    Для Каждого Стр Из Т Цикл
+        Стр.Код = СокрЛП(Стр.Код);
+    КонецЦикла;
+    Возврат Т;
+КонецФункции
+";
+    let (db, file_id) = setup_inline(code);
+    let diags = readonly_diagnostics(&db, file_id);
+    assert!(diags.is_empty(), "a value-table row column is writable, got: {diags:?}");
+}
+
+#[test]
+fn query_selection_field_assignment_still_emits_diagnostic() {
+    let code = "\
+Процедура Тест()
+    Запрос = Новый Запрос(\"ВЫБРАТЬ \"\" 01 \"\" КАК Код\");
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Выборка.Код = СокрЛП(Выборка.Код);
+    КонецЦикла;
+КонецПроцедуры
+";
+    let (db, file_id) = setup_inline(code);
+    let diags = readonly_diagnostics(&db, file_id);
+    assert_eq!(diags.len(), 1, "a query-result cursor field is read-only, got: {diags:?}");
+    assert_eq!(diags[0].0.as_str(), "Код");
+    assert!(
+        matches!(db.lookup_type(diags[0].1), TypeKind::QueryResultSelection(_)),
+        "receiver must be the selection, got {:?}",
+        db.lookup_type(diags[0].1)
+    );
+}

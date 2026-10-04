@@ -177,10 +177,11 @@ fn enumerate_metadata_reference_collection(
 }
 
 fn enumerate_projection_fields(db: &dyn TypeKernelDb, ty: TypeId) -> Option<Vec<FieldInfo>> {
-    // Structures are mutable, query/value-table projections are read-only at the cursor.
+    // A query-result cursor refuses writes ("Поле объекта недоступно для записи"); a
+    // value-table row is materialised data whose columns are as writable as a structure's keys.
     let (projection, is_readonly) = match db.lookup_type(ty) {
         TypeKind::QueryResultSelection(facet) => (facet.projection.clone()?, true),
-        TypeKind::ValueTableRow(facet) => (facet.projection.clone()?, true),
+        TypeKind::ValueTableRow(facet) => (facet.projection.clone()?, false),
         TypeKind::Structure(facet) => {
             (crate::structure_keys::structure_projection_fields(facet)?, false)
         }
