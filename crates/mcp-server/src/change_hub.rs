@@ -4676,6 +4676,10 @@ fn apply_declaration(
         // survives the strip, so nothing downstream would ever notice: the blind set reads
         // the set, not the backend.
         if !dropped.is_empty() && a_kept_target_must_be_re_armed() {
+            // The records that are staying, read before the drain: the guard below asks
+            // whether an unwatch of a dropped one would strip a keepable watch.
+            let staying: Vec<PathBuf> =
+                armed.iter().map(|entry| entry.target().path.clone()).collect();
             let mut restored: Vec<ArmedTarget> = Vec::with_capacity(armed.len());
             for entry in armed.drain(..) {
                 if !entry.is_declared() {
@@ -4691,6 +4695,17 @@ fn apply_declaration(
                     // root and the periodic check put it back.
                     Err(error) => {
                         tracing::warn!(root = ?entry.target().path, "workspace change hub lost a root while restoring it after dropping a watch above it: {error}");
+                        // And the registration goes with the record (github#185) — under
+                        // the twin guard the same drop carries in `apply_rearm`: a path
+                        // with another record's watch beneath it is left alone.
+                        if !a_record_lies_beneath(
+                            staying.iter().map(PathBuf::as_path),
+                            &entry.target().path,
+                        ) {
+                            if let Err(error) = watcher.disarm(&entry.target().path) {
+                                tracing::debug!(root = ?entry.target().path, "workspace change hub unwatch of a root lost while restoring: {error}");
+                            }
+                        }
                     }
                 }
             }
@@ -5230,6 +5245,18 @@ fn a_kept_target_must_be_re_armed() -> bool {
 /// re-armed nor disarmed with the declared targets: it is kept while the new scope still
 /// walks it and dropped when it does not. Returns whether EVERY desired target is armed
 /// afterwards.
+/// Whether any of `records` names a path strictly BENEATH `path`.
+///
+/// Asked before an unwatch that goes with a dropped record: an unwatch strips by spelling
+/// on inotify, so it would take the registrations of every record below with it — records
+/// that are staying, and whose claims of coverage would then be lies nothing downstream
+/// could notice. The leak left by NOT unwatching is the smaller wrong: it belongs to a
+/// declared root that is reported blind and put back by the retry, which is exactly what
+/// walks the two back into agreement (github#185).
+fn a_record_lies_beneath<'a>(records: impl IntoIterator<Item = &'a Path>, path: &Path) -> bool {
+    records.into_iter().any(|other| other != path && other.starts_with(path))
+}
+
 fn apply_rearm(
     inner: &HubInner,
     watcher: &mut Watch,
@@ -5399,6 +5426,30 @@ fn apply_rearm(
             Ok(()) => kept.push(entry),
             Err(error) => {
                 tracing::warn!(root = ?entry.target().path, "workspace change hub lost a kept root on re-arm: {error}");
+                // The record is being dropped, so the registration goes with it: a refused
+                // arm of an ALREADY watched path does not take the old registration away,
+                // and left behind it would outlive every name that could ever unwatch it,
+                // feeding events from a root the declaration no longer holds (github#185).
+                // The pass's own comment above already allows that the watch may still
+                // stand — this is what makes the drop complete either way.
+                //
+                // Except where another record names a path BENEATH this one: an unwatch
+                // strips by spelling on inotify, and the registrations it would take away
+                // are claimed by records that are staying. The spellings of THIS pass count
+                // too — a declared root can be spelled under this one while resolving
+                // elsewhere, and the canonical order that decided the loop may have placed
+                // it already. See [`a_record_lies_beneath`].
+                if !a_record_lies_beneath(
+                    armed
+                        .iter()
+                        .map(|other| other.target().path.as_path())
+                        .chain(desired.iter().map(|(target, _)| target.path.as_path())),
+                    &entry.target().path,
+                ) {
+                    if let Err(error) = watcher.disarm(&entry.target().path) {
+                        tracing::debug!(root = ?entry.target().path, "workspace change hub unwatch of a lost kept root on re-arm: {error}");
+                    }
+                }
                 full_coverage = false;
             }
         }
@@ -8051,6 +8102,81 @@ mod tests {
         assert!(delivered, "a change under the blind root never reached the cursor");
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(hub.rescan_request_count(), rescans, "polls raised reconciles of their own");
+        hub.shutdown();
+    }
+
+    /// A kept target whose defensive re-arm fails is dropped from the records — and the
+    /// registration has to go with the record: a refused arm is not an unwatched one, and a
+    /// registration left behind a dropped record outlives every name that could ever take
+    /// it away, feeding events from a root the declaration no longer holds (github#185).
+    /// The seam is told about every end of a watch, so the unwatch itself is the gate.
+    ///
+    /// Not on macOS: there the defensive pass skips a kept target
+    /// ([`a_kept_target_must_be_re_armed`] is false), so the drop this test provokes cannot
+    /// happen and the stand would stay covered. The scenario is real only where the
+    /// backend wants the kept target placed again.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_kept_target_lost_on_re_arm_is_also_unwatched() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::create_dir(&c).unwrap();
+        // Both ends of every watch in one seam, because a test that sees only the arms
+        // cannot tell a registration that was dropped from one that was never placed. Built
+        // by hand rather than through `RefusedWatches`, whose bookkeeping is unix-only —
+        // the invariant this pins is the hub's own, and it holds wherever a watch can be
+        // refused.
+        let refusals = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disarms: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let (refuse_b, unwatches, key) = (Arc::clone(&refusals), Arc::clone(&disarms), b.clone());
+        let seams = Arc::new(WatchSeams {
+            refuses: Box::new(move |path: &Path| {
+                refuse_b.load(std::sync::atomic::Ordering::SeqCst) && path == key.as_path()
+            }),
+            disarmed: Box::new(move |path: &Path| {
+                unwatches.lock().unwrap_or_else(PoisonError::into_inner).push(path.to_path_buf());
+            }),
+        });
+        let hub = WorkspaceChangeHub::start_seamed(
+            vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())],
+            DEFAULT_CAPACITY,
+            Duration::from_secs(3600),
+            false,
+            None,
+            Some(seams),
+            Vec::new(),
+            PollConfig::PRODUCTION,
+            BlindPollSeam::default(),
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(
+            !disarms.lock().unwrap_or_else(PoisonError::into_inner).contains(&b),
+            "the stand starts with `b` watched, not unwatched",
+        );
+
+        // `b` becomes unwatchable while it is still declared: the defensive pass of the next
+        // re-arm fails on it and drops its record.
+        refusals.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !hub.rearm(
+                vec![
+                    WatchTarget::recursive(a.clone()),
+                    WatchTarget::recursive(b.clone()),
+                    WatchTarget::recursive(c.clone()),
+                ],
+                Duration::from_secs(10),
+            ),
+            "a dropped target must deny coverage",
+        );
+
+        let asked = disarms.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            asked.contains(&b),
+            "the registration outlived the record that named it: {asked:?}",
+        );
         hub.shutdown();
     }
 
