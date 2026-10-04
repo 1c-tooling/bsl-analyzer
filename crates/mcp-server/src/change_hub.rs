@@ -1786,14 +1786,6 @@ enum HubMsg {
         epoch: u64,
         ack: std::sync::mpsc::SyncSender<bool>,
     },
-    /// Record the age of a composition that did NOT move the watch set: sent where a
-    /// declaration equals the one in force, so the hub's mark knows a newer world agreed
-    /// with what it holds and can refuse a still older, DIFFERENT declaration that would
-    /// take it back off that world (github#184). Fire and forget: no reaction beyond the
-    /// mark and no acknowledgement, so a sender may drop it and never wait.
-    Remark {
-        epoch: u64,
-    },
     /// Run one coverage tick now. A test seam: production drives ticks by the
     /// deadline, and both paths call the same function so a broken periodic path
     /// cannot hide behind a working commanded one.
@@ -2318,8 +2310,8 @@ impl WorkspaceChangeHub {
     /// nothing at all rather than merely little.
     ///
     /// An unchanged declaration therefore moves nothing — no re-arm, no reconcile — and
-    /// answers from what the hub already holds. Its AGE still reaches the hub, best effort
-    /// and without waiting ([`HubMsg::Remark`]): a composition that agrees with the stand
+    /// answers from what the hub already holds. It still reaches the hub with its AGE, best
+    /// effort and without waiting ([`Self::remark`]): a composition that agrees with the stand
     /// keeps the hub's mark moving, which is what refuses a still older, DIFFERENT
     /// declaration arriving after it (github#184).
     ///
@@ -2340,14 +2332,14 @@ impl WorkspaceChangeHub {
         let resolved = ResolvedTargets::here(targets.to_vec());
         let declaration = resolved.as_slice().to_vec();
         if same_declaration(&self.inner.accepted_declaration(), &declaration) {
-            // Nothing that moves coverage is sent — that is the point of the barrier — but
-            // the AGE still is: the mark has to hear that a newer composition agreed with
-            // the stand, or a still older, DIFFERENT declaration would apply after it and
-            // take the hub off a world the newer one had confirmed (github#184). Sent once,
-            // without an acknowledgement and without waiting: the mark is best effort, and
-            // a full channel under an event storm must not delay a caller that used to send
-            // nothing at all.
-            let _ = self.control().try_send(HubMsg::Remark { epoch });
+            // Nothing is waited on — that is the point of the barrier — but the declaration
+            // still travels with its AGE: the mark has to hear that a newer composition
+            // agreed with the stand, or a still older, DIFFERENT declaration would apply
+            // after it and take the hub off a world the newer one had confirmed
+            // (github#184). Sent once, without waiting: the mark is best effort, and a full
+            // channel under an event storm must not delay a caller that used to send nothing
+            // at all.
+            self.remark(targets.to_vec(), epoch);
             // The rest of the answer is about coverage, and coverage is not knowable while
             // the watch is still being armed: the accepted declaration is recorded before
             // the thread has armed anything, so a caller asking in that window would be
@@ -2359,6 +2351,17 @@ impl WorkspaceChangeHub {
         }
         tracing::info!(?targets, "workspace change hub declaring new scan roots");
         self.rearm_with_epoch(targets.to_vec(), epoch, REARM_ACK_TIMEOUT)
+    }
+
+    /// Send an unchanged declaration as what it is — a declaration, at its age — without
+    /// waiting for an answer. "Unchanged" was read on the caller's thread, and the stand can
+    /// move before the thread hears it; `apply_declaration` weighs it against what stands
+    /// when it arrives, so an agreeing word costs nothing there and an overtaken one applies.
+    fn remark(&self, targets: Vec<WatchTarget>, epoch: u64) {
+        // Nobody waits on the answer: the receiver is dropped here, and the thread's
+        // `try_send` of the acknowledgement fails quietly.
+        let (ack, _) = std::sync::mpsc::sync_channel(1);
+        let _ = self.control().try_send(HubMsg::Rearm { targets, epoch, ack });
     }
 
     /// [`Self::ensure_roots`] together with the user's `[source].exclude` the roots were
@@ -4311,11 +4314,6 @@ fn run_polling(
                 map(&mut poller, &declared, DegradeReason::Rearmed);
                 let _ = ack.try_send(false);
             }
-            Ok(HubMsg::Remark { epoch }) => {
-                // Same as the watching thread: the age of a composition that agreed with
-                // the stand still refuses an older, different one (github#184).
-                applied_epoch = applied_epoch.max(epoch);
-            }
             #[cfg(test)]
             Ok(HubMsg::Tick) => {
                 poll_once(inner, &mut poller, &declared);
@@ -4582,13 +4580,6 @@ fn run_hub_thread(
                 );
                 let _ = ack.try_send(covered);
             }
-            HubMsg::Remark { epoch } => {
-                // A composition that agrees with the stand still has an age, and the mark
-                // has to move with it — otherwise a still older, different declaration
-                // would apply after it (github#184). Fire and forget by construction:
-                // nothing is owed back.
-                applied_epoch = applied_epoch.max(epoch);
-            }
             HubMsg::Rearm { targets, epoch, ack } => {
                 if epoch < applied_epoch {
                     // A slow build finishing after a newer one: its composition is older
@@ -4810,9 +4801,10 @@ fn apply_declaration(
         // survives the strip, so nothing downstream would ever notice: the blind set reads
         // the set, not the backend.
         if !dropped.is_empty() && a_kept_target_must_be_re_armed() {
-            // The records that are staying, read before the drain: the guard below asks
-            // whether an unwatch of a dropped one would strip a keepable watch.
-            let staying: Vec<PathBuf> =
+            // The records that are staying, read before the drain and narrowed as the pass
+            // drops them: the guard below asks whether an unwatch of a dropped one would
+            // strip a keepable watch, and a record already dropped holds nothing to keep.
+            let mut staying: Vec<PathBuf> =
                 armed.iter().map(|entry| entry.target().path.clone()).collect();
             let mut restored: Vec<ArmedTarget> = Vec::with_capacity(armed.len());
             for entry in armed.drain(..) {
@@ -4832,6 +4824,7 @@ fn apply_declaration(
                         // And the registration goes with the record (github#185) — under
                         // the twin guard the same drop carries in `apply_rearm`: a path
                         // with another record's watch beneath it is left alone.
+                        staying.retain(|path| path != &entry.target().path);
                         if !an_unwatch_would_strip_a_record(
                             staying.iter().map(PathBuf::as_path),
                             &entry.target().path,
@@ -5556,6 +5549,11 @@ fn apply_rearm(
     // there would make the next request for the same set find coverage equal and answer
     // yes over a subtree nothing is watching. Dropping a target whose watch may in fact
     // still stand costs one retry; keeping one that does not costs the events.
+    // The records this pass ends with, as far as it knows yet: the guard on a dropped record's
+    // unwatch asks about them, and a record this very pass has unwatched or dropped already
+    // has no registration left to spare.
+    let mut staying: Vec<PathBuf> =
+        next_armed.iter().chain(doors.iter()).map(|entry| entry.target().path.clone()).collect();
     let mut kept: Vec<ArmedTarget> = Vec::with_capacity(next_armed.len() + doors.len());
     for entry in next_armed {
         if !a_kept_target_must_be_re_armed() && !needs_placing.contains(&entry.target().path) {
@@ -5573,17 +5571,16 @@ fn apply_rearm(
                 // The pass's own comment above already allows that the watch may still
                 // stand — this is what makes the drop complete either way.
                 //
-                // Except where another record names a path BENEATH this one: an unwatch
+                // Except where a staying record names a path BENEATH this one: an unwatch
                 // strips by spelling on inotify, and the registrations it would take away
                 // are claimed by records that are staying. The spellings of THIS pass count
-                // too — a declared root can be spelled under this one while resolving
-                // elsewhere, and the canonical order that decided the loop may have placed
-                // it already. See [`an_unwatch_would_strip_a_record`].
+                // — a declared root can be spelled under this one while resolving elsewhere —
+                // and only those still standing: an obsolete record unwatched above, or a
+                // target whose arm failed, holds nothing to spare. See
+                // [`an_unwatch_would_strip_a_record`].
+                staying.retain(|path| path != &entry.target().path);
                 if !an_unwatch_would_strip_a_record(
-                    armed
-                        .iter()
-                        .map(|other| other.target().path.as_path())
-                        .chain(desired.iter().map(|(target, _)| target.path.as_path())),
+                    staying.iter().map(PathBuf::as_path),
                     &entry.target().path,
                 ) {
                     if let Err(error) = watcher.disarm(&entry.target().path) {
@@ -8266,6 +8263,55 @@ mod tests {
         );
     }
 
+    /// The guard on a lost record's unwatch spares only records that are STAYING. A record
+    /// beneath it that this very pass unwatched as obsolete has no registration left to
+    /// protect, and sparing the unwatch for its sake would leave the lost root's
+    /// registration with no record able to name it (github#185).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_record_unwatched_by_the_same_pass_does_not_spare_a_lost_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (kept, obsolete) = (root.join("a"), root.join("a").join("b"));
+        std::fs::create_dir_all(&obsolete).unwrap();
+        let refusals = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disarms: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let (refuse, unwatches, key) = (Arc::clone(&refusals), Arc::clone(&disarms), kept.clone());
+        let seams = Arc::new(WatchSeams {
+            refuses: Box::new(move |path: &Path| {
+                refuse.load(std::sync::atomic::Ordering::SeqCst) && path == key.as_path()
+            }),
+            disarmed: Box::new(move |path: &Path| {
+                unwatches.lock().unwrap_or_else(PoisonError::into_inner).push(path.to_path_buf());
+            }),
+        });
+        // Flat, so the root beneath it stands as a record of its own instead of being absorbed.
+        let flat = WatchTarget { path: kept.clone(), recursive: false };
+        let hub = WorkspaceChangeHub::start_seamed(
+            vec![flat.clone(), WatchTarget::recursive(obsolete.clone())],
+            DEFAULT_CAPACITY,
+            Duration::from_secs(3600),
+            false,
+            None,
+            Some(seams),
+            Vec::new(),
+            PollConfig::PRODUCTION,
+            BlindPollSeam::default(),
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        refusals.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!hub.rearm(vec![flat], Duration::from_secs(10)), "a lost root must deny coverage");
+
+        let asked = disarms.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(asked.contains(&obsolete), "the obsolete root is unwatched first: {asked:?}");
+        assert!(
+            asked.contains(&kept),
+            "the lost root's registration was spared for a record already gone: {asked:?}",
+        );
+        hub.shutdown();
+    }
+
     /// A kept target whose defensive re-arm fails is dropped from the records — and the
     /// registration has to go with the record: a refused arm is not an unwatched one, and a
     /// registration left behind a dropped record outlives every name that could ever take
@@ -8337,6 +8383,41 @@ mod tests {
         assert!(
             asked.contains(&b),
             "the registration outlived the record that named it: {asked:?}",
+        );
+        hub.shutdown();
+    }
+
+    /// The sender's "unchanged" is read on ITS thread, and the stand can move before the
+    /// thread hears it: a declaration of an older composition can apply between the read and
+    /// the send. The newer composition's word then has to be weighed against what stands
+    /// when it ARRIVES — read as a bare age, it would raise the mark over a stand it never
+    /// agreed with, keep the hub on the older roots, and refuse the very roots it had
+    /// confirmed when a build in between declares them again (github#184).
+    #[test]
+    fn an_unchanged_declaration_overtaken_before_it_arrives_still_applies() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let a = first.path().canonicalize().unwrap();
+        let c = second.path().canonicalize().unwrap();
+        let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(a.clone())]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let only = |path: &PathBuf| vec![WatchTarget::recursive(path.clone())];
+        assert!(hub.rearm_with_epoch(only(&a), 5, Duration::from_secs(10)));
+
+        // Composition 9 read `a` as standing; composition 7 moves the hub to `c` before 9's
+        // word is sent.
+        assert!(hub.rearm_with_epoch(only(&c), 7, Duration::from_secs(10)));
+        hub.remark(only(&a), 9);
+        // Acknowledged in order behind the remark, so the thread has heard it by now.
+        let _ = hub.rearm_with_epoch(only(&a), 8, Duration::from_secs(10));
+
+        assert!(
+            same_declaration(
+                &hub.inner.accepted_declaration(),
+                ResolvedTargets::here(only(&a)).as_slice(),
+            ),
+            "the newest composition's roots must stand, not the older one's: {:?}",
+            hub.inner.accepted_declaration(),
         );
         hub.shutdown();
     }
