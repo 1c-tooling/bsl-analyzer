@@ -50,6 +50,18 @@ const STOP_BUDGET: Duration = Duration::from_secs(5);
 /// How often a stop re-checks the two things it waits on (channel space, thread exit).
 const STOP_POLL: Duration = Duration::from_millis(10);
 
+/// The next topology epoch: a monotonic label for the age of one composition of scan roots.
+///
+/// Assigned where the composition is TAKEN — a [`crate::graph::input::ProjectSnapshot`] — and
+/// carried with every declaration that speaks for it, so the hub can tell which of two
+/// declarations describes the newer world when their arrival order is the reverse of their
+/// age. The clock is the process's own: numbers are only ever compared within one hub's
+/// lifetime (github#184).
+pub(crate) fn next_topology_epoch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// What is known to have happened to a path within a drain window. The kind is
 /// re-derived from on-disk state at event time (stats are truth), so a
 /// create-then-delete or delete-then-create burst settles on the final reality
@@ -1752,20 +1764,35 @@ fn classify_path(path: &Path) -> Option<(PathBuf, ChangeKind)> {
 /// hub identity for the (many, clonable) handle holders to migrate to.
 enum HubMsg {
     Event(Result<Event, notify::Error>),
-    /// Declare the watch set (see [`WorkspaceChangeHub::rearm`]). `ack` fires once the
+    /// Declare the watch set (see [`WorkspaceChangeHub::rearm_with_epoch`]). `ack` fires once the
     /// declaration is applied; it carries whether EVERY desired target is actually armed
     /// (partial coverage must surface to the caller, not read as success). What the
     /// declaration costs — nothing, a record, or a re-arm and the reconcile that comes with
     /// it — is decided by the thread in [`apply_declaration`], never by the sender.
     Rearm {
         targets: Vec<WatchTarget>,
+        /// The age of the composition this declaration speaks for ([`next_topology_epoch`]):
+        /// an older declaration is ignored rather than allowed to roll the hub back onto the
+        /// roots a newer build left behind (github#184).
+        epoch: u64,
         ack: std::sync::mpsc::SyncSender<bool>,
     },
     /// Replace the user's `[source].exclude` and re-place every registration under it.
-    /// `ack` carries whether every declared target is armed afterwards.
+    /// `ack` carries whether every declared target is armed afterwards. `epoch` ages like
+    /// [`HubMsg::Rearm`]'s: a moved exclusion set is a composition decision too, and an old
+    /// one must not undo a newer one.
     Rescope {
         user_excluded: ExcludedPaths,
+        epoch: u64,
         ack: std::sync::mpsc::SyncSender<bool>,
+    },
+    /// Record the age of a composition that did NOT move the watch set: sent where a
+    /// declaration equals the one in force, so the hub's mark knows a newer world agreed
+    /// with what it holds and can refuse a still older, DIFFERENT declaration that would
+    /// take it back off that world (github#184). Fire and forget: no reaction beyond the
+    /// mark and no acknowledgement, so a sender may drop it and never wait.
+    Remark {
+        epoch: u64,
     },
     /// Run one coverage tick now. A test seam: production drives ticks by the
     /// deadline, and both paths call the same function so a broken periodic path
@@ -2231,8 +2258,25 @@ impl WorkspaceChangeHub {
     /// deadline. Returns whether every desired target is actually armed; `false`
     /// for a timeout, a dead hub thread, or partial coverage (an unwatchable
     /// target) — the caller must not treat any of those as covered.
+    /// Declare `targets` as of now — a test-side convenience. Production always states the
+    /// age of its composition ([`Self::rearm_with_epoch`]), because a declaration with no
+    /// age cannot be ordered against the one in force (github#184).
+    #[cfg(test)]
     pub(crate) fn rearm(&self, targets: Vec<WatchTarget>, timeout: Duration) -> bool {
-        self.handshake(|ack| HubMsg::Rearm { targets, ack }, timeout)
+        self.rearm_with_epoch(targets, next_topology_epoch(), timeout)
+    }
+
+    /// [`Self::rearm`] under the age of the composition that chose `targets`: a caller whose
+    /// snapshot predates a newer one must say so, or the thread cannot tell its declaration
+    /// from a fresh one and a slow build finishing last would roll the hub back onto the
+    /// roots the newer build left (github#184).
+    pub(crate) fn rearm_with_epoch(
+        &self,
+        targets: Vec<WatchTarget>,
+        epoch: u64,
+        timeout: Duration,
+    ) -> bool {
+        self.handshake(|ack| HubMsg::Rearm { targets, epoch, ack }, timeout)
     }
 
     /// Send the message `build` makes around an acknowledgement channel and wait for the
@@ -2272,49 +2316,73 @@ impl WorkspaceChangeHub {
     /// calls this again: a loop with no external cause, which is why the repeat has to cost
     /// nothing at all rather than merely little.
     ///
-    /// An unchanged declaration therefore sends NOTHING — no message, no re-arm, no
-    /// reconcile — in either transport mode, and answers from what the hub already holds.
+    /// An unchanged declaration therefore moves nothing — no re-arm, no reconcile — and
+    /// answers from what the hub already holds. Its AGE still reaches the hub, best effort
+    /// and without waiting ([`HubMsg::Remark`]): a composition that agrees with the stand
+    /// keeps the hub's mark moving, which is what refuses a still older, DIFFERENT
+    /// declaration arriving after it (github#184).
+    ///
+    /// The form without an age is a test-side convenience: production states the age of the
+    /// composition it speaks for ([`Self::ensure_roots_with_epoch`]).
+    #[cfg(test)]
     pub(crate) fn ensure_roots(&self, targets: &[WatchTarget]) -> bool {
+        self.ensure_roots_with_epoch(targets, next_topology_epoch())
+    }
+
+    /// [`Self::ensure_roots`] under the epoch of the composition that produced `targets`:
+    /// the sender states how old the world it speaks for is, and the thread refuses to
+    /// apply a declaration older than the one it already stands on (github#184).
+    pub(crate) fn ensure_roots_with_epoch(&self, targets: &[WatchTarget], epoch: u64) -> bool {
         // Resolved before comparing, exactly as the hub thread will: the declaration travels
         // and is remembered in PLACED spellings, and one relative spelling names two
         // different targets under two different current directories.
         let resolved = ResolvedTargets::here(targets.to_vec());
         let declaration = resolved.as_slice().to_vec();
         if same_declaration(&self.inner.accepted_declaration(), &declaration) {
-            // Nothing is sent — that is the point of the barrier — but the ANSWER is about
-            // coverage, and coverage is not knowable while the watch is still being armed:
-            // the accepted declaration is recorded before the thread has armed anything, so
-            // a caller asking in that window would be told "not covered" about a watch that
-            // arms a moment later. Waiting for the hub to settle costs the arming time once,
-            // which is what the acknowledgement of a re-arm used to cost anyway.
+            // Nothing that moves coverage is sent — that is the point of the barrier — but
+            // the AGE still is: the mark has to hear that a newer composition agreed with
+            // the stand, or a still older, DIFFERENT declaration would apply after it and
+            // take the hub off a world the newer one had confirmed (github#184). Sent once,
+            // without an acknowledgement and without waiting: the mark is best effort, and
+            // a full channel under an event storm must not delay a caller that used to send
+            // nothing at all.
+            let _ = self.control().try_send(HubMsg::Remark { epoch });
+            // The rest of the answer is about coverage, and coverage is not knowable while
+            // the watch is still being armed: the accepted declaration is recorded before
+            // the thread has armed anything, so a caller asking in that window would be
+            // told "not covered" about a watch that arms a moment later. Waiting for the
+            // hub to settle costs the arming time once, which is what the acknowledgement
+            // of a re-arm used to cost anyway.
             let _ = self.watch_readiness_or(REARM_ACK_TIMEOUT, || false);
             return self.covers(&resolved);
         }
         tracing::info!(?targets, "workspace change hub declaring new scan roots");
-        self.rearm(targets.to_vec(), REARM_ACK_TIMEOUT)
+        self.rearm_with_epoch(targets.to_vec(), epoch, REARM_ACK_TIMEOUT)
     }
 
     /// [`Self::ensure_roots`] together with the user's `[source].exclude` the roots were
     /// resolved under. Unchanged exclusions cost what `ensure_roots` costs; changed ones
     /// re-place every registration, because the same roots no longer mean the same
-    /// coverage, and owe consumers the reconcile any re-arm owes.
+    /// coverage, and owe consumers the reconcile any re-arm owes. `epoch` is the age of the
+    /// composition both were taken from, and rides both declarations.
     pub(crate) fn ensure_scope(
         &self,
         targets: &[WatchTarget],
         user_excluded: &ExcludedPaths,
+        epoch: u64,
     ) -> bool {
         // The roots are declared whatever the rescope answered: a hub that polls answers
         // "not covered" to everything, and the new roots must reach it all the same.
         let rescoped = self.inner.user_excluded() == *user_excluded || {
             tracing::info!("workspace change hub re-scoping to a new [source].exclude");
-            self.rescope(user_excluded.clone(), REARM_ACK_TIMEOUT)
+            self.rescope(user_excluded.clone(), epoch, REARM_ACK_TIMEOUT)
         };
-        let covered = self.ensure_roots(targets);
+        let covered = self.ensure_roots_with_epoch(targets, epoch);
         rescoped && covered
     }
 
-    fn rescope(&self, user_excluded: ExcludedPaths, timeout: Duration) -> bool {
-        self.handshake(|ack| HubMsg::Rescope { user_excluded, ack }, timeout)
+    fn rescope(&self, user_excluded: ExcludedPaths, epoch: u64, timeout: Duration) -> bool {
+        self.handshake(|ack| HubMsg::Rescope { user_excluded, epoch, ack }, timeout)
     }
 
     /// Whether every declared target is placed and armed right now. A verdict read off what
@@ -4184,6 +4252,9 @@ fn run_polling(
     };
     tracing::warn!("workspace change hub has no watch; polling the workspace instead");
     map(&mut poller, &declared, DegradeReason::WatcherSetup);
+    // The age of the stand this thread holds: the set it started on is the world as of
+    // startup, so anything a message carries is newer than it.
+    let mut applied_epoch: u64 = 0;
     let mut due = Instant::now() + inner.poll.period;
     loop {
         let now = Instant::now();
@@ -4196,7 +4267,17 @@ fn run_polling(
             Ok(HubMsg::Shutdown) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return;
             }
-            Ok(HubMsg::Rearm { targets, ack }) => {
+            Ok(HubMsg::Rearm { targets, epoch, ack }) => {
+                if epoch < applied_epoch {
+                    tracing::info!(
+                        epoch,
+                        applied = applied_epoch,
+                        "workspace change hub ignoring a declaration older than the applied one"
+                    );
+                    let _ = ack.try_send(false);
+                    continue;
+                }
+                applied_epoch = epoch;
                 // The same rule the watching thread applies: a declaration equal to the one
                 // in force costs nothing. Re-taking the picture would throw away the map the
                 // poll compares against and owe every consumer a reconcile for a set that
@@ -4211,13 +4292,28 @@ fn run_polling(
                 // Never "covered": polling is what the hub does when it could not watch.
                 let _ = ack.try_send(false);
             }
-            Ok(HubMsg::Rescope { user_excluded, ack }) => {
+            Ok(HubMsg::Rescope { user_excluded, epoch, ack }) => {
+                if epoch < applied_epoch {
+                    tracing::info!(
+                        epoch,
+                        applied = applied_epoch,
+                        "workspace change hub ignoring a rescope older than the applied one"
+                    );
+                    let _ = ack.try_send(false);
+                    continue;
+                }
+                applied_epoch = epoch;
                 *inner.user_excluded.write().unwrap_or_else(PoisonError::into_inner) =
                     user_excluded;
                 declared = repoint_polling(inner, ResolvedTargets::here(declared));
                 poller = Poller::default();
                 map(&mut poller, &declared, DegradeReason::Rearmed);
                 let _ = ack.try_send(false);
+            }
+            Ok(HubMsg::Remark { epoch }) => {
+                // Same as the watching thread: the age of a composition that agreed with
+                // the stand still refuses an older, different one (github#184).
+                applied_epoch = applied_epoch.max(epoch);
             }
             #[cfg(test)]
             Ok(HubMsg::Tick) => {
@@ -4354,6 +4450,9 @@ fn run_hub_thread(
     // long the deadline has been past, so a storm of events would starve the tick
     // indefinitely — on exactly the tree where losing coverage costs the most.
     let mut due = Instant::now() + inner.tick_period;
+    // The age of the stand this thread holds: the set it started on is the world as of
+    // startup, so anything a message carries is newer than it.
+    let mut applied_epoch: u64 = 0;
     loop {
         inner.drain_channel_overflow();
         let now = Instant::now();
@@ -4461,7 +4560,17 @@ fn run_hub_thread(
                     }
                 }
             }
-            HubMsg::Rescope { user_excluded, ack } => {
+            HubMsg::Rescope { user_excluded, epoch, ack } => {
+                if epoch < applied_epoch {
+                    tracing::info!(
+                        epoch,
+                        applied = applied_epoch,
+                        "workspace change hub ignoring a rescope older than the applied one"
+                    );
+                    let _ = ack.try_send(false);
+                    continue;
+                }
+                applied_epoch = epoch;
                 let covered = apply_rescope(
                     &inner,
                     &mut watcher,
@@ -4472,7 +4581,31 @@ fn run_hub_thread(
                 );
                 let _ = ack.try_send(covered);
             }
-            HubMsg::Rearm { targets, ack } => {
+            HubMsg::Remark { epoch } => {
+                // A composition that agrees with the stand still has an age, and the mark
+                // has to move with it — otherwise a still older, different declaration
+                // would apply after it (github#184). Fire and forget by construction:
+                // nothing is owed back.
+                applied_epoch = applied_epoch.max(epoch);
+            }
+            HubMsg::Rearm { targets, epoch, ack } => {
+                if epoch < applied_epoch {
+                    // A slow build finishing after a newer one: its composition is older
+                    // than the one in force, and applying it would roll the hub back onto
+                    // the roots the newer build left behind (github#184). The caller-side
+                    // freshness guard has already let it through — check-then-send is a
+                    // race by construction — so the ordering has to be decided here, on
+                    // the one thread that owns the watch set. "Not covered" is the honest
+                    // answer: the declaration was not applied.
+                    tracing::info!(
+                        epoch,
+                        applied = applied_epoch,
+                        "workspace change hub ignoring a declaration older than the applied one"
+                    );
+                    let _ = ack.try_send(false);
+                    continue;
+                }
+                applied_epoch = epoch;
                 // One path for every declaration the thread receives. `apply_declaration`
                 // decides what the declaration is worth: an unchanged one costs nothing, one
                 // that moves no coverage is recorded without a re-arm, and only a real move
@@ -8177,6 +8310,107 @@ mod tests {
             asked.contains(&b),
             "the registration outlived the record that named it: {asked:?}",
         );
+        hub.shutdown();
+    }
+
+    /// A declaration that speaks for an older composition must not roll the hub back onto
+    /// the roots a newer one already applied: a slow build passes its caller-side freshness
+    /// check while its topology is still live, is overtaken between that check and the
+    /// declaration, and arrives after the newer one. The epoch is the age of the composition,
+    /// so the thread can order the two however they arrive (github#184).
+    #[test]
+    fn a_declaration_older_than_the_applied_one_is_ignored() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let a = first.path().canonicalize().unwrap();
+        let b = second.path().canonicalize().unwrap();
+        let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(a.clone())]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        // The newer composition declares both roots, at its own age.
+        let both = vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())];
+        assert!(hub.rearm_with_epoch(both.clone(), 10, Duration::from_secs(10)));
+        let standing = |targets: &[WatchTarget]| {
+            same_declaration(
+                &hub.inner.accepted_declaration(),
+                ResolvedTargets::here(targets.to_vec()).as_slice(),
+            )
+        };
+        assert!(standing(&both), "the newer declaration is the one in force");
+
+        // An older composition declares only `a`. Applied, it would drop `b`'s watch — the
+        // hub has to refuse it on its own, because the caller-side check cannot cover the
+        // window: it read the live topology before the newer build moved it.
+        assert!(
+            !hub.rearm_with_epoch(
+                vec![WatchTarget::recursive(a.clone())],
+                9,
+                Duration::from_secs(10),
+            ),
+            "a superseded declaration is not applied, and not answered as covered",
+        );
+        assert!(
+            standing(&both),
+            "the older declaration rolled the hub back: {:?}",
+            hub.inner.accepted_declaration(),
+        );
+
+        // The ordering is not a freeze: the same age still applies, so a rescope and its
+        // re-arm, which travel under one epoch, both take.
+        assert!(hub.rearm_with_epoch(
+            vec![WatchTarget::recursive(a.clone())],
+            10,
+            Duration::from_secs(10),
+        ));
+        assert!(standing(&[WatchTarget::recursive(a.clone())]), "an equal age is not superseded",);
+        hub.shutdown();
+    }
+
+    /// An unchanged declaration moves no coverage, but its age still has to reach the hub: a
+    /// newer composition that AGREES with what the hub holds must raise the mark, or a still
+    /// older, DIFFERENT declaration would apply after it — the flip-flop the epoch exists to
+    /// refuse, in the one case where nothing but the age travels (github#184).
+    #[test]
+    fn an_unchanged_declaration_still_advances_the_mark() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let a = first.path().canonicalize().unwrap();
+        let b = second.path().canonicalize().unwrap();
+        let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(a.clone())]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        // A declaration at age 5, then a silent repeat of the same set at age 9.
+        assert!(hub.rearm_with_epoch(
+            vec![WatchTarget::recursive(a.clone())],
+            5,
+            Duration::from_secs(10),
+        ));
+        assert!(hub.ensure_roots_with_epoch(&[WatchTarget::recursive(a.clone())], 9));
+
+        // A different composition, older than the silent repeat, must not apply…
+        assert!(
+            !hub.rearm_with_epoch(
+                vec![WatchTarget::recursive(b.clone())],
+                7,
+                Duration::from_secs(10),
+            ),
+            "an age under the silent repeat's is superseded by it",
+        );
+        assert!(same_declaration(
+            &hub.inner.accepted_declaration(),
+            ResolvedTargets::here(vec![WatchTarget::recursive(a.clone())]).as_slice(),
+        ));
+
+        // …while one above it still does.
+        assert!(hub.rearm_with_epoch(
+            vec![WatchTarget::recursive(b.clone())],
+            11,
+            Duration::from_secs(10),
+        ));
+        assert!(same_declaration(
+            &hub.inner.accepted_declaration(),
+            ResolvedTargets::here(vec![WatchTarget::recursive(b.clone())]).as_slice(),
+        ));
         hub.shutdown();
     }
 
