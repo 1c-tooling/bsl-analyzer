@@ -134,20 +134,36 @@ pub fn collect_query_parse_errors(query_ast: &Parse<SyntaxNode>) -> Vec<(TextRan
 ///
 /// The parser reads `(ВЫБРАТЬ ...)` as an operand anywhere, as SQL does; 1C answers
 /// «Синтаксическая ошибка "ВЫБРАТЬ"» at run time (8.3.17 and 8.3.27). Only the select-list
-/// position is reported — the one attested. The walk up stops at the first `В (...)` /
-/// `В ИЕРАРХИИ (...)`, so the right side of `В` stays unreported wherever it appears, and at the
+/// position is reported — the one attested. The walk up stops on reaching `В (...)` /
+/// `В ИЕРАРХИИ (...)` from its right side, so the right side of `В` stays unreported wherever it
+/// appears, while the left operand is an ordinary operand of the field. It also stops at the
 /// first enclosing query, so a nested query in a condition of another nested query is judged by
 /// the query it belongs to rather than by the select list that query happens to sit in.
 fn is_in_select_list(subquery: &SyntaxNode) -> bool {
+    let mut child = subquery.clone();
     for ancestor in subquery.ancestors().skip(1) {
         match ancestor.kind() {
-            SyntaxKind::SDBL_IN_EXPR | SyntaxKind::SDBL_IN_HIERARCHY_EXPR => return false,
+            SyntaxKind::SDBL_IN_EXPR | SyntaxKind::SDBL_IN_HIERARCHY_EXPR
+                if !is_left_of_in(&ancestor, &child) =>
+            {
+                return false;
+            }
             SyntaxKind::SDBL_SELECTED_FIELD => return true,
             SyntaxKind::SDBL_SUBQUERY => return false,
             _ => {}
         }
+        child = ancestor;
     }
     false
+}
+
+/// Whether `child` of an `В` / `В ИЕРАРХИИ` predicate lies before its `В` keyword, i.e. is the
+/// tested operand rather than the set it is tested against.
+fn is_left_of_in(predicate: &SyntaxNode, child: &SyntaxNode) -> bool {
+    predicate
+        .children_with_tokens()
+        .find(|element| element.kind() == SyntaxKind::KW_IN)
+        .is_some_and(|keyword| child.text_range().end() <= keyword.text_range().start())
 }
 
 fn trailing_dot_range(refs: &SyntaxNode) -> Option<TextRange> {

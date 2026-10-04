@@ -156,6 +156,22 @@ fn a_nested_query_where_the_platform_accepts_one_is_not_reported() {
     }
 }
 
+/// `В` legalises only its right side. A nested query on the left of `В` / `В ИЕРАРХИИ` in a
+/// select list is still a select-list operand, while the right side next to it stays silent.
+#[test]
+fn a_subquery_on_the_left_of_in_in_the_select_list_is_reported() {
+    assert_eq!(errors("ВЫБРАТЬ (ВЫБРАТЬ 1) В (1) КАК А"), reported(&["(ВЫБРАТЬ 1)"]));
+    assert_eq!(errors("ВЫБРАТЬ (ВЫБРАТЬ 1) НЕ В (1) КАК А"), reported(&["(ВЫБРАТЬ 1)"]));
+    assert_eq!(
+        errors("ВЫБРАТЬ (ВЫБРАТЬ 1) В ИЕРАРХИИ (&Группы) КАК А"),
+        reported(&["(ВЫБРАТЬ 1)"]),
+    );
+    assert_eq!(
+        errors("ВЫБРАТЬ (ВЫБРАТЬ 1) В (ВЫБРАТЬ Т.Код КАК Код ИЗ Справочник.Т КАК Т) КАК А"),
+        reported(&["(ВЫБРАТЬ 1)"]),
+    );
+}
+
 /// A parenthesised nested query inside the value list of `В` / `В ИЕРАРХИИ` is not attested
 /// either way, so the whole right side of `В` is left unreported rather than guessed at.
 #[test]
