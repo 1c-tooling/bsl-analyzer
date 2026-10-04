@@ -223,3 +223,32 @@ fn max_of_a_foreign_first_argument_is_not_narrowed_to_it() {
         db.lookup_type(ty)
     );
 }
+
+#[test]
+fn a_module_method_named_max_is_not_narrowed() {
+    let fixture = r#"
+//- /test.bsl
+Функция Макс(Значение)
+    Возврат "текст";
+КонецФункции
+
+Процедура Тест()
+    Результат = Макс(1);
+    Текст = Формат(Результат, "ЧГ=0");
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+    let ty = local_ty(&db, file_id, "результат");
+    let admits_string = match db.lookup_type(ty) {
+        TypeKind::Union(arms) => {
+            arms.iter().any(|arm| matches!(db.lookup_type(*arm), TypeKind::String(_)))
+        }
+        kind => matches!(kind, TypeKind::String(_)),
+    };
+    assert!(
+        admits_string,
+        "the module's own `Макс` returns a Строка, so the platform rule must not apply, got {:?}",
+        db.lookup_type(ty)
+    );
+    assert_eq!(mismatch_count(&db, file_id), 1, "Формат does not accept a Строка");
+}

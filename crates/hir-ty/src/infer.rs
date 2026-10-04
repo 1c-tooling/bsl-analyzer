@@ -1508,13 +1508,18 @@ impl<'db> InferenceContext<'db> {
     /// runs, so the declared union stays. An unknown one leaves the result unknown: the
     /// declared union would claim `Строка` for `Макс(Параметр, 1)` and accuse the next
     /// number-only consumer (`Формат(..., "ЧГ=0")`) on the strength of nothing.
+    /// The rule is the platform function's: a module method, module variable or global
+    /// export that owns the name answers for its own result.
     fn refine_first_argument_return(
-        &self,
+        &mut self,
         name: &hir_def::Name,
         args: &[ExprId],
         declared: TypeId,
     ) -> TypeId {
-        if !builtin::returns_first_argument_type(name.as_str()) {
+        if !builtin::returns_first_argument_type(name.as_str())
+            || self.bare_module_method_exists(name)
+            || self.is_call_name_shadowed(name)
+        {
             return declared;
         }
         let Some(first) = args.first().and_then(|arg| self.expr_types.get(arg)).copied() else {
