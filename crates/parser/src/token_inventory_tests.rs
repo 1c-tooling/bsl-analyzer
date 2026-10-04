@@ -205,11 +205,19 @@ fn the_witness_table_covers_every_kind_exactly_once() {
     assert_eq!(TokenKind::ALL.iter().filter(|k| k.is_trivia()).count(), 4);
 }
 
+/// Public mirrors omit the attestation directory, but a partial directory must still fail.
 #[test]
 fn original_inventory_has_one_attestation_per_variant() {
     let original: Vec<_> =
         include_str!("fixtures/token_inventory_original_kinds.txt").lines().collect();
-    let document = include_str!("../../../docs/legal/bsl-clean-room-slice-b1.md");
+    let legal = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/legal");
+    if !legal.is_dir() {
+        tracing::info!("Skipping token inventory attestation: docs/legal is absent");
+        return;
+    }
+    let attestation = legal.join("bsl-clean-room-slice-b1.md");
+    let document = std::fs::read_to_string(&attestation)
+        .unwrap_or_else(|err| panic!("{} could not be read: {err}", attestation.display()));
     let rows: Vec<Vec<_>> = document
         .lines()
         .filter_map(|line| {

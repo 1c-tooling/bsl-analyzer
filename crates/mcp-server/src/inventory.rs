@@ -847,6 +847,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
             "graph/test_support.rs",
             "indexing_runtime_tests.rs",
             "payload_smoke_tests.rs",
+            "serve_stream_tests.rs",
             "state/indexing_tests.rs",
             "state/test_support.rs",
             "tools/search/cancel_tests.rs",
