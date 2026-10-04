@@ -147,9 +147,8 @@ fn test_subquery_in_from() {
 
 #[test]
 fn test_subquery_nested() {
-    // `Inner`/`Outer` collide with the INNER join keyword by text but are valid
-    // aliases — keywords are not reserved as alias names.
-    let input = "SELECT * FROM (SELECT * FROM (SELECT Name FROM Products) AS Inner) AS Outer";
+    // `Outer` collides with the OUTER join keyword by text but is a valid alias.
+    let input = "SELECT * FROM (SELECT * FROM (SELECT Name FROM Products) AS Middle) AS Outer";
     check_no_errors(input);
     let parse = parse_sdbl(input);
     let root = parse.syntax_node();
@@ -4252,8 +4251,10 @@ mod keyword_names {
 
     #[test]
     fn join_keyword_alias_parses_clean() {
-        // `Inner`/`Outer` collide with the INNER join keyword by text but are aliases.
-        check_no_errors("SELECT * FROM (SELECT 1) AS Inner");
+        // Join keywords collide with aliases by text, and only `INNER` is reserved.
+        check_no_errors("SELECT * FROM (SELECT 1) AS Outer");
+        check_no_errors("SELECT * FROM (SELECT 1) AS Left");
+        check_no_errors("SELECT * FROM (SELECT 1) AS Join");
     }
 
     #[test]

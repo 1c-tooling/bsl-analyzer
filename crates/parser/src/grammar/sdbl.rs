@@ -241,9 +241,9 @@ pub(super) fn at_the_alias_separator(p: &Parser) -> bool {
 ///
 /// `ПО` is already among the clause keywords, as the Russian for `ON`. Its
 /// English spelling is here instead, because that predicate would also make it
-/// a boundary — and `BY` is a legal alias and a legal qualifier
-/// (`SELECT A FROM T BY`, `SELECT BY.A FROM T AS BY`), which a boundary
-/// forbids. Only a position that must hold a field or a table is closed to it.
+/// a boundary — and `BY` is a legal qualifier (`SELECT BY.A FROM T`), which a
+/// boundary forbids. Only a position that must hold a field or a table is
+/// closed to it; as an alias it is refused like any other reserved word.
 pub(super) fn at_a_list_separator(p: &Parser) -> bool {
     p.at_keyword("BY")
 }
