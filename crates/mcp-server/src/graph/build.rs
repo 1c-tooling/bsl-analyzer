@@ -216,7 +216,7 @@ impl GraphState {
             built.recovery,
         ))?;
         *lock_recover(&self.scan) = None;
-        self.ensure_hub_roots(&built.scan_roots, built.physical_topology);
+        self.ensure_hub_roots(&built.scan_roots, built.physical_topology, built.declaration_epoch);
         // The fused sink just wrote every indexed document's context from THIS
         // build — nothing persisted predates it, so no whole-collection re-render.
         self.notify_published(false);
@@ -228,7 +228,18 @@ impl GraphState {
     /// root would otherwise leave the hub watching the old universe — events in a
     /// new extension would never be delivered, and every consumer would coast on
     /// its reconcile interval. A no-op when the roots did not change.
-    pub(super) fn ensure_hub_roots(&self, scan_roots: &[std::path::PathBuf], built_topology: u64) {
+    ///
+    /// `declaration_epoch` is the age of the build's own snapshot. The freshness check
+    /// below skips the common case of an overtaken build before anything is sent; the
+    /// epoch covers the race the check cannot — passed its re-read, this build can still
+    /// be overtaken between the check and the declaration — and the hub refuses one that
+    /// speaks for an older composition (github#184).
+    pub(super) fn ensure_hub_roots(
+        &self,
+        scan_roots: &[std::path::PathBuf],
+        built_topology: u64,
+        declaration_epoch: u64,
+    ) {
         let (Some(hub), Some(root)) = (&self.change_hub, self.workspace_root.as_deref()) else {
             return;
         };
@@ -246,6 +257,7 @@ impl GraphState {
         if !hub.ensure_scope(
             &crate::change_hub::watch_targets_for(root, scan_roots),
             &live.user_excluded,
+            declaration_epoch,
         ) {
             tracing::warn!("graph rebuild could not re-arm the change hub onto new roots");
         }
@@ -399,6 +411,7 @@ impl GraphState {
                     fp_pre,
                     force_stale,
                     scan_roots,
+                    declaration_epoch,
                     physical_topology,
                     search_roots,
                     prepared,
@@ -455,7 +468,7 @@ impl GraphState {
                 if let Some(hook) = &self.publish_window_hook {
                     hook();
                 }
-                self.ensure_hub_roots(&scan_roots, physical_topology);
+                self.ensure_hub_roots(&scan_roots, physical_topology, declaration_epoch);
                 self.notify_published(topology_changed);
                 tracing::info!(files, generation, is_reload, "graph database build complete");
             }
@@ -1298,6 +1311,7 @@ fn build_and_publish_scanned_inner(
         fp_pre,
         force_stale,
         scan_roots: project.scan_roots.clone(),
+        declaration_epoch: project.declaration_epoch,
         physical_topology: super::scan::topology_u64(&project.configs),
         search_roots: project.search_roots.clone(),
         prepared,
@@ -2036,6 +2050,10 @@ struct PublishedBuild {
     fp_pre: crate::graph_db::GraphFp,
     force_stale: bool,
     scan_roots: Vec<PathBuf>,
+    /// The age of the build snapshot these roots were taken from, for the hub declaration:
+    /// the build and its declaration are separated by an arbitrary delay, during which a
+    /// newer build may declare first (github#184).
+    declaration_epoch: u64,
     physical_topology: u64,
     search_roots: Option<bsl_search::WorkspaceRoots>,
     prepared: PreparedSnapshotPool,
