@@ -373,6 +373,15 @@ pub struct ModuleMetadata {
 }
 
 impl ModuleMetadata {
+    /// Whether this is the module of an ORDINARY form (a `Form.bin` dialog): code of
+    /// a thick client only, with no compilation directives.
+    /// Managed-form rules (directive defaults, `ЭтотОбъект`, `ОткрытьФорму`, no modal
+    /// dialogs) do not apply there.
+    pub fn is_ordinary_form_module(&self) -> bool {
+        self.module_type == bsl_metadata::ModuleType::FormModule
+            && self.form.as_ref().is_some_and(|form| form.is_ordinary())
+    }
+
     pub fn unknown(module_type: bsl_metadata::ModuleType) -> Self {
         Self {
             module_type,

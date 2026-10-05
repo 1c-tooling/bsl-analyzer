@@ -281,22 +281,31 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
     )
     .unwrap_or_else(|| forms_dir.join(format!("{}.xml", form_name)));
 
-    let ext_form_xml = std::fs::read_to_string(&ext_form_xml_path).map_err(|e| {
-        crate::error::MetadataError::InvalidFormat(format!(
-            "Cannot read form XML at {}: {}",
-            ext_form_xml_path.display(),
-            e
-        ))
-    })?;
+    let metadata = std::fs::read_to_string(&metadata_xml_path)
+        .ok()
+        .and_then(|xml| parse_form_metadata_xml(&xml).ok());
 
-    let mut form = parse_form_xml(&ext_form_xml)?;
-
-    if let Ok(metadata_xml) = std::fs::read_to_string(&metadata_xml_path) {
-        if let Ok(metadata) = parse_form_metadata_xml(&metadata_xml) {
-            form.name = metadata.name;
-            form.form_type = metadata.form_type;
-            form.uuid = metadata.uuid;
+    let mut form = match std::fs::read_to_string(&ext_form_xml_path) {
+        Ok(ext_form_xml) => parse_form_xml(&ext_form_xml)?,
+        // An ORDINARY form has no `Ext/Form.xml`: its dialog is the binary
+        // `Ext/Form.bin`. The form's own descriptor still says `<FormType>Ordinary`,
+        // which is enough to stop analyzing the module as a managed one.
+        Err(_) if metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary) => {
+            Form::ordinary_without_dialog(form_name)
         }
+        Err(e) => {
+            return Err(crate::error::MetadataError::InvalidFormat(format!(
+                "Cannot read form XML at {}: {}",
+                ext_form_xml_path.display(),
+                e
+            )));
+        }
+    };
+
+    if let Some(metadata) = metadata {
+        form.name = metadata.name;
+        form.form_type = metadata.form_type;
+        form.uuid = metadata.uuid;
     }
 
     Ok(form)
@@ -828,6 +837,63 @@ mod tests {
         assert_eq!(form.form_type(), FormType::Ordinary);
         assert!(form.is_handler("ПриСозданииНаСервере"));
         assert!(form.is_handler("КомандаОК"));
+    }
+
+    #[test]
+    fn ordinary_form_without_form_xml_is_read_from_its_descriptor() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let forms = manifest_dir.join("fixtures/designer/Catalogs/Справочник1/Forms");
+        assert!(!forms.join("ФормаОбычная/Ext/Form.xml").exists());
+
+        let form =
+            parse_form_from_bsl_path(&forms.join("ФормаОбычная/Ext/Form/Module.bsl")).unwrap();
+
+        assert_eq!(form.name(), "ФормаОбычная");
+        assert_eq!(form.form_type(), FormType::Ordinary);
+        assert_eq!(form.uuid().to_string(), "0f0e0d0c-0b0a-4908-8706-050403020101");
+        assert!(form.elements().is_empty());
+        // The dialog is unreadable, so the form's own events get their default handlers ...
+        assert!(form.is_handler("ПередОткрытием"));
+        assert!(form.is_handler("OnOpen"));
+        assert!(form.is_handler("ПередЗаписью"));
+        assert!(form.is_handler("ПослеВосстановленияЗначений"));
+        // ... and nothing else: element events and managed-form events are not guessed.
+        assert!(!form.is_handler("ПриСозданииНаСервере"));
+        assert!(!form.is_handler("СписокПриАктивизацииСтроки"));
+    }
+
+    #[test]
+    fn a_form_without_form_xml_needs_an_ordinary_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let forms = dir.path().join("Catalogs/Справочник/Forms");
+        let module = forms.join("Ф/Ext/Form/Module.bsl");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "").unwrap();
+        let descriptor = |form_type: &str| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+	<Form uuid="0f0e0d0c-0b0a-4908-8706-050403020102">
+		<Properties>
+			<Name>Ф</Name>
+			<FormType>{form_type}</FormType>
+		</Properties>
+	</Form>
+</MetaDataObject>"#
+            )
+        };
+
+        // No descriptor at all: nothing says what the form is.
+        assert!(parse_form_from_bsl_path(&module).is_err());
+
+        // A managed form whose `Form.xml` is missing is a broken dump, not an ordinary form.
+        std::fs::write(forms.join("Ф.xml"), descriptor("Managed")).unwrap();
+        assert!(parse_form_from_bsl_path(&module).is_err());
+
+        std::fs::write(forms.join("Ф.xml"), descriptor("Ordinary")).unwrap();
+        let form = parse_form_from_bsl_path(&module).unwrap();
+        assert!(form.is_ordinary());
+        assert_eq!(form.name(), "Ф");
     }
 
     #[test]

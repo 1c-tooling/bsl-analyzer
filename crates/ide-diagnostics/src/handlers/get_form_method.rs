@@ -28,6 +28,10 @@ pub fn from_hir(
     if ctx.is_disabled_with_metadata(code) {
         return None;
     }
+    // In an ordinary form `ПолучитьФорму` is the way to get a form.
+    if ctx.is_ordinary_form_module() {
+        return None;
+    }
 
     Some(Diagnostic {
         code,
