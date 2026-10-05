@@ -374,7 +374,7 @@ pub struct ModuleMetadata {
 
 impl ModuleMetadata {
     /// Whether this is the module of an ORDINARY form (a `Form.bin` dialog): code of
-    /// the thick client of the ordinary application, with no compilation directives.
+    /// a thick client only, with no compilation directives.
     /// Managed-form rules (directive defaults, `ЭтотОбъект`, `ОткрытьФорму`, no modal
     /// dialogs) do not apply there.
     pub fn is_ordinary_form_module(&self) -> bool {

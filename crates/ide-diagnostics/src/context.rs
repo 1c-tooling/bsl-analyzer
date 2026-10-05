@@ -278,7 +278,7 @@ impl<'a> AnalysisContext<'a> {
     }
 
     /// Whether this file is the module of an ORDINARY form (a `Form.bin` dialog):
-    /// thick-client code of the ordinary application, where `ЭтаФорма`,
+    /// thick-client code, where `ЭтаФорма`,
     /// `ПолучитьФорму`, modal dialogs and synchronous calls are the platform's own
     /// means rather than smells to report.
     pub fn is_ordinary_form_module(&self) -> bool {

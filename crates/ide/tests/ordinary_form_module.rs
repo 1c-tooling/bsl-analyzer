@@ -114,3 +114,26 @@ fn managed_form_module_keeps_reporting_the_same_code() {
     assert_eq!(lines_of(&found, DiagnosticCode::UnusedLocalMethod), vec![0, 7], "{found:?}");
     assert!(lines_of(&found, DiagnosticCode::UnusedParameters).contains(&0), "{found:?}");
 }
+
+/// An ordinary form opens in the thick client of the managed application too, when the
+/// configuration allows ordinary forms there (this fixture does): a call no thick
+/// client can make is still reported.
+#[test]
+fn ordinary_form_module_is_checked_for_the_managed_thick_client() {
+    const CALL: &str = "\
+Процедура ПередОткрытием(Отказ, СтандартнаяОбработка)
+	Доступен = ОсновнойСерверДоступен();
+КонецПроцедуры
+";
+    let (db, file_id) = setup(ordinary_form_module(), CALL);
+    assert!(db.module_metadata(ModuleId::new(file_id)).is_ordinary_form_module());
+
+    let unavailable: Vec<String> =
+        ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::UnavailableInEnvironment)
+            .map(|d| d.message)
+            .collect();
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert!(unavailable[0].contains("ОсновнойСерверДоступен"), "{unavailable:?}");
+}
