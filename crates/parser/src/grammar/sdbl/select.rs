@@ -307,7 +307,7 @@ fn selected_field(p: &mut Parser) {
         expressions::expression(p);
 
         let at_expected_position = at_sdbl_keyword(p, "AS", "КАК")
-            || (is_identifier_token(p) && !is_clause_keyword(p))
+            || at_an_implicit_alias(p)
             || p.at(T![Comma])
             || p.at(T![Semicolon])
             || p.at(T![LBrace])
@@ -319,7 +319,7 @@ fn selected_field(p: &mut Parser) {
         }
     }
 
-    if (at_sdbl_keyword(p, "AS", "КАК") || is_identifier_token(p)) && !is_clause_keyword(p) {
+    if at_sdbl_keyword(p, "AS", "КАК") || at_an_implicit_alias(p) {
         selected_field_alias(p);
     }
 
@@ -368,7 +368,7 @@ fn asterisk_field(p: &mut Parser) {
 
 fn selected_field_alias(p: &mut Parser) {
     let m = p.start();
-    alias_name(p, "ожидался псевдоним после 'КАК' / 'AS'", true);
+    alias_name(p, "ожидался псевдоним после 'КАК' / 'AS'", Aliased::Field);
     m.complete(p, NodeKind::SdblAlias);
 }
 
@@ -388,11 +388,12 @@ fn selected_field_alias(p: &mut Parser) {
 /// Without `КАК` the word is reported only behind a complete name: one refused
 /// as the table, or as the part of a name after a dot, has been reported there
 /// already.
-fn alias_name(p: &mut Parser, missing: &'static str, after_a_name: bool) {
+fn alias_name(p: &mut Parser, missing: &'static str, aliased: Aliased) {
     let explicit = eat_sdbl_keyword(p, "AS", "КАК");
 
     // Behind a dot the word is the part of a name that the dot promised and
     // the name's own rule has refused it already.
+    let after_a_name = !matches!(aliased, Aliased::Source { named: false });
     let reported_elsewhere = !after_a_name || p.prev_significant() == Some(T![Dot]);
     if at_word_refused_as_alias(p) && (explicit || !reported_elsewhere) {
         let message = if explicit {
@@ -400,7 +401,7 @@ fn alias_name(p: &mut Parser, missing: &'static str, after_a_name: bool) {
         } else {
             "синтаксическая ошибка: ключевое слово языка запросов нельзя использовать как псевдоним"
         };
-        if explicit && at_a_clause_that_goes_on(p) {
+        if explicit && at_a_clause_that_goes_on(p, aliased) {
             p.error_custom_no_bump(message);
         } else if is_clause_keyword(p) {
             // A clause word is a boundary the generic recovery will not consume,
@@ -417,9 +418,30 @@ fn alias_name(p: &mut Parser, missing: &'static str, after_a_name: bool) {
     super::eat_name_here(p, missing);
 }
 
-fn at_a_clause_that_goes_on(p: &Parser) -> bool {
+/// What an alias names: a selected field, or a source together with whether
+/// the source's name was taken.
+#[derive(Clone, Copy)]
+enum Aliased {
+    Field,
+    Source { named: bool },
+}
+
+/// A clause word that really opens a clause here. A join and its `ПО` follow
+/// only a source, never a field.
+fn at_a_clause_that_goes_on(p: &Parser, aliased: Aliased) -> bool {
+    let opens_here = match aliased {
+        Aliased::Field => !is_join_keyword(p) && !at_sdbl_keyword(p, "ON", "ПО"),
+        Aliased::Source { .. } => true,
+    };
     is_clause_keyword(p)
+        && opens_here
         && !matches!(p.nth(1), None | Some(T![Comma]) | Some(T![RParen]) | Some(T![Semicolon]))
+}
+
+/// A word standing where an alias without `КАК` would: a name that opens no
+/// clause, or a reserved word of a kind of its own, which is reported there.
+fn at_an_implicit_alias(p: &Parser) -> bool {
+    (is_identifier_token(p) && !is_clause_keyword(p)) || at_a_keyword_kind_refused_as_alias(p)
 }
 
 /// A word the platform refuses as an alias: after `КАК` it answers «Ожидается
@@ -483,6 +505,10 @@ fn at_word_refused_as_alias(p: &Parser) -> bool {
         "CAST",
     ];
 
+    at_a_keyword_kind_refused_as_alias(p) || REFUSED.iter().any(|word| p.at_keyword(word))
+}
+
+fn at_a_keyword_kind_refused_as_alias(p: &Parser) -> bool {
     matches!(
         p.current(),
         Some(
@@ -494,7 +520,7 @@ fn at_word_refused_as_alias(p: &Parser) -> bool {
                 | T![KwFalse]
                 | T![KwUndefined]
         )
-    ) || REFUSED.iter().any(|word| p.at_keyword(word))
+    )
 }
 
 fn into_clause(p: &mut Parser) {
@@ -550,7 +576,7 @@ fn data_source(p: &mut Parser) {
         table_ref(p)
     };
 
-    if (at_sdbl_keyword(p, "AS", "КАК") || is_identifier_token(p)) && !is_clause_keyword(p) {
+    if at_sdbl_keyword(p, "AS", "КАК") || at_an_implicit_alias(p) {
         source_alias(p, named);
     }
 
@@ -620,7 +646,7 @@ fn table_ref(p: &mut Parser) -> bool {
 
 fn source_alias(p: &mut Parser, named: bool) {
     let m = p.start();
-    alias_name(p, "ожидался псевдоним источника после 'КАК' / 'AS'", named);
+    alias_name(p, "ожидался псевдоним источника после 'КАК' / 'AS'", Aliased::Source { named });
     m.complete(p, NodeKind::SdblAlias);
 }
 

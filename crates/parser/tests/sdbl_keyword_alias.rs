@@ -271,6 +271,65 @@ fn a_refused_word_after_a_field_or_a_source_without_as_is_reported_at_itself() {
     }
 }
 
+/// The words that reach the parser with kinds of their own are refused without `КАК` as well,
+/// and the clause behind the source is still parsed. Behind a field only the literals reach the
+/// alias: `И`, `ИЛИ`, `В` and `НЕ` continue the expression.
+#[test]
+fn a_refused_keyword_kind_without_as_is_reported_at_itself() {
+    let mut queries = Vec::new();
+    for word in [
+        "В",
+        "И",
+        "ИЛИ",
+        "НЕ",
+        "ИСТИНА",
+        "ЛОЖЬ",
+        "НЕОПРЕДЕЛЕНО",
+        "IN",
+        "AND",
+        "OR",
+        "NOT",
+        "TRUE",
+        "FALSE",
+        "UNDEFINED",
+    ] {
+        queries.push((format!("ВЫБРАТЬ 1 ИЗ Справочник.Валюты {word}"), word));
+    }
+    for word in ["ИСТИНА", "ЛОЖЬ", "НЕОПРЕДЕЛЕНО", "TRUE", "FALSE", "UNDEFINED"]
+    {
+        queries.push((format!("ВЫБРАТЬ 1 {word}"), word));
+    }
+    for (query, word) in &queries {
+        let start = query.rfind(word).unwrap();
+        assert_eq!(errors(query), vec![(range_at(start, word), IMPLICIT)], "`{query}`");
+    }
+
+    let query = "ВЫБРАТЬ 1 ИЗ Справочник.Валюты В ГДЕ ИСТИНА";
+    let start = query.find(" В ").unwrap() + 1;
+    assert_eq!(errors(query), vec![(range_at(start, "В"), IMPLICIT)], "`{query}`");
+    let root = parse_sdbl(query).syntax_node();
+    assert!(has_kind(&root, SyntaxKind::SDBL_WHERE_CLAUSE), "`{query}`: {root:#?}");
+}
+
+/// A join, or the `ПО` of one, cannot follow a field, so after a field's `КАК` such a word is the
+/// alias it was meant to be, and the source clause behind it is still parsed. A clause word is
+/// taken as a recovery span, which runs up to the next word.
+#[test]
+fn a_join_word_as_a_field_alias_leaves_the_source_clause_intact() {
+    for (query, word, span) in [
+        ("SELECT 1 AS INNER FROM Catalog.Currencies", "INNER", "INNER "),
+        ("ВЫБРАТЬ 1 КАК ВНУТРЕННЕЕ ИЗ Справочник.Валюты", "ВНУТРЕННЕЕ", "ВНУТРЕННЕЕ "),
+        ("ВЫБРАТЬ 1 КАК ПО ИЗ Справочник.Валюты", "ПО", "ПО "),
+        ("SELECT 1 AS BY FROM Catalog.Currencies", "BY", "BY"),
+    ] {
+        let start = query.find(&format!(" {word} ")).unwrap() + 1;
+        let span = range_at(start, span);
+        assert_eq!(errors(query), vec![(span, EXPLICIT)], "`{query}`");
+        let root = parse_sdbl(query).syntax_node();
+        assert!(has_kind(&root, SyntaxKind::SDBL_FROM_CLAUSE), "`{query}`: {root:#?}");
+    }
+}
+
 /// A source spelled with a refused word is referenced afterwards; the reference reads as a chain
 /// so the alias stays the one finding, in the select list and in a filter alike.
 #[test]
