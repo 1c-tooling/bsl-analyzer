@@ -12,6 +12,7 @@ pub(crate) const SINGLE_PASS_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::BadWords,
     DiagnosticCode::Typo,
     DiagnosticCode::NestedTernaryOperator,
+    DiagnosticCode::PostfixAccessOnExpression,
     DiagnosticCode::YoLetterUsage,
     DiagnosticCode::MagicDate,
     DiagnosticCode::UsingHardcodePath,

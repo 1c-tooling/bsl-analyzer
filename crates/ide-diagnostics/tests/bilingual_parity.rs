@@ -93,6 +93,7 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (DiagnosticCode::InvalidCharacterInFile, "lexical character diagnostic"),
     (DiagnosticCode::DoubleNegatives, "expression-shape diagnostic"),
     (DiagnosticCode::NestedTernaryOperator, "expression-shape diagnostic"),
+    (DiagnosticCode::PostfixAccessOnExpression, "expression-shape diagnostic"),
     (
         DiagnosticCode::NonExportMethodsInApiRegion,
         "region/export policy; no platform bilingual identifier lookup",
@@ -615,7 +616,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 195, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 196, "update the Track 3 Phase E inventory when DiagnosticCode changes");
 }
 
 #[test]

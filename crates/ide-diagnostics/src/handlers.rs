@@ -121,6 +121,7 @@ pub mod ordinary_app_support;
 pub mod os_users_method;
 pub mod pairing_broken_transaction;
 pub mod parse_error;
+pub mod postfix_access_on_expression;
 pub mod privileged_module_method_call;
 pub mod procedure_returns_value;
 pub mod protected_module;
@@ -251,6 +252,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::InvalidCharacterInFile => Some(&invalid_character_in_file::METADATA),
         DiagnosticCode::DoubleNegatives => Some(&double_negatives::METADATA),
         DiagnosticCode::NestedTernaryOperator => Some(&nested_ternary_operator::METADATA),
+        DiagnosticCode::PostfixAccessOnExpression => Some(&postfix_access_on_expression::METADATA),
         DiagnosticCode::NonExportMethodsInApiRegion => {
             Some(&non_export_methods_in_api_region::METADATA)
         }

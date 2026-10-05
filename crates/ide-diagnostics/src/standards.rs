@@ -61,6 +61,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::InvalidCharacterInFile => &[456],
         DiagnosticCode::DoubleNegatives => &[],
         DiagnosticCode::NestedTernaryOperator => &[],
+        DiagnosticCode::PostfixAccessOnExpression => &[],
         DiagnosticCode::NonExportMethodsInApiRegion => &[455],
         DiagnosticCode::TernaryOperatorUsage => &[],
         DiagnosticCode::UnaryPlusInConcatenation => &[],

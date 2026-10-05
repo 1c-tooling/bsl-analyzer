@@ -35,6 +35,7 @@ fn check_node_handlers(
     handlers::bad_words::check_node(node, acc, ctx);
     handlers::typo::check_node(node, acc, ctx);
     handlers::nested_ternary_operator::check_node(node, acc, ctx);
+    handlers::postfix_access_on_expression::check_node(node, acc, ctx);
 }
 
 #[inline]
