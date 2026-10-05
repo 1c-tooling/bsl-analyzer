@@ -12,7 +12,7 @@ use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
 use std::path::PathBuf;
 use test_fixture::Fixture;
-use vfs::FileId;
+use vfs::{FileId, FileSet, VfsPath};
 
 fn designer_fixture_path() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer"))
@@ -251,4 +251,100 @@ fn a_module_method_named_max_is_not_narrowed() {
         db.lookup_type(ty)
     );
     assert_eq!(mismatch_count(&db, file_id), 1, "Формат does not accept a Строка");
+}
+
+#[test]
+fn a_global_export_named_max_is_not_narrowed() {
+    // The inline fixture format cannot carry the `<Global>` flag, so the global module
+    // and the caller live at their paths in the on-disk `designer` configuration.
+    let global_body = "Функция Макс(Значение) Экспорт\n    Возврат \"текст\";\nКонецФункции\n";
+    let caller_body = "Процедура Тест() Экспорт\n    Результат = Макс(1);\n    \
+                       Текст = Формат(Результат, \"ЧГ=0\");\nКонецПроцедуры\n";
+    let caller_id = FileId::from_raw(1);
+    let global_id = FileId::from_raw(2);
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::default();
+    for (id, rel) in [
+        (caller_id, "CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl"),
+        (global_id, "CommonModules/ГлобальныйСерверныйМодуль/Ext/Module.bsl"),
+    ] {
+        let path = designer_fixture_path().join(rel).to_string_lossy().to_string();
+        file_set.insert(id, VfsPath::new(path));
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (id, text) in [(caller_id, caller_body), (global_id, global_body)] {
+        db.set_file_source_root(id, SourceRootId(0));
+        db.set_file_text(id, text);
+    }
+    db.set_all_config_paths(vec![(None, designer_fixture_path())]);
+
+    let ty = local_ty(&db, caller_id, "результат");
+    assert!(
+        matches!(db.lookup_type(ty), TypeKind::String(_)),
+        "the global export `Макс` returns a Строка, so the platform rule must not apply, got {:?}",
+        db.lookup_type(ty)
+    );
+    assert_eq!(mismatch_count(&db, caller_id), 1, "Формат does not accept a Строка");
+}
+
+/// Methods and variables live apart: `Макс(...)` looks among methods only, so a variable
+/// named `Макс` leaves the call to the platform function and the result is still the
+/// first argument's type.
+#[test]
+fn a_module_variable_named_max_leaves_the_narrowing_in_place() {
+    let fixture = r#"
+//- /test.bsl
+Перем Макс;
+
+Функция ПериодВМесяцах(Начало, Конец)
+    Возврат Месяц(Конец) - Месяц(Начало);
+КонецФункции
+
+Процедура МаксМин(Начало, Конец)
+    Месяцев = Макс(1, ПериодВМесяцах(Начало, Конец));
+    Сообщить(Формат(Месяцев, "ЧГ=0"));
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+    let ty = local_ty(&db, file_id, "месяцев");
+    assert!(
+        matches!(db.lookup_type(ty), TypeKind::Number(_)),
+        "a module variable does not own the call name, so the result is a Число, got {:?}",
+        db.lookup_type(ty)
+    );
+    assert_eq!(mismatch_count(&db, file_id), 0, "a Число is a valid Формат argument");
+}
+
+#[test]
+fn a_local_variable_named_max_leaves_the_narrowing_in_place() {
+    let fixture = r#"
+//- /test.bsl
+Процедура ЧерезПараметр(Макс)
+    ЧерезПараметр = Макс(1, 2);
+    Текст = Формат(ЧерезПараметр, "ЧГ=0");
+КонецПроцедуры
+
+Процедура ЧерезПерем()
+    Перем Мин;
+    ЧерезПерем = Мин(1, 2);
+    Текст = Формат(ЧерезПерем, "ЧГ=0");
+КонецПроцедуры
+
+Процедура ЧерезЛокальную()
+    Макс = "текст";
+    ЧерезЛокальную = Макс(1, 2);
+    Текст = Формат(ЧерезЛокальную, "ЧГ=0");
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+    for local in ["черезпараметр", "черезперем", "черезлокальную"]
+    {
+        let ty = local_ty(&db, file_id, local);
+        assert!(
+            matches!(db.lookup_type(ty), TypeKind::Number(_)),
+            "`{local}`: a variable does not own the call name, so the result is a Число, got {:?}",
+            db.lookup_type(ty)
+        );
+    }
+    assert_eq!(mismatch_count(&db, file_id), 0, "a Число is a valid Формат argument");
 }
