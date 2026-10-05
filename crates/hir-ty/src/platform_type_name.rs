@@ -101,6 +101,14 @@ const FORM_CONTROL_KINDS: &[FormElementKind] = &[
     FormElementKind::Addition,
 ];
 
+/// One of the generic form-item kinds (`ПолеФормы`, `ГруппаФормы`, …).
+pub(crate) fn is_form_control_type_name(name: &str) -> bool {
+    FORM_CONTROL_KINDS
+        .iter()
+        .filter_map(|kind| form_control_name_for(*kind))
+        .any(|(ru, en)| name_eq_ci(name, ru, en))
+}
+
 /// The four form-data container family names. SSoT behind the FormData arm of
 /// `subtype::is_concrete_to_generic_platform_bridge` and the lowering gate.
 pub(crate) const FORM_DATA_NAMES: &[(&str, &str)] = &[

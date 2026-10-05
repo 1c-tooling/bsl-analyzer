@@ -1261,6 +1261,63 @@ impl<'db> InferenceContext<'db> {
         Some(text.trim())
     }
 
+    /// The one member of a platform method's return union that its `Тип`
+    /// argument names. Collections that create items of several kinds
+    /// (`Элементы.Добавить(Имя, Тип("ГруппаФормы"), Родитель)`,
+    /// `Отбор.Элементы.Добавить(Тип("ЭлементОтбораКомпоновкиДанных"))`, …)
+    /// document the result as the union of every kind they can create, while
+    /// the call creates exactly the kind it was asked for. Keeping the union
+    /// makes the result unusable as an argument whose slot admits only some of
+    /// the kinds — a group created to be a `Родитель` is rejected because a
+    /// field could not be one.
+    ///
+    /// Only a literal `Тип("X")` decides, and only when X is one of the
+    /// documented kinds: the platform rejects any other type at runtime, so a
+    /// name outside the union is a different defect, not a reason to trust it.
+    /// Only platform signatures reach this: a user method is bound before the
+    /// platform lookup, and its documented `Тип` parameter would promise
+    /// nothing about the result anyway.
+    fn return_selected_by_type_argument(
+        &mut self,
+        body: &Body,
+        signature: &crate::call_resolution::CallSignature,
+        args: &[ExprIdx],
+    ) -> Option<TypeId> {
+        let TypeKind::Union(members) = self.db.lookup_type(signature.return_ty) else {
+            return None;
+        };
+        let type_param = self.db.type_descriptor();
+        let position = signature.params.iter().position(|param| param.ty == type_param)?;
+        let arg = *args.get(position)?;
+        let (callee, text) = crate::type_literal::type_ctor_literal(body, arg)?;
+        if self.is_call_name_shadowed(callee) {
+            return None;
+        }
+        let named = crate::lower::type_string::lower_constructed_type_name_typeid(self.db, text);
+        if named == self.db.unknown() {
+            return None;
+        }
+        members
+            .iter()
+            .any(|member| crate::subtype::is_assignable(self.db, named, *member))
+            .then_some(named)
+    }
+
+    /// [`Self::return_selected_by_type_argument`] applied to every signature,
+    /// so overload selection and the call's recorded binding agree on it.
+    fn select_returns_by_type_argument(
+        &mut self,
+        candidates: &mut crate::call_resolution::CallCandidateSet,
+        args: &[ExprIdx],
+    ) {
+        let body = Arc::clone(&self.body);
+        for signature in candidates.signatures_mut() {
+            if let Some(selected) = self.return_selected_by_type_argument(&body, signature, args) {
+                signature.return_ty = selected;
+            }
+        }
+    }
+
     fn is_call_name_shadowed(&mut self, name: &Name) -> bool {
         // Variables are NOT asked: BSL keeps names of variables and of methods
         // apart, so `Имя(...)` is looked up among methods even where a local
@@ -3121,6 +3178,8 @@ impl<'db> InferenceContext<'db> {
                     );
                     self.check_member_env(callee, &method_name, info.env, EnvMemberKind::Method);
                     let mut candidates = info.candidates;
+                    let arg_idxs: Vec<ExprIdx> = args.iter().map(|arg| arg.to_idx()).collect();
+                    self.select_returns_by_type_argument(&mut candidates, &arg_idxs);
                     // Same coercion the user cascade dispatched on: the manager
                     // receiver and the workspace receiver are one value.
                     if let TypeKind::ObjectManager(facet) = &workspace_receiver_kind {
