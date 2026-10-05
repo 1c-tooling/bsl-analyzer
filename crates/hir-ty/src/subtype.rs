@@ -393,12 +393,21 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
     //   author knows the template's kind), where flagging the canonical print
     //   flow is noise. Any other non-fitting alternative keeps the call
     //   flagged.
+    // - a union made only of form-item kinds is accepted when one kind fits:
+    //   it is what `Элементы.Добавить`/`Вставить` return when the `Тип`
+    //   argument is not a literal (a variable, a parameter, `ТипЗнч(Элемент)`)
+    //   and what a loop over `Элементы` yields, and the author chose the kind
+    //   through that argument or a check the analyzer does not narrow on, just
+    //   as with the template above.
+    //   A literal `Тип("…")` narrows the result to one kind during inference,
+    //   so a field passed where only a group fits is still flagged.
     // This is argument-position policy, NOT subtype truth: is_assignable
     // keeps the sound all-members rule that function variance relies on.
     if let TypeKind::Union(parts) = db.lookup_type(from) {
         let mut has_regular = false;
         let mut some_regular_fits = false;
         let mut nonfitting_regular_all_binary = true;
+        let mut regular_all_form_items = true;
         for part in parts.iter() {
             let part_kind = db.lookup_type(*part);
             if matches!(part_kind, TypeKind::Undefined | TypeKind::Null) {
@@ -407,6 +416,7 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
                 }
             } else {
                 has_regular = true;
+                regular_all_form_items &= is_form_item_kind(part_kind);
                 if is_coercible_to(db, *part, to) {
                     some_regular_fits = true;
                 } else if !is_binary_data(part_kind) {
@@ -414,7 +424,8 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
                 }
             }
         }
-        return !has_regular || (some_regular_fits && nonfitting_regular_all_binary);
+        return !has_regular
+            || (some_regular_fits && (nonfitting_regular_all_binary || regular_all_form_items));
     }
     is_assignable(db, from, to)
 }
@@ -436,6 +447,16 @@ fn to_admits_bare_value_table(db: &dyn TypeKernelDb, to: TypeId) -> bool {
 fn is_binary_data(kind: &TypeKind) -> bool {
     matches!(kind, TypeKind::PlatformObject(facet)
         if platform_name_eq_ci(&facet.name, "ДвоичныеДанные", "BinaryData"))
+}
+
+fn is_form_item_kind(kind: &TypeKind) -> bool {
+    match kind {
+        TypeKind::PlatformObject(facet) => {
+            crate::platform_type_name::is_form_control_type_name(&facet.name)
+        }
+        TypeKind::FormControl { .. } => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1176,6 +1197,46 @@ mod tests {
         );
         let field = db.mk_form_control(FormElementFacet::Field, None);
         assert!(is_assignable(&db, field, db.platform_object("ПолеФормы".to_string())));
+    }
+
+    #[test]
+    fn form_item_union_argument_is_accepted_when_one_kind_fits() {
+        let db = InMemoryDb::new();
+        let item = |name: &str| db.platform_object(name.to_string());
+        let created = db.union(vec![
+            item("ДекорацияФормы"),
+            item("ГруппаФормы"),
+            item("КнопкаФормы"),
+            item("ТаблицаФормы"),
+            item("ПолеФормы"),
+        ]);
+        let parent_slot = db.union(vec![
+            item("ГруппаФормы"),
+            item("ТаблицаФормы"),
+            item("ФормаКлиентскогоПриложения"),
+        ]);
+        assert!(
+            is_coercible_to(&db, created, parent_slot),
+            "the kind chosen by a non-literal Тип argument may be a group"
+        );
+        assert!(
+            !is_assignable(&db, created, parent_slot),
+            "the lattice keeps the all-members rule"
+        );
+        assert!(
+            !is_coercible_to(&db, item("ПолеФормы"), parent_slot),
+            "a narrowed field still cannot be a parent"
+        );
+        let mixed = db.union(vec![item("ГруппаФормы"), db.number(None, None)]);
+        assert!(
+            !is_coercible_to(&db, mixed, item("ГруппаФормы")),
+            "only a union made of form items gets the latitude"
+        );
+        let maybe_absent = db.union(vec![item("ГруппаФормы"), item("ПолеФормы"), db.undefined()]);
+        assert!(
+            !is_coercible_to(&db, maybe_absent, parent_slot),
+            "a possibly absent item still fails a slot that does not admit Неопределено"
+        );
     }
 
     #[test]
