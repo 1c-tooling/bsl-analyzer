@@ -16,8 +16,17 @@ fn base_data() -> Value {
     })
 }
 
+fn curated_overlay() -> Value {
+    serde_json::from_str(include_str!("../data/platform_overlays.json")).unwrap()
+}
+
+/// The curated overlay narrowed to its DOM `AppendChild` override, the one
+/// method [`base_data`] carries; the other sections stay as curated.
 fn valid_overlay() -> String {
-    include_str!("../data/platform_overlays.json").to_owned()
+    let mut overlay = curated_overlay();
+    overlay["method_parameter_overrides"].as_array_mut().unwrap().truncate(1);
+    overlay.as_object_mut().unwrap().remove("global_function_parameter_overrides");
+    serde_json::to_string_pretty(&overlay).unwrap()
 }
 
 fn overlay_with_versions(min_version: Option<&str>, max_version: Option<&str>) -> String {
@@ -367,4 +376,223 @@ fn curated_overlay_adds_window_opening_mode() {
         prop["type_name"] == "ClientApplicationForm" && prop["name"] == "РежимОткрытияОкна"
     });
     assert!(added, "curated overlay must add ClientApplicationForm.РежимОткрытияОкна");
+}
+
+fn global_function_data() -> Value {
+    json!({
+        "types": [
+            {"name": "ОбъектМетаданных: Поле", "english_name": "MetadataObject: Field"},
+            {"name": "ОбъектМетаданных: Справочник", "english_name": "MetadataObject: Catalog"},
+            {"name": "ОбъектМетаданныхКонфигурация", "english_name": "ConfigurationMetadataObject"},
+            {"name": "ОбъектМетаданных: ТаблицаИзмерения", "english_name": "MetadataObject: DimensionTable"}
+        ],
+        "methods": [
+            {
+                "id": 1,
+                "type_name": "MetadataObjectCollection",
+                "name": "ПравоДоступа",
+                "english_name": "AccessRight",
+                "min_version": "8.0",
+                "parameters": [{"name": "Право", "param_type": "Строка"}, {"name": "Объект", "param_type": "Строка"}]
+            }
+        ],
+        "global_functions": [
+            {
+                "id": 459,
+                "name": "ПравоДоступа",
+                "english_name": "AccessRight",
+                "min_version": "8.0",
+                "parameters": [
+                    {"name": "Право", "param_type": "Строка"},
+                    {"name": "ОбъектМетаданных", "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: Поле"}
+                ]
+            }
+        ]
+    })
+}
+
+fn global_function_overlay(entry: Value) -> String {
+    json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "global_function_parameter_overrides": [entry]
+    })
+    .to_string()
+}
+
+fn access_right_override() -> Value {
+    json!({
+        "russian_name": "ПравоДоступа",
+        "english_name": "AccessRight",
+        "min_version": "8.0",
+        "parameter_index": 1,
+        "replacement_type_list": ["ОбъектМетаданных: *"],
+        "evidence_source": "the parameter description lists every metadata-object kind",
+        "rationale": "the extract cut the list to five kinds"
+    })
+}
+
+#[test]
+fn applies_global_function_override_by_name_alone() {
+    let mut data = global_function_data();
+
+    apply_global_function_parameter_overlays(
+        &mut data,
+        &global_function_overlay(access_right_override()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        data["global_functions"][0]["parameters"][1]["param_type"],
+        "ОбъектМетаданных: Поле, ОбъектМетаданных: Справочник, ОбъектМетаданных: ТаблицаИзмерения"
+    );
+    assert_eq!(
+        data["methods"][0]["parameters"][1]["param_type"], "Строка",
+        "a type method of the same name is not a global function"
+    );
+}
+
+#[test]
+fn global_function_override_leaves_method_overrides_alone() {
+    let mut data = global_function_data();
+
+    apply_method_parameter_overlays(&mut data, &global_function_overlay(access_right_override()))
+        .unwrap();
+
+    assert_eq!(
+        data["global_functions"][0]["parameters"][1]["param_type"],
+        "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: Поле"
+    );
+}
+
+#[test]
+fn absent_global_function_section_is_a_no_op() {
+    let mut data = global_function_data();
+    data.as_object_mut().unwrap().remove("global_functions");
+
+    apply_global_function_parameter_overlays(&mut data, &valid_overlay()).unwrap();
+}
+
+#[test]
+fn rejects_missing_global_function_target() {
+    let mut data = global_function_data();
+    let mut entry = access_right_override();
+    entry["english_name"] = Value::String("NoSuchFunction".to_owned());
+    entry["russian_name"] = Value::String("НетТакойФункции".to_owned());
+
+    let error =
+        apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
+            .unwrap_err();
+
+    assert_eq!(error.to_string(), "overlay target NoSuchFunction is missing or ambiguous");
+}
+
+#[test]
+fn rejects_global_function_aliases_that_resolve_to_different_functions() {
+    let mut data = global_function_data();
+    data["global_functions"].as_array_mut().unwrap().push(json!({
+        "id": 460,
+        "name": "ДругаяФункция",
+        "english_name": "OtherFunction",
+        "min_version": "8.0",
+        "parameters": [{"name": "Право", "param_type": "Строка"}, {"name": "Объект", "param_type": "Строка"}]
+    }));
+    let mut entry = access_right_override();
+    entry["english_name"] = Value::String("OtherFunction".to_owned());
+
+    let error =
+        apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
+            .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "overlay aliases for OtherFunction resolve to different methods (0 and 1)"
+    );
+}
+
+#[test]
+fn rejects_canonical_type_on_a_global_function_override() {
+    let mut data = global_function_data();
+    let mut entry = access_right_override();
+    entry["canonical_type"] = Value::String("MetadataObjectCollection".to_owned());
+
+    let error =
+        apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
+            .unwrap_err();
+
+    assert_eq!(error.to_string(), "overlay entry 0 has unknown field canonical_type");
+}
+
+#[test]
+fn rejects_duplicate_global_function_override() {
+    let mut data = global_function_data();
+    let overlay = json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "global_function_parameter_overrides": [access_right_override(), access_right_override()]
+    })
+    .to_string();
+
+    let error = apply_global_function_parameter_overlays(&mut data, &overlay).unwrap_err();
+
+    assert_eq!(error.to_string(), "duplicate override for AccessRight parameter 1");
+}
+
+#[test]
+fn rejects_global_function_override_outside_its_version_bounds() {
+    let mut data = global_function_data();
+    let mut entry = access_right_override();
+    entry["min_version"] = Value::String("8.2".to_owned());
+
+    let error =
+        apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
+            .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "overlay target AccessRight version is outside its declared bounds"
+    );
+}
+
+#[test]
+fn family_wildcard_expands_to_every_extracted_member() {
+    let mut data = global_function_data();
+    let mut entry = access_right_override();
+    entry["replacement_type_list"] =
+        json!(["Массив", "ОбъектМетаданных: *", "ОбъектМетаданных: Поле"]);
+
+    apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry)).unwrap();
+
+    assert_eq!(
+        data["global_functions"][0]["parameters"][1]["param_type"],
+        "Массив, ОбъектМетаданных: Поле, ОбъектМетаданных: Справочник, ОбъектМетаданных: ТаблицаИзмерения",
+        "members in extract order, once each; a name merely sharing the stem is no member"
+    );
+}
+
+#[test]
+fn rejects_family_wildcard_without_members() {
+    let mut data = global_function_data();
+    let mut entry = access_right_override();
+    entry["replacement_type_list"] = json!(["ОбъектНетТакого: *"]);
+
+    let error =
+        apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
+            .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "overlay target AccessRight replacement ОбъектНетТакого: * names no extracted type"
+    );
+}
+
+#[test]
+fn a_star_without_a_family_prefix_is_a_plain_name() {
+    let mut data = global_function_data();
+    let mut entry = access_right_override();
+    entry["replacement_type_list"] = json!(["ОбъектМетаданных*"]);
+
+    apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry)).unwrap();
+
+    assert_eq!(data["global_functions"][0]["parameters"][1]["param_type"], "ОбъектМетаданных*");
 }

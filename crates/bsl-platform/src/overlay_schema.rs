@@ -15,13 +15,24 @@ impl std::error::Error for OverlayError {}
 
 #[derive(Debug)]
 pub(crate) struct MethodParameterOverride {
-    pub(crate) canonical_type: String,
+    /// The owning type of a method; `None` for a global-context function.
+    pub(crate) canonical_type: Option<String>,
     pub(crate) russian_name: String,
     pub(crate) english_name: String,
     pub(crate) min_version: Option<Vec<u32>>,
     pub(crate) max_version: Option<Vec<u32>>,
     pub(crate) parameter_index: usize,
     pub(crate) replacement_type_list: Vec<String>,
+}
+
+impl MethodParameterOverride {
+    /// `Type.Method` for a method, `Function` for a global-context function.
+    pub(crate) fn target(&self) -> String {
+        match &self.canonical_type {
+            Some(canonical_type) => format!("{canonical_type}.{}", self.english_name),
+            None => self.english_name.clone(),
+        }
+    }
 }
 
 /// A standard property the extracted help archive omits or files under a
@@ -39,8 +50,12 @@ pub(crate) struct TypePropertyAddition {
     pub(crate) min_version: Option<String>,
 }
 
-const OVERLAY_ROOT_FIELDS: &[&str] =
-    &["schema_version", "method_parameter_overrides", "type_property_additions"];
+const OVERLAY_ROOT_FIELDS: &[&str] = &[
+    "schema_version",
+    "method_parameter_overrides",
+    "global_function_parameter_overrides",
+    "type_property_additions",
+];
 
 pub(crate) fn parse_overrides(
     overlay_source: &str,
@@ -57,7 +72,44 @@ pub(crate) fn parse_overrides(
             OverlayError("overlay method_parameter_overrides must be an array".to_owned())
         })?;
 
-    entries.iter().enumerate().map(|(index, entry)| parse_override(index, entry)).collect()
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_override(index, entry, OverrideTarget::TypeMethod))
+        .collect()
+}
+
+/// Parses the optional `global_function_parameter_overrides` section: the same
+/// entry shape as a method override, without `canonical_type`. An absent section
+/// yields no overrides.
+pub(crate) fn parse_global_function_overrides(
+    overlay_source: &str,
+) -> Result<Vec<MethodParameterOverride>, OverlayError> {
+    let root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    require_only_fields(object, OVERLAY_ROOT_FIELDS, "overlay root")?;
+    validate_schema_version(object)?;
+    let entries = match object.get("global_function_parameter_overrides") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or_else(|| {
+            OverlayError("overlay global_function_parameter_overrides must be an array".to_owned())
+        })?,
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_override(index, entry, OverrideTarget::GlobalFunction))
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverrideTarget {
+    TypeMethod,
+    GlobalFunction,
 }
 
 /// Parses the optional `type_property_additions` section. An absent section
@@ -194,8 +246,8 @@ pub(crate) fn validate_version_bounds(
         method.get("min_version").and_then(Value::as_str).and_then(parse_version).ok_or_else(
             || {
                 OverlayError(format!(
-                    "overlay target {}.{} has no valid minimum version",
-                    overlay.canonical_type, overlay.english_name
+                    "overlay target {} has no valid minimum version",
+                    overlay.target()
                 ))
             },
         )?;
@@ -205,33 +257,40 @@ pub(crate) fn validate_version_bounds(
         overlay.max_version.as_ref().is_some_and(|max_version| target_version > *max_version);
     if below_minimum || above_maximum {
         return Err(OverlayError(format!(
-            "overlay target {}.{} version is outside its declared bounds",
-            overlay.canonical_type, overlay.english_name
+            "overlay target {} version is outside its declared bounds",
+            overlay.target()
         )));
     }
     Ok(())
 }
 
-fn parse_override(index: usize, entry: &Value) -> Result<MethodParameterOverride, OverlayError> {
+fn parse_override(
+    index: usize,
+    entry: &Value,
+    target: OverrideTarget,
+) -> Result<MethodParameterOverride, OverlayError> {
     let object = entry
         .as_object()
         .ok_or_else(|| OverlayError(format!("overlay entry {index} must be an object")))?;
-    require_only_fields(
-        object,
-        &[
-            "canonical_type",
-            "russian_name",
-            "english_name",
-            "min_version",
-            "max_version",
-            "parameter_index",
-            "replacement_type_list",
-            "evidence_source",
-            "rationale",
-        ],
-        &format!("overlay entry {index}"),
-    )?;
-    let canonical_type = required_string(object, "canonical_type", index)?;
+    const ENTRY_FIELDS: &[&str] = &[
+        "russian_name",
+        "english_name",
+        "min_version",
+        "max_version",
+        "parameter_index",
+        "replacement_type_list",
+        "evidence_source",
+        "rationale",
+    ];
+    let allowed_fields = match target {
+        OverrideTarget::TypeMethod => [&["canonical_type"], ENTRY_FIELDS].concat(),
+        OverrideTarget::GlobalFunction => ENTRY_FIELDS.to_vec(),
+    };
+    require_only_fields(object, &allowed_fields, &format!("overlay entry {index}"))?;
+    let canonical_type = match target {
+        OverrideTarget::TypeMethod => Some(required_string(object, "canonical_type", index)?),
+        OverrideTarget::GlobalFunction => None,
+    };
     let russian_name = required_string(object, "russian_name", index)?;
     let english_name = required_string(object, "english_name", index)?;
     let min_version = optional_version(object, "min_version", index)?;
