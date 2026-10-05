@@ -1267,15 +1267,15 @@ impl<'db> InferenceContext<'db> {
         // `Имя` exists. The BSP idiom `КаталогПрограммы = КаталогПрограммы();`
         // is exactly that, 17 times over on a real configuration — treating the
         // local as an owner would silence every one of them.
+        // A module-level `Перем` is a variable too and is not asked either: a module
+        // `Перем СтрДлина` leaves `СтрДлина("abcd")` calling the platform function
+        // (checked on 8.3.17 and 8.3.27).
         let key = NormName::intern(name.as_str());
-        // A module-level `Перем` takes the name over just as a module method
-        // does, so both are asked. Not through `resolve_name`: it answers
-        // `Builtin` first, and every name worth asking about here — `Тип` above
-        // all — is precisely a builtin, so the module would never be consulted.
+        // Not through `resolve_name`: it answers `Builtin` first, and every name
+        // worth asking about here — `Тип` above all — is precisely a builtin, so
+        // the module would never be consulted.
         let resolver = self.get_resolver();
-        if resolver.resolve_module_method(self.db, name).is_some()
-            || resolver.resolve_module_variable(self.db, name).is_some()
-        {
+        if resolver.resolve_module_method(self.db, name).is_some() {
             return true;
         }
         self.global_export_map().contains_key(&key)
@@ -1508,8 +1508,9 @@ impl<'db> InferenceContext<'db> {
     /// runs, so the declared union stays. An unknown one leaves the result unknown: the
     /// declared union would claim `Строка` for `Макс(Параметр, 1)` and accuse the next
     /// number-only consumer (`Формат(..., "ЧГ=0")`) on the strength of nothing.
-    /// The rule is the platform function's: a module method, module variable or global
-    /// export that owns the name answers for its own result.
+    /// The rule is the platform function's: a module method or a global export that owns
+    /// the name answers for its own result. A same-named variable does not take the name
+    /// over (see [`Self::is_call_name_shadowed`]), so the narrowing stays there.
     fn refine_first_argument_return(
         &mut self,
         name: &hir_def::Name,
@@ -3241,11 +3242,12 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
+        // Variables never own a call name: a parameter, a `Перем` (in the body or the
+        // module) or an implicit local named like a method leaves `Имя(...)` calling the
+        // method — the module's own, a global export or the platform's. Checked on
+        // 8.3.17 and 8.3.27; BSL has no way to call a variable's value.
         if let Some(name) = &bare_callee_name {
-            if !self.body_declares_binding(name)
-                && !self.assigned_var_names.contains(&NormName::intern(name.as_str()))
-                && !self.bare_module_method_exists(name)
-            {
+            if !self.bare_module_method_exists(name) {
                 if let Some(ret) = self.resolve_bare_global_export(name, args, callee) {
                     return ret;
                 }
@@ -3336,10 +3338,7 @@ impl<'db> InferenceContext<'db> {
         // callables; infer arguments and availability, but keep the return type
         // unknown until a signature is available.
         if let Some(name) = &bare_callee_name {
-            let unshadowed = !self.body_declares_binding(name)
-                && !self.assigned_var_names.contains(&NormName::intern(name.as_str()))
-                && !self.bare_module_method_exists(name);
-            if unshadowed {
+            if !self.bare_module_method_exists(name) {
                 if let Some(symbol) =
                     bsl_platform::PlatformGlobalCatalog::instance().lookup(name.as_str())
                 {
@@ -3372,27 +3371,20 @@ impl<'db> InferenceContext<'db> {
         }
 
         let callee_kind = self.db.lookup_type(callee_ty);
-        match callee_kind {
-            TypeKind::Function(facet) => {
-                let candidates =
-                    crate::call_resolution::CallCandidateSet::from_function_facet(facet);
-                self.record_candidate_call_arg_binding(callee, args, candidates);
-                facet.returns
-            }
-            TypeKind::Unknown => {
-                if let Some(name) = bare_callee_name.as_ref() {
-                    if !self.body_declares_binding(name)
-                        && !self.assigned_var_names.contains(&NormName::intern(name.as_str()))
-                    {
-                        if let Some(return_ty) = self.infer_local_method_call(name, args, callee) {
-                            return return_ty;
-                        }
-                    }
-                }
-                self.db.unknown()
-            }
-            _ => self.db.unknown(),
+        if let TypeKind::Function(facet) = callee_kind {
+            let candidates = crate::call_resolution::CallCandidateSet::from_function_facet(facet);
+            self.record_candidate_call_arg_binding(callee, args, candidates);
+            return facet.returns;
         }
+        // The callee expression typed above reads the name as a VALUE, so a variable of the
+        // name — parameter, `Перем`, implicit local (`Соединение = Соединение(...)` in BSP) —
+        // answered it. The call itself looks among methods only.
+        if let Some(name) = bare_callee_name.as_ref() {
+            if let Some(return_ty) = self.infer_local_method_call(name, args, callee) {
+                return return_ty;
+            }
+        }
+        self.db.unknown()
     }
 
     /// Resolves a call against the methods of the module being inferred, judges it

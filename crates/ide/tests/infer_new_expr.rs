@@ -401,10 +401,10 @@ fn new_with_family_guessed_name_stays_unknown_in_the_string_form() {
     }
 }
 
-/// Модульная переменная перехватывает имя так же, как метод модуля: платформенной
-/// `Тип` здесь нет, и строка ничего не говорит о типе результата.
+/// Модульная переменная имя вызова не перехватывает: `Тип("Массив")` при `Перем Тип;`
+/// в модуле - по-прежнему платформенная функция.
 #[test]
-fn module_variable_named_type_is_not_a_type_name_wrapper() {
+fn module_variable_named_type_leaves_the_type_name_wrapper() {
     let fixture = r#"//- /test.bsl
 Перем Тип;
 Функция Тест()
@@ -415,8 +415,8 @@ fn module_variable_named_type_is_not_a_type_name_wrapper() {
     let (db, file_id) = setup(fixture);
     assert_eq!(
         var_ty(&db, file_id, "х"),
-        None,
-        "a module variable takes the name over, so the literal is not a type name"
+        Some(db.array(None)),
+        "a module variable does not take the call name, so the literal still names the type"
     );
 
     let control = r#"//- /test.bsl
