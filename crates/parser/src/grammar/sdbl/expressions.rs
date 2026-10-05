@@ -2,6 +2,10 @@ use crate::event::NodeKind;
 use crate::parser::Parser;
 
 pub(super) fn is_expression_start(p: &Parser) -> bool {
+    if at_a_keyword_qualifier(p) {
+        return true;
+    }
+
     match p.current() {
         Some(T![Decimal])
         | Some(T![Float])
@@ -275,7 +279,7 @@ fn logical_and_expr(p: &mut Parser) {
 }
 
 fn not_expr(p: &mut Parser) {
-    if p.at(T![KwNot]) {
+    if p.at(T![KwNot]) && !at_a_keyword_qualifier(p) {
         let m = p.start();
         p.bump();
         not_expr(p);
@@ -320,7 +324,9 @@ fn multiplicative_expr(p: &mut Parser) {
 }
 
 fn unary_expr(p: &mut Parser) {
-    if matches!(p.current(), Some(T![Plus]) | Some(T![Minus]) | Some(T![KwNot])) {
+    if matches!(p.current(), Some(T![Plus]) | Some(T![Minus]) | Some(T![KwNot]))
+        && !at_a_keyword_qualifier(p)
+    {
         let m = p.start();
         p.bump();
         unary_expr(p);
@@ -331,6 +337,11 @@ fn unary_expr(p: &mut Parser) {
 }
 
 fn primary_expr(p: &mut Parser) {
+    if at_a_keyword_qualifier(p) {
+        column_or_function(p);
+        return;
+    }
+
     if p.at_keyword("CASE") || p.at_keyword("ВЫБОР") {
         case_expr(p);
         return;
@@ -414,6 +425,33 @@ fn at_a_keyword_that_cannot_be_a_field(p: &Parser) -> bool {
     p.names_are_fields()
         && (super::select::is_clause_keyword(p) || super::at_a_list_separator(p))
         && !next_is_a_qualifying_dot(p)
+}
+
+/// An operator or literal word standing in front of a dot: `В.Ссылка`,
+/// `НЕ.Ссылка`, `ВЫБОР.Ссылка`.
+///
+/// None of these words takes a dot as an operator or a literal, so the dot makes
+/// the word the qualifier of a chain — the alias of a source spelled with a
+/// reserved word. The alias is refused where it is declared; reading its uses
+/// as chains keeps that one finding from being followed by a second one at
+/// every reference.
+fn at_a_keyword_qualifier(p: &Parser) -> bool {
+    let is_keyword = matches!(
+        p.current(),
+        Some(
+            T![KwIn]
+                | T![KwAnd]
+                | T![KwOr]
+                | T![KwNot]
+                | T![KwTrue]
+                | T![KwFalse]
+                | T![KwUndefined]
+        )
+    ) || p.at_keyword("CASE")
+        || p.at_keyword("ВЫБОР")
+        || p.at_keyword("NULL");
+
+    is_keyword && next_is_a_qualifying_dot(p)
 }
 
 fn next_is_a_qualifying_dot(p: &Parser) -> bool {

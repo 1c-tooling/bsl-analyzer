@@ -1093,9 +1093,20 @@ fn an_extension_region_is_opaque_to_every_skip() {
 fn a_position_that_admits_only_a_name_takes_any_word() {
     // Not every word of this language arrives as an identifier — a handful
     // keep a kind of their own — so a rule that says "a name belongs here"
-    // and then asks for one kind rejects the aliases it meant to allow.
-    for word in ["НЕ", "И", "ИЛИ", "В", "ИСТИНА", "УНИЧТОЖИТЬ"] {
-        accepted(&format!("ВЫБРАТЬ А КАК {word} ИЗ Т"));
+    // and then asks for one kind loses the word. Those words are reserved as
+    // aliases, so they are reported, but at themselves and with the source
+    // clause behind them intact; a word the platform accepts stays clean.
+    accepted("ВЫБРАТЬ А КАК УНИЧТОЖИТЬ ИЗ Т");
+    for word in ["НЕ", "И", "ИЛИ", "В", "ИСТИНА"] {
+        let input = format!("ВЫБРАТЬ А КАК {word} ИЗ Т");
+        let parse = parse_sdbl(&input);
+        let reported: Vec<_> = parse
+            .errors()
+            .iter()
+            .map(|e| &input[usize::from(e.range().start())..usize::from(e.range().end())])
+            .collect();
+        assert_eq!(reported, [word], "`{input}`: {:#?}", parse.errors());
+        assert!(has_kind(&parse.syntax_node(), SyntaxKind::SDBL_FROM_CLAUSE), "`{input}`");
     }
 }
 

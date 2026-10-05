@@ -307,7 +307,7 @@ fn selected_field(p: &mut Parser) {
         expressions::expression(p);
 
         let at_expected_position = at_sdbl_keyword(p, "AS", "КАК")
-            || (is_identifier_token(p) && !is_clause_keyword(p))
+            || at_an_implicit_alias(p)
             || p.at(T![Comma])
             || p.at(T![Semicolon])
             || p.at(T![LBrace])
@@ -319,7 +319,7 @@ fn selected_field(p: &mut Parser) {
         }
     }
 
-    if (at_sdbl_keyword(p, "AS", "КАК") || is_identifier_token(p)) && !is_clause_keyword(p) {
+    if at_sdbl_keyword(p, "AS", "КАК") || at_an_implicit_alias(p) {
         selected_field_alias(p);
     }
 
@@ -368,21 +368,159 @@ fn asterisk_field(p: &mut Parser) {
 
 fn selected_field_alias(p: &mut Parser) {
     let m = p.start();
+    alias_name(p, "ожидался псевдоним после 'КАК' / 'AS'", Aliased::Field);
+    m.complete(p, NodeKind::SdblAlias);
+}
 
-    eat_sdbl_keyword(p, "AS", "КАК");
+/// Reads an alias after its optional `КАК`, refusing the words the language
+/// reserves.
+///
+/// Most keywords are not reserved as alias names — `КАК Итоги`, `КАК Выбрать`,
+/// `КАК Упорядочить` are accepted by the platform — so the word alone decides,
+/// not whether it opens a clause. A refused word is reported at itself. After
+/// an explicit `КАК` one that opens a clause is left to that clause: the alias
+/// was more likely omitted than misspelt, and taking the word would cost the
+/// clause behind it. Any other refused word — a clause word too, when a list
+/// separator or the end follows it and no clause can begin — is taken as the
+/// alias it was meant to be, so the source or field it names keeps its place in
+/// the query.
+///
+/// Without `КАК` the word is reported only behind a complete name: one refused
+/// as the table, or as the part of a name after a dot, has been reported there
+/// already.
+fn alias_name(p: &mut Parser, missing: &'static str, aliased: Aliased) {
+    let explicit = eat_sdbl_keyword(p, "AS", "КАК");
 
-    // SDBL keywords are not reserved as alias names: `КАК Итоги`, `AS Inner` are
-    // valid field aliases. See `source_alias` for the rationale.
-    if is_body_clause_keyword(p) {
-        let err = p.start();
-        p.error_custom_at_marker(err, "ожидался алиас, встречено ключевое слово");
-        m.complete(p, NodeKind::SdblAlias);
+    // Behind a dot the word is the part of a name that the dot promised and
+    // the name's own rule has refused it already.
+    let after_a_name = !matches!(aliased, Aliased::Source { named: false });
+    let reported_elsewhere = !after_a_name || p.prev_significant() == Some(T![Dot]);
+    if at_word_refused_as_alias(p) && (explicit || !reported_elsewhere) {
+        let message = if explicit {
+            "ожидается имя: ключевое слово языка запросов нельзя использовать как псевдоним"
+        } else {
+            "синтаксическая ошибка: ключевое слово языка запросов нельзя использовать как псевдоним"
+        };
+        if explicit && at_a_clause_that_goes_on(p, aliased) {
+            p.error_custom_no_bump(message);
+        } else if is_clause_keyword(p) {
+            // A clause word is a boundary the generic recovery will not consume,
+            // so it is taken explicitly; only a separator or the end follows it.
+            let err = p.start();
+            p.bump();
+            p.error_custom_at_marker(err, message);
+        } else {
+            p.error_custom(message);
+        }
         return;
     }
 
-    super::eat_name_here(p, "ожидался псевдоним после 'КАК' / 'AS'");
+    super::eat_name_here(p, missing);
+}
 
-    m.complete(p, NodeKind::SdblAlias);
+/// What an alias names: a selected field, or a source together with whether
+/// the source's name was taken.
+#[derive(Clone, Copy)]
+enum Aliased {
+    Field,
+    Source { named: bool },
+}
+
+/// A clause word that really opens a clause here. A join and its `ПО` follow
+/// only a source, never a field.
+fn at_a_clause_that_goes_on(p: &Parser, aliased: Aliased) -> bool {
+    let opens_here = match aliased {
+        Aliased::Field => !is_join_keyword(p) && !at_sdbl_keyword(p, "ON", "ПО"),
+        Aliased::Source { .. } => true,
+    };
+    is_clause_keyword(p)
+        && opens_here
+        && !matches!(p.nth(1), None | Some(T![Comma]) | Some(T![RParen]) | Some(T![Semicolon]))
+}
+
+/// A word standing where an alias without `КАК` would: a name that opens no
+/// clause, or a reserved word of a kind of its own, which is reported there.
+fn at_an_implicit_alias(p: &Parser) -> bool {
+    (is_identifier_token(p) && !is_clause_keyword(p)) || at_a_keyword_kind_refused_as_alias(p)
+}
+
+/// A word the platform refuses as an alias: after `КАК` it answers «Ожидается
+/// имя», without `КАК` it reports a syntax error at the word.
+///
+/// The list is exactly the set checked word by word after `КАК` on 8.3.17 and
+/// 8.3.27, as a field alias and as a source alias, and refused by both; the
+/// form without `КАК` was checked on 8.3.27. Counterparts that
+/// were not checked (`ESCAPE`, `AUTOORDER`, `PERIODS`, `ON`) are left out rather
+/// than guessed. `В`, `И`, `ИЛИ`, `НЕ`, `ИСТИНА`, `ЛОЖЬ` and `НЕОПРЕДЕЛЕНО`
+/// reach the parser with kinds of their own; the rest arrive as identifiers.
+fn at_word_refused_as_alias(p: &Parser) -> bool {
+    const REFUSED: &[&str] = &[
+        "ИЗ",
+        "ГДЕ",
+        "КАК",
+        "ПО",
+        "ВЫБОР",
+        "КОГДА",
+        "ТОГДА",
+        "ИНАЧЕ",
+        "ЕСТЬ",
+        "NULL",
+        "ПОДОБНО",
+        "СПЕЦСИМВОЛ",
+        "МЕЖДУ",
+        "ПЕРВЫЕ",
+        "РАЗЛИЧНЫЕ",
+        "РАЗРЕШЕННЫЕ",
+        "ВНУТРЕННЕЕ",
+        "ДЛЯ",
+        "ПОМЕСТИТЬ",
+        "ВОЗР",
+        "УБЫВ",
+        "АВТОУПОРЯДОЧИВАНИЕ",
+        "ОБЩИЕ",
+        "ТОЛЬКО",
+        "ПЕРИОДАМИ",
+        "ВЫРАЗИТЬ",
+        "FROM",
+        "WHERE",
+        "AS",
+        "BY",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "IS",
+        "LIKE",
+        "BETWEEN",
+        "TOP",
+        "DISTINCT",
+        "ALLOWED",
+        "INNER",
+        "FOR",
+        "INTO",
+        "ASC",
+        "DESC",
+        "ONLY",
+        "OVERALL",
+        "CAST",
+    ];
+
+    at_a_keyword_kind_refused_as_alias(p) || REFUSED.iter().any(|word| p.at_keyword(word))
+}
+
+fn at_a_keyword_kind_refused_as_alias(p: &Parser) -> bool {
+    matches!(
+        p.current(),
+        Some(
+            T![KwIn]
+                | T![KwAnd]
+                | T![KwOr]
+                | T![KwNot]
+                | T![KwTrue]
+                | T![KwFalse]
+                | T![KwUndefined]
+        )
+    )
 }
 
 fn into_clause(p: &mut Parser) {
@@ -429,16 +567,17 @@ fn from_clause(p: &mut Parser) {
 fn data_source(p: &mut Parser) {
     let m = p.start();
 
-    if p.at(T![LParen]) {
+    let named = if p.at(T![LParen]) {
         p.bump();
         subquery(p);
         p.expect(T![RParen]);
+        true
     } else {
-        table_ref(p);
-    }
+        table_ref(p)
+    };
 
-    if (at_sdbl_keyword(p, "AS", "КАК") || is_identifier_token(p)) && !is_clause_keyword(p) {
-        source_alias(p);
+    if at_sdbl_keyword(p, "AS", "КАК") || at_an_implicit_alias(p) {
+        source_alias(p, named);
     }
 
     eat_query_extensions(p);
@@ -450,7 +589,9 @@ fn data_source(p: &mut Parser) {
     m.complete(p, NodeKind::SdblDataSource);
 }
 
-fn table_ref(p: &mut Parser) {
+/// Returns whether a name was taken: a word refused as the table has already
+/// been reported, and saying it again as a bad alias would report it twice.
+fn table_ref(p: &mut Parser) -> bool {
     let m = p.start();
 
     if p.at(T![Ampersand]) {
@@ -461,7 +602,7 @@ fn table_ref(p: &mut Parser) {
         p.bump();
         pm.complete(p, NodeKind::SdblParameter);
         m.complete(p, NodeKind::SdblTableRef);
-        return;
+        return true;
     }
 
     // `expect` on a matching kind is refused only by a hard boundary, and a
@@ -472,12 +613,12 @@ fn table_ref(p: &mut Parser) {
     if p.at(T![Ident]) && !super::at_field_name(p) {
         p.error_custom_no_bump("ожидалось имя таблицы");
         m.complete(p, NodeKind::SdblTableRef);
-        return;
+        return false;
     }
 
     if !p.expect(T![Ident]) {
         m.complete(p, NodeKind::SdblTableRef);
-        return;
+        return false;
     }
 
     // The dot reaches across the space before it as well as the space after
@@ -500,26 +641,12 @@ fn table_ref(p: &mut Parser) {
     virtual_table_args(p);
 
     m.complete(p, NodeKind::SdblTableRef);
+    true
 }
 
-fn source_alias(p: &mut Parser) {
+fn source_alias(p: &mut Parser, named: bool) {
     let m = p.start();
-
-    eat_sdbl_keyword(p, "AS", "КАК");
-
-    // SDBL keywords are not reserved as alias names: `КАК Итоги`, `AS Inner` are
-    // valid source aliases, recognised here because clause keywords are matched by
-    // text on `Ident` tokens. Only a primary body clause after AS signals an omitted
-    // alias and is left for its clause parser.
-    if is_body_clause_keyword(p) {
-        let err = p.start();
-        p.error_custom_at_marker(err, "ожидался алиас источника, встречено ключевое слово");
-        m.complete(p, NodeKind::SdblAlias);
-        return;
-    }
-
-    super::eat_name_here(p, "ожидался псевдоним источника после 'КАК' / 'AS'");
-
+    alias_name(p, "ожидался псевдоним источника после 'КАК' / 'AS'", Aliased::Source { named });
     m.complete(p, NodeKind::SdblAlias);
 }
 
@@ -756,10 +883,9 @@ pub(super) fn is_query_starter_or_combiner_keyword(p: &Parser) -> bool {
 }
 
 // Primary clause keywords that begin a new query section. When one of these
-// appears where an alias is expected the alias was almost certainly omitted, so
-// the alias parser leaves the keyword for its clause instead of swallowing it.
-// `ИТОГИ`, join keywords and `ПО`/`ДЛЯ`/`ИНДЕКСИРОВАТЬ` are excluded: they are
-// valid alias names (`КАК Итоги`, `AS Inner`) and not reserved.
+// appears where a totals alias is expected the alias was almost certainly
+// omitted, so the alias parser leaves the keyword for its clause instead of
+// swallowing it.
 pub(super) fn is_body_clause_keyword(p: &Parser) -> bool {
     at_sdbl_keyword(p, "SELECT", "ВЫБРАТЬ")
         || at_sdbl_keyword(p, "FROM", "ИЗ")
