@@ -93,6 +93,7 @@ fn selected_signature<'a>(
         .or_else(|| signatures.first())
 }
 
+/// Projects the selected callable's parameter names onto nonempty argument slots.
 fn parameter_hints_for_arg_list<DB: RootDatabase>(
     db: &DB,
     bindings: &HashMap<TextRange, CandidateCallBinding>,
@@ -124,8 +125,8 @@ fn parameter_hints_for_arg_list<DB: RootDatabase>(
                 }
             }
             NodeOrToken::Node(arg) => {
-                if let Some(param) = signature.params.get(slot) {
-                    maybe_push_param_hint(&arg, param.name.as_str(), range, hints);
+                if let Some(name) = signature.parameter_name_at(slot) {
+                    maybe_push_param_hint(&arg, &name, range, hints);
                 }
             }
         }
@@ -282,5 +283,124 @@ mod tests {
                 ("Второе:".to_string(), "3".to_string()),
             ],
         );
+    }
+
+    /// Global aliases share the platform signature and its numbered argument group.
+    #[test]
+    fn parameter_hints_expand_global_parameter_series() {
+        for name in ["Мин", "Макс", "ПродолжитьВызов", "Min", "Max", "ProceedWithCall"]
+        {
+            let source = format!("Процедура Тест()\n    {name}(10, 20, 30);\nКонецПроцедуры\n");
+            let (db, file_id) = single_file(&source);
+            let hints = inlay_hints(&db, file_id, whole_range(&source));
+            assert_eq!(
+                labels_at(&source, &hints),
+                vec![
+                    ("Значение1:".to_string(), "10".to_string()),
+                    ("Значение2:".to_string(), "20".to_string()),
+                    ("Значение3:".to_string(), "30".to_string()),
+                ],
+                "{name}",
+            );
+        }
+        for name in ["СтрШаблон", "StrTemplate", "стршаблон"] {
+            let source = format!(
+                "Процедура Тест(Текст1, Текст2, Текст3)\n    Текст = {name}(\n        \"%1, %2, %3\",\n        Текст1,\n        Текст2,\n        Текст3);\nКонецПроцедуры\n"
+            );
+            let (db, file_id) = single_file(&source);
+            let hints = inlay_hints(&db, file_id, whole_range(&source));
+            assert_eq!(
+                labels_at(&source, &hints),
+                vec![
+                    ("Шаблон:".to_string(), "".to_string()),
+                    ("Значение1:".to_string(), "Текст1".to_string()),
+                    ("Значение2:".to_string(), "Текст2".to_string()),
+                    ("Значение3:".to_string(), "Текст3".to_string()),
+                ],
+                "{name}",
+            );
+        }
+    }
+
+    /// A bounded group must stop naming arguments beyond its documented endpoint.
+    #[test]
+    fn parameter_hints_respect_bounded_series() {
+        let source = "Процедура Тест()\n    СтрШаблон(\"%10\", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let hints = inlay_hints(&db, file_id, whole_range(source));
+        let expected: Vec<_> = std::iter::once(("Шаблон:".to_string(), "".to_string()))
+            .chain((1..=10).map(|n| (format!("Значение{n}:"), n.to_string())))
+            .collect();
+        assert_eq!(labels_at(source, &hints), expected);
+    }
+
+    /// Empty slots retain their index, and expanded names still suppress redundant hints.
+    #[test]
+    fn parameter_series_preserve_empty_slots_and_name_suppression() {
+        let source = "Процедура Тест(Значение1, зНАЧЕНИЕ2)\n    СтрШаблон(\"%3\", , , 30);\n    СтрШаблон(\"%1 %2 %3\", Значение1, зНАЧЕНИЕ2, 40);\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let hints = inlay_hints(&db, file_id, whole_range(source));
+        assert_eq!(
+            labels_at(source, &hints),
+            vec![
+                ("Шаблон:".to_string(), "".to_string()),
+                ("Значение3:".to_string(), "30".to_string()),
+                ("Шаблон:".to_string(), "".to_string()),
+                ("Значение3:".to_string(), "40".to_string()),
+            ],
+        );
+        let start = TextSize::from(source.find("30").unwrap() as u32);
+        let range = TextRange::new(start, start + TextSize::from(2));
+        assert_eq!(
+            labels_at(source, &inlay_hints(&db, file_id, range)),
+            vec![("Значение3:".to_string(), "30".to_string())],
+        );
+    }
+
+    /// Constructors use both numbered groups and explicit variadic flags from the reference.
+    #[test]
+    fn parameter_hints_expand_constructor_parameter_series() {
+        let cases = [
+            (
+                "Новый Массив(10, 20, 30)",
+                vec!["КоличествоЭлементов1:", "КоличествоЭлементов2:", "КоличествоЭлементов3:"],
+            ),
+            (
+                "New Array(10, 20, 30)",
+                vec!["КоличествоЭлементов1:", "КоличествоЭлементов2:", "КоличествоЭлементов3:"],
+            ),
+            (
+                "Новый ФорматированнаяСтрока(\"a\", \"b\", \"c\", \"d\")",
+                vec!["Содержимое1:", "Содержимое2:", "Содержимое3:", "Содержимое4:"],
+            ),
+            (
+                "Новый Структура(\"Первый, Второй, Третий\", 10, 20, 30)",
+                vec!["Ключи:", "Значения:", "Значения:", "Значения:"],
+            ),
+            (
+                "Новый ФиксированнаяСтруктура(\"Первый, Второй\", 10, 20)",
+                vec!["Ключ:", "Значения:", "Значения:"],
+            ),
+            (
+                "Новый КлючСтрокиДинамическогоСписка(\"Первый, Второй\", 10, 20)",
+                vec!["ПутиКлючевыхПолей:", "Значения:", "Значения:"],
+            ),
+        ];
+        for (call, expected) in cases {
+            let source = format!("Процедура Тест()\n    Результат = {call};\nКонецПроцедуры\n");
+            let (db, file_id) = single_file(&source);
+            let hints = inlay_hints(&db, file_id, whole_range(&source));
+            let labels: Vec<_> = hints.iter().map(|hint| hint.label.as_str()).collect();
+            assert_eq!(labels, expected, "{call}");
+        }
+    }
+
+    /// A numbered local parameter is positional unless its callable declares a variadic tail.
+    #[test]
+    fn numbered_local_parameter_does_not_create_a_series() {
+        let source = "Процедура Одно(Значение1)\nКонецПроцедуры\nПроцедура Тест()\n    Одно(10, 20, 30);\nКонецПроцедуры\n";
+        let (db, file_id) = single_file(source);
+        let hints = inlay_hints(&db, file_id, whole_range(source));
+        assert_eq!(labels_at(source, &hints), vec![("Значение1:".to_string(), "10".to_string())]);
     }
 }

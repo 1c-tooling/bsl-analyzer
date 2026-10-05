@@ -30,11 +30,12 @@ use interprocess::local_socket::tokio::Stream as TokioStream;
 use interprocess::local_socket::ListenerOptions;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{interval, Instant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 
 use crate::broker::name::{backend_name, BackendKey};
 #[cfg(windows)]
 use crate::broker::security::pipe_security_descriptor_for_current_user;
-use crate::{serve_stream, McpServer};
+use crate::{serve_stream_with_shutdown, McpServer};
 
 /// Cap on connections held while the resident state builds. The listener keeps draining
 /// past this (so a concurrent liveness probe still succeeds), but excess connections are
@@ -134,10 +135,13 @@ async fn serve(
     // Live session tasks, reaped once finished so the vector can't grow without bound
     // across a long-lived backend's many short sessions.
     let mut sessions: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let session_shutdown = CancellationToken::new();
+    // Cancellation of the daemon future must also release the sessions it spawned.
+    let _session_shutdown_guard = session_shutdown.clone().drop_guard();
 
     // Serve the connections that arrived during the build first.
     for conn in parked {
-        sessions.push(spawn_session(&server, &active, &warmed, conn));
+        sessions.push(spawn_session(&server, &active, &warmed, conn, session_shutdown.clone()));
     }
 
     // `idle_since` marks when the current connection-less stretch began; it is cleared
@@ -152,7 +156,7 @@ async fn serve(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick
 
-    loop {
+    let result = loop {
         tokio::select! {
             // Poll accept before the idle tick: a proxy's `connect()` returns only once the
             // connection sits in the listener backlog (so `accept()` is ready), so biasing
@@ -162,12 +166,15 @@ async fn serve(
             // continuously ready while connections are actively arriving, which is not idle.
             biased;
             accepted = listener.accept() => {
-                let conn = accepted?;
+                let conn = match accepted {
+                    Ok(conn) => conn,
+                    Err(error) => break Err(error),
+                };
                 if !peer_authorized(&conn) {
                     tracing::warn!("rejected backend connection from an unauthorized peer");
                     continue;
                 }
-                sessions.push(spawn_session(&server, &active, &warmed, conn));
+                sessions.push(spawn_session(&server, &active, &warmed, conn, session_shutdown.clone()));
             }
             _ = ticker.tick() => {
                 sessions.retain(|h| !h.is_finished());
@@ -182,7 +189,7 @@ async fn serve(
                          and leaving once its graph reads finish"
                     );
                     superseded = true;
-                    break;
+                    break Ok(());
                 }
                 // Reset the idle clock while any session is connected; otherwise count down
                 // against the grace that fits the backend's history — the long `idle_ttl`
@@ -198,16 +205,16 @@ async fn serve(
                             grace_secs = grace.as_secs(),
                             "backend idle past its grace; shutting down"
                         );
-                        break;
+                        break Ok(());
                     }
                 }
             }
         }
-    }
+    };
 
     // Teardown cascade: stop accepting and sever every still-connected session, so each
-    // proxy gets an EOF and exits. Aborting a session task drops its socket; dropping the
-    // listener frees the rendezvous name.
+    // proxy gets an EOF and exits. Dropping the listener frees the rendezvous name;
+    // each RMCP service must finish closing its transport before the daemon returns.
     drop(listener);
     if superseded {
         // The name is free for the current owner already. The graph reads in flight finish
@@ -218,11 +225,14 @@ async fn serve(
         }
         tokio::time::sleep(SUPERSEDED_DRAIN).await;
     }
-    for handle in &sessions {
-        handle.abort();
+    session_shutdown.cancel();
+    for handle in sessions {
+        if let Err(error) = handle.await {
+            tracing::warn!(%error, "broker session task failed during shutdown");
+        }
     }
 
-    Ok(())
+    result.map_err(Into::into)
 }
 
 /// Serve one accepted connection on its own task. The [`ActiveGuard`] decrements the
@@ -231,12 +241,13 @@ async fn serve(
 /// The connection is wrapped in a [`FirstByteProbe`] that flips `warmed` the first time the
 /// peer sends any data, so a session carrying real MCP traffic promotes the backend to the
 /// long idle TTL while a no-data liveness probe (connect-then-close) never does. Returns the
-/// task handle so the serve loop can abort it during the shutdown cascade.
+/// task handle so the serve loop can await transport cleanup during shutdown.
 fn spawn_session(
     server: &McpServer,
     active: &Arc<AtomicU64>,
     warmed: &Arc<AtomicBool>,
     conn: TokioStream,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let guard = ActiveGuard::new(Arc::clone(active));
     tracing::debug!(active = active.load(Ordering::SeqCst), "broker accepted a session");
@@ -247,7 +258,7 @@ fn spawn_session(
         // First byte on this connection marks the backend as having served real traffic. A
         // liveness probe connects and closes without sending, so it never reaches here.
         let probe = FirstByteProbe::new(conn, move || warmed.store(true, Ordering::SeqCst));
-        if let Err(e) = serve_stream(session, probe).await {
+        if let Err(e) = serve_stream_with_shutdown(session, probe, shutdown).await {
             tracing::warn!(error = %e, "broker session ended with error");
         }
     })

@@ -22,6 +22,7 @@ pub(super) fn build_user_params(
                 name: SmolStr::new(name_str),
                 types,
                 is_optional: p.has_default,
+                is_variadic: false,
                 default_value: printable_default(p.default_value.clone()),
                 description: doc.and_then(joined_descriptions),
                 is_val: p.is_val,
@@ -80,6 +81,7 @@ fn build_from_param_docs(
                 name: p.name.clone(),
                 types,
                 is_optional: p.is_optional,
+                is_variadic: p.is_variadic,
                 default_value: printable_default(
                     pdoc.and_then(|d| d.default_value.as_deref().map(SmolStr::new)),
                 ),

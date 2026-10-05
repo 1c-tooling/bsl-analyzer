@@ -16,6 +16,8 @@ mod indexing_runtime_tests;
 #[cfg(test)]
 mod inventory;
 pub mod project;
+#[cfg(test)]
+mod serve_stream_tests;
 mod state;
 mod tasks;
 mod tools;
@@ -229,8 +231,26 @@ pub async fn serve_stream<T, A>(server: McpServer, transport: T) -> anyhow::Resu
 where
     T: rmcp::transport::IntoTransport<rmcp::RoleServer, std::io::Error, A>,
 {
+    serve_stream_with_shutdown(server, transport, tokio_util::sync::CancellationToken::new()).await
+}
+
+/// Cancel RMCP's service task and await its transport cleanup before the broker exits.
+pub(crate) async fn serve_stream_with_shutdown<T, A>(
+    server: McpServer,
+    transport: T,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleServer, std::io::Error, A>,
+{
     use rmcp::ServiceExt;
-    let session = server.serve(transport).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    // RMCP cancels its token when a session ends. A child keeps one client's disconnect
+    // from stopping the broker's other sessions while still observing broker shutdown.
+    let session = match server.serve_with_ct(transport, shutdown.child_token()).await {
+        Ok(session) => session,
+        Err(rmcp::service::ServerInitializeError::Cancelled) => return Ok(()),
+        Err(error) => return Err(anyhow::anyhow!("{error}")),
+    };
     session.waiting().await.map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
