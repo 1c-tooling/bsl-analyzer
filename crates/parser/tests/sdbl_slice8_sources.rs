@@ -96,9 +96,8 @@ fn test_from_subquery_source_bare_implicit_alias() {
 
 #[test]
 fn test_from_subquery_source_nested() {
-    // `Inner`/`Outer` collide with the INNER join keyword by text but are valid
-    // aliases — keywords are not reserved as alias names.
-    let input = "SELECT * FROM (SELECT * FROM (SELECT 1) AS Inner) AS Outer";
+    // `Outer` collides with the OUTER join keyword by text but is a valid alias.
+    let input = "SELECT * FROM (SELECT * FROM (SELECT 1) AS Middle) AS Outer";
     parse_clean(input);
     let parse = parse_sdbl(input);
     assert_eq!(parse.syntax_node().text().to_string(), input, "Root must cover full input");

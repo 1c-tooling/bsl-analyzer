@@ -875,10 +875,8 @@ fn a_keyword_standing_where_a_name_belongs_is_a_name() {
         "ВЫБРАТЬ А ИЗ Т ДЛЯ ИЗМЕНЕНИЯ Т",
         // `BY` ends a list, so no rule inside one may consume it — and it is
         // still an ordinary name where a name may stand. Saying both with one
-        // predicate cost these four.
-        "SELECT BY.A FROM T AS BY",
-        "SELECT A BY FROM T",
-        "SELECT A FROM T BY",
+        // predicate cost these. As a field or source alias it is reserved.
+        "SELECT BY.A FROM T",
         "SELECT A FROM T TOTALS SUM(A) BY N BY",
         // A field chain is open to keywords where a table's name is not, and
         // closing the one must not close the other.

@@ -228,59 +228,14 @@ pub(crate) fn descriptor_from_params(
     }
 }
 
-fn split_variadic_name(name: &str) -> Option<(&str, &str)> {
-    if let Some(idx) = name.find(",...,") {
-        return Some((&name[..idx], &name[idx + ",...,".len()..]));
-    }
-    name.split_once('-')
-}
-
+/// Uses the platform's shared interpretation of alphabetic range endpoints.
 fn name_implies_unbounded_variadic(name: &str) -> bool {
-    let Some((head, tail)) = split_variadic_name(name) else {
-        return false;
-    };
-    let Some(digits_start) = head
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| c.is_ascii_digit())
-        .last()
-        .map(|(idx, _)| idx)
-    else {
-        return false;
-    };
-    let (head_word, head_digits) = head.split_at(digits_start);
-    if head_word.is_empty() || head_digits.is_empty() {
-        return false;
-    }
-    let tail = tail.trim_start();
-    if !tail.starts_with(head_word) {
-        return false;
-    }
-    let suffix = &tail[head_word.len()..];
-    !suffix.is_empty() && suffix.chars().all(|c| c.is_alphabetic())
+    bsl_platform::ParameterSeries::parse(name).is_some_and(|series| series.last.is_none())
 }
 
+/// Keeps bounded variadic arity aligned with the platform's parameter-name series.
 fn variadic_param_max(name: &str) -> Option<u32> {
-    let (head, tail) = split_variadic_name(name)?;
-    let digits_start = head
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| c.is_ascii_digit())
-        .last()
-        .map(|(idx, _)| idx)?;
-    let (head_word, head_digits) = head.split_at(digits_start);
-    if head_word.is_empty() || head_digits.is_empty() {
-        return None;
-    }
-    let tail = tail.trim_start();
-    if !tail.starts_with(head_word) {
-        return None;
-    }
-    let tail_digits = &tail[head_word.len()..];
-    if tail_digits.is_empty() || !tail_digits.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    tail_digits.parse::<u32>().ok()
+    bsl_platform::ParameterSeries::parse(name)?.last
 }
 
 fn register_fallbacks(sigs: &mut FxHashMap<String, Vec<BuiltinSignature>>) {

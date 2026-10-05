@@ -28,6 +28,7 @@ pub enum DiagnosticCode {
     InvalidCharacterInFile,
     DoubleNegatives,
     NestedTernaryOperator,
+    PostfixAccessOnExpression,
     NonExportMethodsInApiRegion,
     TernaryOperatorUsage,
     UnaryPlusInConcatenation,

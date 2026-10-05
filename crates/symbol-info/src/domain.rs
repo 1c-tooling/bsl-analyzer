@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use bsl_metadata::MdoType;
 use hir::{MethodId, ModuleId, Name};
 use smol_str::SmolStr;
@@ -27,6 +29,7 @@ pub struct SignatureParam {
     pub name: SmolStr,
     pub types: Vec<TypeRef>,
     pub is_optional: bool,
+    pub is_variadic: bool,
     pub default_value: Option<SmolStr>,
     pub description: Option<String>,
     pub is_val: bool,
@@ -79,4 +82,26 @@ pub struct SymbolSignature {
     pub source: SignatureSource,
     pub method_id: Option<MethodId>,
     pub platform_id: Option<u32>,
+}
+
+impl SymbolSignature {
+    /// Names the parameter at an argument slot, expanding a trailing parameter group.
+    pub fn parameter_name_at(&self, slot: usize) -> Option<Cow<'_, str>> {
+        let index = slot.min(self.params.len().checked_sub(1)?);
+        let param = &self.params[index];
+        let offset = slot - index;
+        let series = bsl_platform::ParameterSeries::parse(param.name.as_str()).or_else(|| {
+            param
+                .is_variadic
+                .then(|| bsl_platform::ParameterSeries::from_numbered_name(param.name.as_str()))
+                .flatten()
+        });
+        if let Some(mut series) = series {
+            if param.is_variadic {
+                series.last = None;
+            }
+            return series.name_at(offset).map(Cow::Owned);
+        }
+        (offset == 0 || param.is_variadic).then(|| Cow::Borrowed(param.name.as_str()))
+    }
 }
