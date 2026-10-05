@@ -5058,7 +5058,7 @@ mod tests {
             }),
             "the stand needs a search init that failed"
         );
-        let before = state.graph().status_report().revision.expect("ready");
+        let before = wait_until_graph_revision(state.graph());
 
         fs::write(
             cf.join("CommonModules").join("Сервер").join("Ext").join("Module.bsl"),
@@ -5109,7 +5109,7 @@ mod tests {
             "the stand needs a hub that polls"
         );
         wait_until_graph_ready(state.graph());
-        let before = state.graph().status_report().revision.expect("ready");
+        let before = wait_until_graph_revision(state.graph());
         assert!(
             eventually(&|| state.search_engine().lock().unwrap().is_some()),
             "the search engine was never published"
@@ -5132,8 +5132,15 @@ mod tests {
             state.graph().status_report().revision.is_some_and(|revision| revision > before)
         });
         let graph_state = crate::graph::test_support::graph_state_summary(state.graph());
+        let search_state = format!(
+            "consumer {:?}; backlog {:?}; polls {}; seq {}",
+            *state.search_consumer.lock().unwrap(),
+            state.overlay_backlog_state(),
+            state.change_hub().unwrap().poll_count(),
+            state.change_hub().unwrap().seq(),
+        );
         state.shutdown();
-        assert!(searched, "search never saw the polled edit");
+        assert!(searched, "search never saw the polled edit: {search_state}; {graph_state}");
         assert!(reloaded, "the graph never saw the polled edit: {graph_state}");
     }
 
@@ -5317,6 +5324,22 @@ mod tests {
             });
         state.shutdown();
         assert!(abandoned, "a consumer nothing will ever start still reads as starting");
+    }
+
+    /// A ready graph's nonblocking report can omit its revision while an owner holds a
+    /// sampled lock. Keep the sample that ended the wait instead of racing another read.
+    fn wait_until_graph_revision(graph: &GraphState) -> u64 {
+        let mut revision = None;
+        crate::graph::test_support::wait_until_within(
+            graph,
+            std::time::Duration::from_secs(60),
+            "a readable graph revision",
+            || {
+                revision = graph.status_report().revision;
+                revision.is_some()
+            },
+        );
+        revision.expect("the wait captured a graph revision")
     }
 
     /// Drive a graph to `Ready`, or say which state it got stuck in.
