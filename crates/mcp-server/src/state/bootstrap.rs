@@ -5120,8 +5120,13 @@ mod tests {
             "&НаСервере\nФункция ОпросНайден() Экспорт КонецФункции",
         )
         .unwrap();
-
-        let searched = eventually(&|| {
+        // Boot and edit publications can invalidate consecutive point batches. Their
+        // scheduled retries must fit inside the wait, with the ordinary ceiling left for
+        // polling and preparation; thirty seconds alone ends at the first retry's deadline.
+        let search_ceiling = super::super::overlay_retry::retry_delay(1)
+            + super::super::overlay_retry::retry_delay(2)
+            + std::time::Duration::from_secs(30);
+        let searched = crate::change_hub::test_support::eventually(search_ceiling, || {
             state.search_engine().lock().unwrap().as_ref().is_some_and(|engine| {
                 engine
                     .text_search_read_only("ОпросНайден", 10, Some("code"))
