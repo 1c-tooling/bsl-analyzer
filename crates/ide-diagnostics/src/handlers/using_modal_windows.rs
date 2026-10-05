@@ -29,6 +29,11 @@ pub fn from_hir(
     if ctx.is_disabled_with_metadata(code) {
         return None;
     }
+    // The modality mode governs managed forms; an ordinary form shows modal
+    // dialogs even when the configuration forbids them.
+    if ctx.is_ordinary_form_module() {
+        return None;
+    }
 
     let message = format!(
         "Вместо модального метода \"{}\" необходимо использовать \"{}\"",

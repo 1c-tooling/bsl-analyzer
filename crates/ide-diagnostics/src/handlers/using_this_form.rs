@@ -19,6 +19,10 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
 };
 
 pub fn from_hir(range: LocalRange, ctx: &BodyContext) -> Option<Diagnostic<LocalRange>> {
+    // `ЭтаФорма` is how an ordinary form names itself; it has no `ЭтотОбъект`.
+    if ctx.is_ordinary_form_module() {
+        return None;
+    }
     let mut diagnostic = crate::simple_hir_diagnostic(
         DiagnosticCode::UsingThisForm,
         "Вместо устаревшего свойства \"ЭтаФорма\" следует использовать \"ЭтотОбъект\"",

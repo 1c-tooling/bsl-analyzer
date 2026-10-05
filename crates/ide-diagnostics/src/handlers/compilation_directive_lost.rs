@@ -32,6 +32,11 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     ) {
         return Vec::new();
     }
+    // An ordinary form runs only in the thick client; a directive there neither is
+    // required nor moves the method.
+    if metadata.is_ordinary_form_module() {
+        return Vec::new();
+    }
 
     let item_tree = ctx.item_tree();
     let mut diagnostics = Vec::new();

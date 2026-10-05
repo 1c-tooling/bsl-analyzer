@@ -36,6 +36,10 @@ pub(crate) fn from_hir(
     if ctx.is_disabled_with_metadata(code) {
         return None;
     }
+    // Like modality, the synchronous-call mode does not reach an ordinary form.
+    if ctx.is_ordinary_form_module() {
+        return None;
+    }
 
     if effective_dispatch(candidate.method_id, ctx)
         .is_some_and(|dispatch| dispatch.is_server_only())

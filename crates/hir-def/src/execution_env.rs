@@ -294,6 +294,11 @@ pub fn module_base_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags
             Some(cm) => common_module_env(cm, opts),
             None => EnvFlags::EMPTY,
         },
+        // An ordinary form runs in the thick client of the ordinary application
+        // and nowhere else.
+        ModuleType::FormModule if metadata.is_ordinary_form_module() => {
+            EnvFlags::THICK_CLIENT_ORDINARY
+        }
         // Form and command methods pick client or server per directive; the
         // module as a whole spans both.
         ModuleType::FormModule | ModuleType::CommandModule => opts.client_envs() | EnvFlags::SERVER,
@@ -389,6 +394,12 @@ pub fn body_env(
     let base = module_base_env(metadata, opts);
     if base.is_empty() {
         return EnvFlags::EMPTY;
+    }
+    // A directive does not move a method of an ordinary form: `&НаСервере` there still
+    // runs in the thick client, so neither it nor the form-module `&НаСервере`
+    // default may narrow the environment.
+    if metadata.is_ordinary_form_module() {
+        return base;
     }
     let directive = annotations.iter().copied().find(is_compilation_directive);
     // A weaving-only interceptor (`&Вместо("…")` with no directive of its
@@ -618,6 +629,44 @@ mod tests {
             .build();
         let md = common_metadata(cm);
         assert_eq!(body_env(&md, &[], &opts), EnvFlags::SERVER);
+    }
+
+    #[test]
+    fn ordinary_form_module_is_thick_client_only_whatever_the_directive() {
+        let opts = EnvOptions::default();
+        let mut ordinary = ModuleMetadata::unknown(ModuleType::FormModule);
+        ordinary.form = Some(Arc::new(bsl_metadata::Form::ordinary_without_dialog("Форма")));
+        assert!(ordinary.is_ordinary_form_module());
+        assert_eq!(module_base_env(&ordinary, &opts), EnvFlags::THICK_CLIENT_ORDINARY);
+        assert_eq!(module_code_env(&ordinary, &opts), EnvFlags::THICK_CLIENT_ORDINARY);
+        assert_eq!(body_env(&ordinary, &[], &opts), EnvFlags::THICK_CLIENT_ORDINARY);
+        for directive in [
+            AnnotationKind::AtServer,
+            AnnotationKind::AtServerNoContext,
+            AnnotationKind::AtClient,
+            AnnotationKind::AtClientAtServer,
+        ] {
+            assert_eq!(
+                body_env(&ordinary, &[directive], &opts),
+                EnvFlags::THICK_CLIENT_ORDINARY,
+                "{directive:?}"
+            );
+        }
+
+        // A managed form keeps the form-module default (`&НаСервере`) and its directives.
+        let mut managed = ModuleMetadata::unknown(ModuleType::FormModule);
+        managed.form = Some(Arc::new(bsl_metadata::Form::new(
+            "Форма".to_string(),
+            bsl_metadata::FormType::Managed,
+            Default::default(),
+        )));
+        assert!(!managed.is_ordinary_form_module());
+        assert_eq!(body_env(&managed, &[], &opts), EnvFlags::SERVER);
+        assert_ne!(body_env(&managed, &[AnnotationKind::AtClient], &opts), EnvFlags::SERVER);
+        // A form whose metadata could not be read stays as before.
+        let unknown = ModuleMetadata::unknown(ModuleType::FormModule);
+        assert!(!unknown.is_ordinary_form_module());
+        assert_eq!(body_env(&unknown, &[], &opts), EnvFlags::SERVER);
     }
 
     #[test]

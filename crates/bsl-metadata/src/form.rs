@@ -128,6 +128,47 @@ impl FormAttribute {
     }
 }
 
+/// Events of an ordinary form and of its object/saved-values extension, as
+/// `(event, default handler)` pairs: the configurator names a new handler after its
+/// event, in the configuration's script language. Used only when the form's real
+/// bindings cannot be read - see [`Form::ordinary_without_dialog`].
+pub const ORDINARY_FORM_DEFAULT_HANDLERS: &[(&str, &str)] = &[
+    ("ПередОткрытием", "ПередОткрытием"),
+    ("BeforeOpen", "BeforeOpen"),
+    ("ПриОткрытии", "ПриОткрытии"),
+    ("OnOpen", "OnOpen"),
+    ("ПриПовторномОткрытии", "ПриПовторномОткрытии"),
+    ("OnReopen", "OnReopen"),
+    ("ПередЗакрытием", "ПередЗакрытием"),
+    ("BeforeClose", "BeforeClose"),
+    ("ПриЗакрытии", "ПриЗакрытии"),
+    ("OnClose", "OnClose"),
+    ("ОбработкаВыбора", "ОбработкаВыбора"),
+    ("ChoiceProcessing", "ChoiceProcessing"),
+    ("ОбработкаОповещения", "ОбработкаОповещения"),
+    ("NotificationProcessing", "NotificationProcessing"),
+    ("ОбработкаЗаписиНовогоОбъекта", "ОбработкаЗаписиНовогоОбъекта"),
+    ("NewObjectWriteProcessing", "NewObjectWriteProcessing"),
+    ("ОбновлениеОтображения", "ОбновлениеОтображения"),
+    ("RefreshDisplay", "RefreshDisplay"),
+    ("ВнешнееСобытие", "ВнешнееСобытие"),
+    ("ExternalEvent", "ExternalEvent"),
+    // The form extension: object forms bind the write events and the data change,
+    // report and data processor forms the saved-values pair.
+    ("ПередЗаписью", "ПередЗаписью"),
+    ("BeforeWrite", "BeforeWrite"),
+    ("ПриЗаписи", "ПриЗаписи"),
+    ("OnWrite", "OnWrite"),
+    ("ПослеЗаписи", "ПослеЗаписи"),
+    ("AfterWrite", "AfterWrite"),
+    ("ПриИзмененииДанных", "ПриИзмененииДанных"),
+    ("OnDataChange", "OnDataChange"),
+    ("ПередСохранениемЗначений", "ПередСохранениемЗначений"),
+    ("BeforeSaveValues", "BeforeSaveValues"),
+    ("ПослеВосстановленияЗначений", "ПослеВосстановленияЗначений"),
+    ("AfterRestoreValues", "AfterRestoreValues"),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Form {
     pub name: String,
@@ -268,6 +309,24 @@ impl Form {
             + self.command_handlers.iter().map(String::capacity).sum::<usize>()
             + stdx::heap::vec_bytes::<FormAttribute>(self.attributes.len())
             + self.attributes.iter().map(FormAttribute::estimated_heap_size).sum::<usize>()
+    }
+
+    /// An ORDINARY form whose dialog cannot be read: it lives in the binary
+    /// `Ext/Form.bin`, not in `Ext/Form.xml`. Its bindings are unknown, so the form
+    /// gets the configurator's default handler name for each of its own events
+    /// ([`ORDINARY_FORM_DEFAULT_HANDLERS`]): a procedure named `ПередОткрытием` in
+    /// such a module is almost certainly bound, and reporting it unused would be the
+    /// louder mistake.
+    pub fn ordinary_without_dialog(name: impl Into<String>) -> Self {
+        let mut form = Self::new(name.into(), FormType::Ordinary, Uuid::nil());
+        form.event_handlers = ORDINARY_FORM_DEFAULT_HANDLERS
+            .iter()
+            .map(|&(event_type, handler_name)| FormEventHandler {
+                event_type: event_type.to_string(),
+                handler_name: handler_name.to_string(),
+            })
+            .collect();
+        form
     }
 
     pub fn is_handler(&self, method_name: &str) -> bool {

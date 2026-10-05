@@ -277,6 +277,14 @@ impl<'a> AnalysisContext<'a> {
         f(self.provider)
     }
 
+    /// Whether this file is the module of an ORDINARY form (a `Form.bin` dialog):
+    /// thick-client code of the ordinary application, where `ЭтаФорма`,
+    /// `ПолучитьФорму`, modal dialogs and synchronous calls are the platform's own
+    /// means rather than smells to report.
+    pub fn is_ordinary_form_module(&self) -> bool {
+        self.module_metadata().is_ordinary_form_module()
+    }
+
     pub fn module_metadata(&self) -> Arc<hir::ModuleMetadata> {
         let module_id = hir::ModuleId::new(self.file_id);
         self.query(|p| p.module_metadata(module_id))
