@@ -37,6 +37,14 @@ pub(crate) struct ProjectSnapshot {
     /// same validated project as `scan_roots`. Kept apart from `excluded`: nothing
     /// declared inside one of these wins it back, a root included.
     pub user_excluded: project_model::ExcludedPaths,
+    /// The age of this composition, for ordering hub declarations made from it.
+    ///
+    /// Taken when the snapshot is, and carried into every declaration that speaks for it:
+    /// the moment a pass takes its snapshot and the moment it declares the roots are
+    /// arbitrarily far apart, and a build overtaken by a newer one must not roll the hub
+    /// back onto the roots it left behind (github#184). See
+    /// [`crate::change_hub::next_topology_epoch`].
+    pub declaration_epoch: u64,
     /// Whether these roots are a VALIDATED declaration or the restricted fallback below.
     ///
     /// A fallback declares nothing. It is what the loader does when it cannot read the
@@ -74,6 +82,7 @@ impl ProjectSnapshot {
                     search_roots: None,
                     excluded: excluded.to_vec(),
                     user_excluded: project_model::ExcludedPaths::default(),
+                    declaration_epoch: crate::change_hub::next_topology_epoch(),
                     validated: false,
                 }
             }
@@ -106,6 +115,7 @@ impl ProjectSnapshot {
             search_roots: Some(search_roots),
             excluded: excluded.to_vec(),
             user_excluded: project.source_exclusions().clone(),
+            declaration_epoch: crate::change_hub::next_topology_epoch(),
             validated: true,
         }
     }

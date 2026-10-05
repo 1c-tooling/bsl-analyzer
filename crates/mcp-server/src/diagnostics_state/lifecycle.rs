@@ -32,6 +32,10 @@ struct ResidentBuild {
     stats: HashMap<String, u64>,
     config_fp: u64,
     scan_roots: Vec<PathBuf>,
+    /// The age of the build snapshot these roots were taken from, for the hub declaration:
+    /// the build and its declaration are separated by an arbitrary delay, during which a
+    /// newer build may declare first (github#184).
+    declaration_epoch: u64,
     /// The build snapshot's portable topology hash, published in the freshness envelope.
     topology: u64,
     /// The physical topology hash, for the hub re-arm supersession guard: the hub watches
@@ -580,7 +584,11 @@ impl DiagnosticsState {
                 }
                 *lock_recover(&self.scan) = None;
                 tracing::info!(files, "diagnostics resident db ready");
-                self.ensure_hub_roots(&built.scan_roots, built.physical_topology);
+                self.ensure_hub_roots(
+                    &built.scan_roots,
+                    built.physical_topology,
+                    built.declaration_epoch,
+                );
                 self.recheck_config_identity_after_publish();
             }
             Err(msg) => {
@@ -663,7 +671,11 @@ impl DiagnosticsState {
                 drop(inner);
                 *lock_recover(&self.scan) = None;
                 tracing::info!(files, "diagnostics resident db reloaded");
-                self.ensure_hub_roots(&built.scan_roots, built.physical_topology);
+                self.ensure_hub_roots(
+                    &built.scan_roots,
+                    built.physical_topology,
+                    built.declaration_epoch,
+                );
                 self.recheck_config_identity_after_publish();
             }
             Err(msg) => {
@@ -835,6 +847,7 @@ impl DiagnosticsState {
             stats,
             config_fp,
             scan_roots: snapshot.scan_roots,
+            declaration_epoch: snapshot.declaration_epoch,
             topology,
             physical_topology: crate::graph::scan::topology_u64(&snapshot.configs),
             scan_clean,
@@ -845,12 +858,20 @@ impl DiagnosticsState {
     /// snapshot's scan roots (no-op when unchanged): a topology reload that added
     /// an extension root must start receiving its events instead of leaving that
     /// subtree to the periodic reconciler.
-    fn ensure_hub_roots(&self, scan_roots: &[PathBuf], built_topology: u64) {
+    fn ensure_hub_roots(
+        &self,
+        scan_roots: &[PathBuf],
+        built_topology: u64,
+        declaration_epoch: u64,
+    ) {
         let (Some(hub), Some(root)) = (&self.change_hub, self.workspace_root.as_deref()) else {
             return;
         };
         // A slow build finishing after a newer topology reload must not roll the
-        // shared hub back onto its older root set (see the graph-side twin).
+        // shared hub back onto its older root set (see the graph-side twin). That
+        // check is a barrier, not a proof: overtaken between its re-read and the
+        // declaration, this build is caught by the epoch the declaration carries
+        // (github#184).
         let live = crate::graph::input::ProjectSnapshot::load_excluding(root, &self.excluded);
         if crate::graph::scan::topology_u64(&live.configs) != built_topology {
             tracing::info!("skipping hub re-arm: the built snapshot's topology is superseded");
@@ -859,6 +880,7 @@ impl DiagnosticsState {
         if !hub.ensure_scope(
             &crate::change_hub::watch_targets_for(root, scan_roots),
             &live.user_excluded,
+            declaration_epoch,
         ) {
             tracing::warn!("resident rebuild could not re-arm the change hub onto new roots");
         }

@@ -16,17 +16,26 @@ GITHUB_BRANCH="develop"
 
 # Только ОТСЛЕЖИВАЕМЫЕ пути, которым не место в публичном зеркале: дерево берётся
 # из HEAD, поэтому неотслеживаемое в зеркало не попадает по построению и
-# перечислять его здесь не нужно.
-EXCLUDE_PATTERNS=(
-    ".gitlab-ci.yml"
-    ".cargo/config.toml"
-    ".claude/"
-    "scripts/ci-status.sh"
-    "scripts/*sonar-triage*"
-    "docs/diagnostics-audit/"
-    "docs/legal/"
-    "crates/bsl-launcher/release-source.github.json"
-)
+# перечислять его здесь не нужно. Список живёт в файле, а не здесь: по нему же
+# тест `mirror_exclusions` ловит код, встраивающий исключённое при компиляции.
+EXCLUDE_FILE="$(dirname "${BASH_SOURCE[0]}")/github-mirror-exclude.txt"
+if [[ ! -f "$EXCLUDE_FILE" ]]; then
+    echo "Нет списка исключений $EXCLUDE_FILE — без него в зеркало уехали бы закрытые пути" >&2
+    exit 1
+fi
+EXCLUDE_PATTERNS=()
+while IFS= read -r pattern || [[ -n "$pattern" ]]; do
+    # Пробелы по краям срезаются так же, как в тесте `mirror_exclusions`: иначе строка
+    # с отступом была бы комментарием для теста и шаблоном для синка.
+    pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+    pattern="${pattern%"${pattern##*[![:space:]]}"}"
+    [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+    EXCLUDE_PATTERNS+=("$pattern")
+done < "$EXCLUDE_FILE"
+if [[ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]]; then
+    echo "Список исключений $EXCLUDE_FILE пуст — зеркало унесло бы закрытые пути" >&2
+    exit 1
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

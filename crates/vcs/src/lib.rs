@@ -275,6 +275,7 @@ fn merge_adjacent_hunks(hunks: &mut Vec<[u32; 2]>) {
 mod tests {
     use super::*;
     use crate::test_support::TestRepo;
+    #[cfg(unix)]
     use std::fs;
 
     fn five_lines(third: &str) -> String {

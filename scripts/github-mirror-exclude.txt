@@ -1,0 +1,12 @@
+# Tracked paths that are left out of the public GitHub mirror: one git pathspec per
+# line, a trailing `/` names a directory. Read by `scripts/github-sync.sh`; the
+# xtask test `mirror_exclusions` fails when source code embeds a file from here at
+# compile time, which would break the mirror build.
+.gitlab-ci.yml
+.cargo/config.toml
+.claude/
+scripts/ci-status.sh
+scripts/*sonar-triage*
+docs/diagnostics-audit/
+docs/legal/
+crates/bsl-launcher/release-source.github.json

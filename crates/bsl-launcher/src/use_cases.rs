@@ -947,7 +947,9 @@ mod tests {
         assert_eq!(stable_ver, "0.1.5");
     }
 
-    use crate::cache::{data_dir, DATA_DIR_ENV, SWAP_LOCK_FILENAME};
+    #[cfg(unix)]
+    use crate::cache::SWAP_LOCK_FILENAME;
+    use crate::cache::{data_dir, DATA_DIR_ENV};
 
     /// `BSL_ANALYZER_HOME` is process-wide, so the tests that move it take turns.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
