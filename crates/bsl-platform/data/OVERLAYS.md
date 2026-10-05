@@ -33,6 +33,37 @@ out-of-range parameter indices, invalid bounds, and duplicate type-list
 members. Applying an override changes only the selected parameter type list;
 method IDs and method ordering remain those of the extracted data.
 
+## Global function parameter override schema
+
+```json
+{
+  "schema_version": 1,
+  "global_function_parameter_overrides": [
+    {
+      "russian_name": "РусскоеИмяФункции",
+      "english_name": "EnglishFunctionName",
+      "min_version": "8.0",
+      "parameter_index": 1,
+      "replacement_type_list": ["TypeA"],
+      "evidence_source": "source identifying the platform contract",
+      "rationale": "why the extracted signature needs this narrow correction"
+    }
+  ]
+}
+```
+
+An entry of the form `"Семейство: *"` in `replacement_type_list` (in either
+section) stands for every extracted type whose name starts with `Семейство: `,
+in extract order — `"ОбъектМетаданных: *"` is each `ОбъектМетаданных: <Вид>`.
+It is meant for a parameter documented as a whole family: listing some seventy
+kinds by hand in each override would repeat them and drift from the extract when
+it is regenerated. A wildcard that matches no extracted type is rejected.
+
+The global-function entry is the same as a method parameter override, without `canonical_type`:
+global-context functions are extracted apart from type methods and resolve by
+their RU/EN names alone. The section is optional; validation and the effect of
+applying an entry are those of method parameter overrides.
+
 ## Type property addition schema
 
 ```json

@@ -238,6 +238,8 @@ fn generate_code_from_json(
         fs::read_to_string(overlays_path).expect("Failed to read platform overlays");
     overlays::apply_method_parameter_overlays(&mut data, &overlay_content)
         .unwrap_or_else(|error| panic!("Invalid platform overlay: {error}"));
+    overlays::apply_global_function_parameter_overlays(&mut data, &overlay_content)
+        .unwrap_or_else(|error| panic!("Invalid platform overlay: {error}"));
     overlays::apply_type_property_additions(&mut data, &overlay_content)
         .unwrap_or_else(|error| panic!("Invalid platform overlay: {error}"));
 

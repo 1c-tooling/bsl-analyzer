@@ -21,6 +21,196 @@
       ],
       "evidence_source": "platform_data.json: DOMDocument.AppendChild (id 2231) and HTMLDocument.AppendChild (id 3464)",
       "rationale": "The generic HTML document path returns HTMLElement; the comparable HTML AppendChild contract documents the HTML node categories accepted alongside the DOMDocument contract."
+    },
+    {
+      "canonical_type": "MetadataObjectCollection",
+      "russian_name": "Содержит",
+      "english_name": "Contains",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: MetadataObjectCollection.Contains (id 5738), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "MetadataObjectCollection",
+      "russian_name": "Индекс",
+      "english_name": "IndexOf",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: MetadataObjectCollection.IndexOf (id 5740), parameter «ОписаниеМетаданного»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "MetadataObjectPropertyValueCollection",
+      "russian_name": "Содержит",
+      "english_name": "Contains",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: MetadataObjectPropertyValueCollection.Contains (id 5743), parameter «ОбъектОписанияМетаданного»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "FunctionalOptionContent",
+      "russian_name": "Содержит",
+      "english_name": "Contains",
+      "min_version": "8.2",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: FunctionalOptionContent.Contains (id 5755), parameter «Объект»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "FunctionalOptionContent",
+      "russian_name": "Найти",
+      "english_name": "Find",
+      "min_version": "8.2",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "Строка",
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: FunctionalOptionContent.Find (id 5756), parameter «Объект»: param_type «Строка, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "ExchangePlansManager",
+      "russian_name": "ВыбратьИзменения",
+      "english_name": "SelectChanges",
+      "min_version": "8.0",
+      "parameter_index": 2,
+      "replacement_type_list": [
+        "Неопределено",
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: ExchangePlansManager.SelectChanges (id 941), parameter «ФильтрВыборки»: param_type «Неопределено, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "HTMLDocumentField",
+      "russian_name": "ПолучитьURL",
+      "english_name": "GetURL",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: HTMLDocumentField.GetURL (id 1925), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "DatabaseCopyContent",
+      "russian_name": "Найти",
+      "english_name": "Find",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: DatabaseCopyContent.Find (id 5216), parameter «Объект»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "DatabaseCopyContent",
+      "russian_name": "Вставить",
+      "english_name": "Insert",
+      "parameter_index": 1,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: DatabaseCopyContent.Insert (id 5221), parameter «Элемент»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "BinaryDataStorageDataContent",
+      "russian_name": "Найти",
+      "english_name": "Find",
+      "min_version": "8.3.26",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: BinaryDataStorageDataContent.Find (id 5858), parameter «Объект»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "canonical_type": "DatabaseTablespaceContent",
+      "russian_name": "Найти",
+      "english_name": "Find",
+      "min_version": "8.3.23",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: DatabaseTablespaceContent.Find (id 5882), parameter «Объект»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    }
+  ],
+  "global_function_parameter_overrides": [
+    {
+      "russian_name": "ПравоДоступа",
+      "english_name": "AccessRight",
+      "min_version": "8.0",
+      "parameter_index": 1,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: AccessRight (global function id 459), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "russian_name": "ВыполнитьПроверкуПравДоступа",
+      "english_name": "VerifyAccessRights",
+      "min_version": "8.2",
+      "parameter_index": 1,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: VerifyAccessRights (global function id 492), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "russian_name": "ЗаписьЖурналаРегистрации",
+      "english_name": "WriteLogEvent",
+      "min_version": "8.0",
+      "parameter_index": 2,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: WriteLogEvent (global function id 430), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "russian_name": "ОткрытьСправку",
+      "english_name": "OpenHelp",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: OpenHelp (global function id 360), parameter «Раздел»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "russian_name": "ОбновитьНумерациюОбъектов",
+      "english_name": "RefreshObjectsNumbering",
+      "min_version": "8.1",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "Массив",
+        "ОбъектМетаданных: *"
+      ],
+      "evidence_source": "platform_data.json: RefreshObjectsNumbering (global function id 279), parameter «Метаданные»: param_type «Массив, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
     }
   ],
   "type_property_additions": [
