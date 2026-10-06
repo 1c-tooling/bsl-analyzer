@@ -418,6 +418,41 @@ impl WorkspaceRoots {
         self.roots.iter().map(|root| (root.id.as_str(), root.declared.as_path()))
     }
 
+    /// Registered roots as `(id, declared spelling, canonical spelling)`, in registration
+    /// order.
+    ///
+    /// [`Self::entries`] answers where a root is spelled; this also answers where it led
+    /// when the table was built — the only handle on a root reached through a link once
+    /// that link no longer resolves, and on the roots registered under the same target
+    /// (github#190).
+    pub fn entries_with_canonical(&self) -> impl Iterator<Item = (&str, &Path, &Path)> {
+        self.roots
+            .iter()
+            .map(|root| (root.id.as_str(), root.declared.as_path(), root.canonical.as_path()))
+    }
+
+    /// A table whose two spellings are STATED rather than read off the disk.
+    ///
+    /// Attribution is interesting exactly where the spellings differ, and a real link is
+    /// neither available on every test platform nor something a test wants to keep alive
+    /// while it asks what a removal does once the link's target is gone (github#190).
+    #[cfg(test)]
+    pub(crate) fn with_stated_spellings(
+        workspace: &Path,
+        roots: Vec<(String, PathBuf, PathBuf)>,
+    ) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            workspace_canonical: workspace.to_path_buf(),
+            roots: roots
+                .into_iter()
+                .map(|(id, declared, canonical)| Root { id, declared, canonical })
+                .collect(),
+            excluded: Vec::new(),
+            user_excluded: project_model::ExcludedPaths::default(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty()
     }
@@ -491,7 +526,7 @@ fn canonicalize(path: &Path) -> PathBuf {
 }
 
 /// Whether `path` lies strictly inside `prefix`.
-fn starts_at(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn starts_at(path: &Path, prefix: &Path) -> bool {
     path.strip_prefix(prefix).is_ok_and(|rest| rest.components().next().is_some())
 }
 

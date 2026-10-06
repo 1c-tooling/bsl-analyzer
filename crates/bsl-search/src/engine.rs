@@ -6067,6 +6067,29 @@ fn vanished_keys_in(
                 })
                 .map(|(id, _)| id.to_owned()),
         );
+        // A root declared THROUGH a link keeps its declared spelling, while its files —
+        // and the roots registered under its target — are spelled from the target, which
+        // the table captured when it was built. When the target is what got deleted, the
+        // removed path is the root's declared spelling (or a path inside it), and the
+        // nested roots match neither spelling of it: their keys would be left behind,
+        // spelled as the walk saw them through the link that is now gone (github#190).
+        // The nested roots are read from the table for exactly that reason — the disk can
+        // no longer say where the link led. Candidates only: every key is still proven
+        // gone file by file below.
+        for (_, declared, target) in roots.entries_with_canonical() {
+            if declared != walked && !crate::workspace_roots::starts_at(&walked, declared) {
+                continue;
+            }
+            swallowed_roots.extend(
+                roots
+                    .entries_with_canonical()
+                    .filter(|(_, nested_declared, nested_canonical)| {
+                        crate::workspace_roots::starts_at(nested_declared, target)
+                            || crate::workspace_roots::starts_at(nested_canonical, target)
+                    })
+                    .map(|(nested_id, _, _)| nested_id.to_owned()),
+            );
+        }
     }
     if prefixes.is_empty() && swallowed_roots.is_empty() {
         return Vec::new();
@@ -9893,6 +9916,83 @@ mod tests {
             engine.file_count().unwrap(),
             0,
             "a live directory target is not a source; the walked key owns the row"
+        );
+    }
+
+    /// A removed directory can be the DECLARED spelling of a root while every key the root
+    /// holds is spelled from its canonical target — and the roots registered under that
+    /// target carry spellings the removed path never matches. Attribution alone answers
+    /// nothing there: the walk spelled those keys through the link that is now gone, so the
+    /// roots under the target are read from the table, which captured it while it still
+    /// resolved (github#190). The candidates stay gated by the absence proof.
+    #[test]
+    fn a_removed_alias_spelling_reaches_roots_under_its_vanished_target() {
+        let base = tempdir().unwrap();
+        let workspace = base.path().join("w");
+        let alias = workspace.join("alias");
+        let target = base.path().join("outside").join("outer");
+        let inner = target.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let module = inner.join("A.bsl");
+        fs::write(&module, "Процедура Внутренняя()\nКонецПроцедуры").unwrap();
+
+        let roots = crate::WorkspaceRoots::with_stated_spellings(
+            &workspace,
+            vec![
+                ("cfe/alias".to_owned(), alias.clone(), target.clone()),
+                ("cfe/inner".to_owned(), inner.clone(), inner.clone()),
+            ],
+        );
+        let key = FileKey::new("cfe/inner", "A.bsl");
+        let carriers = crate::key_carriers::CarrierKeys {
+            store_rows: [key.clone()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        assert!(
+            super::vanished_keys_in(&roots, &carriers, std::slice::from_ref(&alias)).is_empty(),
+            "a live file is not a removal, however the candidates were widened",
+        );
+        fs::remove_file(&module).unwrap();
+        assert_eq!(
+            super::vanished_keys_in(&roots, &carriers, std::slice::from_ref(&alias)),
+            vec![key],
+            "the nested root's key belongs to the removed tree",
+        );
+    }
+
+    /// The same repair when the removal names a path INSIDE the alias root rather than the
+    /// root itself: the spelling is still followed to the target, and the roots registered
+    /// under it are the ones whose keys the removal has to reach (github#190).
+    #[test]
+    fn a_removal_inside_an_alias_spelling_still_reaches_its_target() {
+        let base = tempdir().unwrap();
+        let workspace = base.path().join("w");
+        let alias = workspace.join("alias");
+        let target = base.path().join("outside").join("outer");
+        let inner = target.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let module = inner.join("A.bsl");
+        fs::write(&module, "Процедура Внутренняя()\nКонецПроцедуры").unwrap();
+
+        let roots = crate::WorkspaceRoots::with_stated_spellings(
+            &workspace,
+            vec![
+                ("cfe/alias".to_owned(), alias.clone(), target.clone()),
+                ("cfe/inner".to_owned(), inner.clone(), inner.clone()),
+            ],
+        );
+        let key = FileKey::new("cfe/inner", "A.bsl");
+        let carriers = crate::key_carriers::CarrierKeys {
+            store_rows: [key.clone()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        fs::remove_file(&module).unwrap();
+        assert_eq!(
+            super::vanished_keys_in(&roots, &carriers, &[alias.join("inner")]),
+            vec![key],
+            "a removed path inside the declared spelling still names the target's roots",
         );
     }
 
