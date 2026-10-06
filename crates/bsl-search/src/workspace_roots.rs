@@ -562,8 +562,8 @@ fn root_id_for(workspace_canonical: &Path, canonical: &Path, declared: &Path) ->
 /// Deletion is the case this exists for: a removed file cannot be canonicalized,
 /// and dropping all the way to the walked spelling would leave attribution
 /// ranking roots by their declared paths alone. A file that lived under a root
-/// reached through an alias would then be removed under a DIFFERENT root's key —
-/// tombstone and all — while its real row stayed behind serving a dead hit.
+/// reached through an alias would then be removed under a DIFFERENT root's key,
+/// while its real row stayed behind serving a dead hit.
 pub(crate) fn canonical_spelling(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;

@@ -46,9 +46,9 @@ pub use domain::{
 };
 pub use embedder::{Embedder, EmbedderConfig};
 pub use engine::{
-    workspace_file_key_in, CarrierCapture, CarrierSnapshot, FenceOutcome, FtsIngest, IndexProgress,
-    OverlayRetrySignals, ReferenceCollectionReplaceOutcome, SearchConfig, SearchEngine, SearchHit,
-    SemanticIndexQualification, ValidatedWorkspaceOverlayPublication,
+    removed_path_keys, workspace_file_key_in, CarrierCapture, CarrierSnapshot, FenceOutcome,
+    FtsIngest, IndexProgress, OverlayRetrySignals, ReferenceCollectionReplaceOutcome, SearchConfig,
+    SearchEngine, SearchHit, SemanticIndexQualification, ValidatedWorkspaceOverlayPublication,
     ValidatedWorkspaceRootsTransitionPlan, WorkspaceOverlayDebt, WorkspaceRootsTransitionOutcome,
     WorkspaceRootsTransitionPlan, WorkspaceRootsTransitionSeed, WORKSPACE_APPLY_BATCH_ROWS,
 };

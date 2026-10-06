@@ -19,10 +19,9 @@ use crate::workspace_roots::FileKey;
 /// A carrier of POSITIVE knowledge: evidence that the key was indexed and is
 /// expected to exist.
 ///
-/// Tombstones and context marks are deliberately absent. A tombstone records a
-/// file's ABSENCE, so it can never make a key a candidate for removal, and a
-/// context mark says a rendered context went stale — a claim about freshness,
-/// not about existence.
+/// Negative knowledge — a record of a file's ABSENCE — is deliberately absent. It could
+/// never make a key a candidate for removal, and a context mark says a rendered context
+/// went stale — a claim about freshness, not about existence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum KeyCarrier {
     /// The `files` row of the `code` collection, with its cascaded chunks.

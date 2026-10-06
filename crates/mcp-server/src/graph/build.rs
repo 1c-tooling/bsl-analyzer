@@ -2173,6 +2173,16 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
                 let Some(key) = self.key_of(&disk_path) else {
                     continue;
                 };
+                // The fused writer is one of the index-write paths, so the spelling it reached
+                // this module through is recorded beside the key: a removal arriving as that
+                // path finds it even when re-attribution cannot (github#192). Best effort —
+                // losing the pair costs the fallback, not the build.
+                if let Err(error) = self.engine.record_workspace_path_spelling(&disk_path, &key) {
+                    tracing::warn!(
+                        path = ?disk_path,
+                        "failed to record the fused writer's path spelling: {error}"
+                    );
+                }
                 let bytes = match std::fs::read(&disk_path) {
                     Ok(b) => b,
                     Err(_) => {
@@ -2852,6 +2862,14 @@ mod tests {
         assert!(
             !rows.iter().any(|(_, path)| path.ends_with("C.bsl")),
             "a module under no registered root is still not this index's business: {rows:?}",
+        );
+        // The fused writer is one of the index-write paths: the spelling it reached each
+        // module through is recorded beside the key, so a removal arriving as that path finds
+        // it (github#192).
+        assert_eq!(
+            engine.store().path_spelling_key(&extension_module.to_string_lossy(), "code").unwrap(),
+            Some(extension_key.clone()),
+            "the fused writer records the spelling it reached the module through",
         );
     }
 

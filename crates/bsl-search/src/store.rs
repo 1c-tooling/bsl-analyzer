@@ -82,7 +82,6 @@ pub(crate) struct WorkspaceStoreTransition<'a> {
     /// persisted overlay rows that are deliberately absent from the positive carrier snapshot.
     pub(crate) changed_root_ids: &'a HashSet<String>,
     pub(crate) cleanup: &'a HashSet<FileKey>,
-    pub(crate) tombstones: &'a HashSet<FileKey>,
     pub(crate) upserts: &'a [WorkspaceTransitionFile],
     pub(crate) token_layout_claim: Option<&'a str>,
 }
@@ -200,17 +199,6 @@ const ROOT_KEYED_TABLES: &[RootKeyedTable] = &[
             path             TEXT    NOT NULL,
             file_fingerprint TEXT    NOT NULL,
             PRIMARY KEY (collection, root_id, path)
-        ",
-        suffix: "",
-    },
-    RootKeyedTable {
-        name: "overlay_tombstones",
-        body: "
-            root_id    TEXT    NOT NULL DEFAULT '',
-            path       TEXT    NOT NULL,
-            collection TEXT    NOT NULL DEFAULT 'code',
-            deleted_at TEXT    NOT NULL,
-            UNIQUE (root_id, path)
         ",
         suffix: "",
     },
@@ -1140,9 +1128,6 @@ impl Store {
                 fetched_at      TEXT    NOT NULL
             );
 
-            -- Tombstones for deleted baseline files.
-            -- When a baseline file is deleted locally, its path is recorded here
-            -- so the merge layer can hide the baseline hit.
             -- Overlay files: files that are locally modified or new relative to
             -- the baseline manifest. These are separate from the main `files`
             -- table so baseline rows never appear in local storage.
@@ -1209,7 +1194,26 @@ impl Store {
             ",
         )?;
 
+        // Every spelling a walk reached an indexed file through, with the key it was stored
+        // under. Attribution cannot be redone once the links are gone — a removal arrives as
+        // the path the watcher saw, and ranking the roots then may name a different file —
+        // so the pair is recorded where it is born and looked up here (github#192). The
+        // spelling is the primary key: a record lives exactly as long as that spelling means
+        // that key, so re-attributing a spelling (a link replaced by a regular file)
+        // overwrites it, while the old key keeps its own record under its own spelling.
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS path_spellings (
+                spelling   TEXT PRIMARY KEY,
+                root_id    TEXT NOT NULL,
+                path       TEXT NOT NULL,
+                collection TEXT NOT NULL DEFAULT 'code'
+            );
+            ",
+        )?;
+
         Self::migrate_overlay_embedding_cache_key(conn)?;
+        Self::migrate_overlay_tombstones_removal(conn)?;
 
         Self::create_embedding_generation_triggers(conn)?;
         Self::create_baseline_version_triggers(conn)?;
@@ -1389,6 +1393,19 @@ impl Store {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Drop `overlay_tombstones`, the negative carrier a removal used to keep.
+    ///
+    /// Nothing in production ever read it: the promise it was introduced for — a baseline
+    /// hit must not resurrect a file deleted locally — is delivered by the overlay's own
+    /// hidings ([`crate::workspace_overlay::WorkspaceOverlayCache::remove_known_deleted`]),
+    /// which live in memory and are rebuilt by the full warmup. The store row, the dirty
+    /// mark and the fingerprint retraction each still carry their own truth; this table
+    /// carried none, so an upgraded store stops paying a write per removal (github#233).
+    fn migrate_overlay_tombstones_removal(conn: &Connection) -> Result<(), SearchError> {
+        conn.execute_batch("DROP TABLE IF EXISTS overlay_tombstones;")?;
         Ok(())
     }
 
@@ -1917,11 +1934,6 @@ impl Store {
         let mut counts = Counts::default();
         let tx = self.conn.unchecked_transaction()?;
         let mut removed_chunk_ids = Vec::new();
-        let deleted_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
         for key in removed {
             let mut stmt = tx.prepare(
                 "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id
@@ -1931,12 +1943,6 @@ impl Store {
                 stmt.query_map(params![key.root_id, key.path], |row| row.get::<_, i64>(0))?
                     .collect::<Result<Vec<_>, _>>()?,
             );
-            tx.execute(
-                "INSERT INTO overlay_tombstones (root_id, path, collection, deleted_at)
-                 VALUES (?1, ?2, 'code', ?3)
-                 ON CONFLICT(root_id, path) DO UPDATE SET collection = 'code', deleted_at = ?3",
-                params![key.root_id, key.path, deleted_at],
-            )?;
             tx.execute(
                 "DELETE FROM overlay_fingerprint_cache WHERE root_id = ?1 AND path = ?2",
                 params![key.root_id, key.path],
@@ -2194,7 +2200,7 @@ impl Store {
                 "DELETE FROM overlay_files WHERE collection = 'code' AND root_id = ?1",
                 params![root_id],
             )?;
-            for table in ["overlay_fingerprint_cache", "context_dirty", "overlay_tombstones"] {
+            for table in ["overlay_fingerprint_cache", "context_dirty", "path_spellings"] {
                 let sql = format!("DELETE FROM {table} WHERE root_id = ?1");
                 tx.execute(&sql, params![root_id])?;
             }
@@ -2242,30 +2248,10 @@ impl Store {
                 "DELETE FROM overlay_files WHERE collection = 'code' AND root_id = ?1 AND path = ?2",
                 params![key.root_id, key.path],
             )?;
-            for table in ["overlay_fingerprint_cache", "context_dirty", "overlay_tombstones"] {
+            for table in ["overlay_fingerprint_cache", "context_dirty", "path_spellings"] {
                 let sql = format!("DELETE FROM {table} WHERE root_id = ?1 AND path = ?2");
                 tx.execute(&sql, params![key.root_id, key.path])?;
             }
-            if tick() {
-                if tx.rollback().is_ok() {
-                    observation.finish(Outcome::Cancelled, Counts::default());
-                }
-                return Ok(ControlFlow::Break(()));
-            }
-        }
-
-        let deleted_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
-        for key in change.tombstones {
-            tx.execute(
-                "INSERT INTO overlay_tombstones (root_id, path, collection, deleted_at)
-                 VALUES (?1, ?2, 'code', ?3)
-                ON CONFLICT(root_id, path) DO UPDATE SET collection = 'code', deleted_at = ?3",
-                params![key.root_id, key.path, deleted_at],
-            )?;
             if tick() {
                 if tx.rollback().is_ok() {
                     observation.finish(Outcome::Cancelled, Counts::default());
@@ -3372,6 +3358,8 @@ impl Store {
             params![collection],
         )?;
         self.conn.execute("DELETE FROM files WHERE collection = ?1", params![collection])?;
+        self.conn
+            .execute("DELETE FROM path_spellings WHERE collection = ?1", params![collection])?;
         observation.finish(
             Outcome::Committed,
             Counts { sqlite_vectors_removed: None, ..Counts::default() },
@@ -3981,52 +3969,121 @@ impl Store {
         Ok(Some(record))
     }
 
-    pub fn insert_overlay_tombstone(
+    /// Record the key one spelling of a workspace file resolves to.
+    ///
+    /// The inverse of attribution, kept because attribution cannot be redone once the links
+    /// are gone: a removal arrives as the path the watcher saw, and ranking the roots then
+    /// may name a different file, or none (github#192). Re-recording a spelling replaces the
+    /// record — a link replaced by a regular file moves its spelling to the new key, while
+    /// the old key, if its file still lives, keeps its own record under its own spelling.
+    pub fn record_path_spelling(
+        &self,
+        spelling: &str,
+        key: &FileKey,
+        collection: &str,
+    ) -> Result<(), SearchError> {
+        self.conn.execute(
+            "INSERT INTO path_spellings (spelling, root_id, path, collection)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(spelling) DO UPDATE SET root_id = ?2, path = ?3, collection = ?4",
+            params![spelling, key.root_id, key.path, collection],
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::record_path_spelling`] for a batch, in one transaction. A spelling repeated
+    /// within the batch keeps the LAST key: the walk can reach one file through two roots and
+    /// records both, and the final attribution is the one a removal has to find.
+    pub fn record_path_spellings(
+        &self,
+        collection: &str,
+        records: &[(String, FileKey)],
+    ) -> Result<(), SearchError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (spelling, key) in records {
+            tx.execute(
+                "INSERT INTO path_spellings (spelling, root_id, path, collection)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(spelling) DO UPDATE SET root_id = ?2, path = ?3, collection = ?4",
+                params![spelling, key.root_id, key.path, collection],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop every spelling recorded for one key — called when the key itself is removed, so
+    /// the journal is bounded by the keys that still exist rather than by every path the store
+    /// has ever seen (github#192).
+    pub fn forget_path_spellings_for_key(
         &self,
         root_id: &str,
         path: &str,
         collection: &str,
     ) -> Result<(), SearchError> {
-        let deleted_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         self.conn.execute(
-            "INSERT INTO overlay_tombstones (root_id, path, collection, deleted_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(root_id, path) DO UPDATE SET collection = ?3, deleted_at = ?4",
-            params![root_id, path, collection, deleted_at.to_string()],
+            "DELETE FROM path_spellings WHERE root_id = ?1 AND path = ?2 AND collection = ?3",
+            params![root_id, path, collection],
         )?;
         Ok(())
     }
 
-    pub fn remove_overlay_tombstone(&self, root_id: &str, path: &str) -> Result<(), SearchError> {
-        self.conn.execute(
-            "DELETE FROM overlay_tombstones WHERE root_id = ?1 AND path = ?2",
-            params![root_id, path],
-        )?;
-        Ok(())
-    }
-
-    pub fn overlay_tombstone_paths(
+    /// The key a spelling was last recorded under, if any.
+    pub fn path_spelling_key(
         &self,
+        spelling: &str,
         collection: &str,
-    ) -> Result<HashSet<FileKey>, SearchError> {
-        let mut stmt = self
+    ) -> Result<Option<FileKey>, SearchError> {
+        let key = self
             .conn
-            .prepare("SELECT root_id, path FROM overlay_tombstones WHERE collection = ?1")?;
-        let rows = stmt.query_map(params![collection], file_key_row)?;
-        let mut keys = HashSet::new();
+            .query_row(
+                "SELECT root_id, path FROM path_spellings WHERE spelling = ?1 AND collection = ?2",
+                params![spelling, collection],
+                file_key_row,
+            )
+            .optional()?;
+        Ok(key)
+    }
+
+    /// The keys recorded under every spelling strictly inside `prefix` — the journal answer
+    /// for a removed directory, whose files the drain cannot name one by one.
+    ///
+    /// Matched by whole component (the caller passes a directory, the pattern adds the
+    /// platform separator), so `Dir.bak` is not inside `Dir`. `LIKE` is case-insensitive for
+    /// ASCII by default, which makes the radius a little wider on case-sensitive filesystems —
+    /// every answer is gated by the absence proof, so the extra candidates only cost a stat —
+    /// and means the scan walks the journal rather than using its index.
+    pub fn path_spellings_under(
+        &self,
+        prefix: &str,
+        collection: &str,
+    ) -> Result<Vec<FileKey>, SearchError> {
+        // The separator is appended ESCAPED like every other metacharacter: an unescaped one
+        // would fuse with the trailing `%` and turn it into a literal.
+        let mut pattern = String::with_capacity(prefix.len() + 8);
+        for character in prefix.chars().chain(std::iter::once(std::path::MAIN_SEPARATOR)) {
+            match character {
+                '\\' | '%' | '_' => {
+                    pattern.push('\\');
+                    pattern.push(character);
+                }
+                _ => pattern.push(character),
+            }
+        }
+        pattern.push('%');
+        let mut stmt = self.conn.prepare(
+            "SELECT root_id, path FROM path_spellings
+             WHERE collection = ?1 AND spelling LIKE ?2 ESCAPE '\\'",
+        )?;
+        let rows = stmt.query_map(params![collection, pattern], file_key_row)?;
+        let mut keys = Vec::new();
         for row in rows {
-            keys.insert(row?);
+            keys.push(row?);
         }
         Ok(keys)
-    }
-
-    pub fn clear_overlay_tombstones(&self, collection: &str) -> Result<(), SearchError> {
-        self.conn
-            .execute("DELETE FROM overlay_tombstones WHERE collection = ?1", params![collection])?;
-        Ok(())
     }
 
     pub fn upsert_overlay_file_with_chunks(
@@ -4317,15 +4374,6 @@ impl Store {
             "SELECT COUNT(*) FROM overlay_chunks c
              JOIN overlay_files f ON f.id = c.file_id
              WHERE f.collection = ?1",
-            params![collection],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-
-    pub fn overlay_tombstone_count(&self, collection: &str) -> Result<usize, SearchError> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM overlay_tombstones WHERE collection = ?1",
             params![collection],
             |row| row.get(0),
         )?;
@@ -4654,7 +4702,8 @@ impl Store {
         );
         self.conn
             .execute("DELETE FROM overlay_files WHERE collection = ?1", params![collection])?;
-        self.clear_overlay_tombstones(collection)?;
+        self.conn
+            .execute("DELETE FROM path_spellings WHERE collection = ?1", params![collection])?;
         Ok(())
     }
 
@@ -4731,7 +4780,7 @@ impl Store {
                 return Ok(ControlFlow::Break(()));
             }
         }
-        tx.execute("DELETE FROM overlay_tombstones WHERE collection = ?1", params![collection])?;
+        tx.execute("DELETE FROM path_spellings WHERE collection = ?1", params![collection])?;
         if checkpoint().is_break() {
             if tx.rollback().is_ok() {
                 observation.finish(Outcome::Cancelled, Counts::default());
@@ -5115,6 +5164,124 @@ mod tests {
         assert_eq!(store.embedding_generation().unwrap(), 17, "the vector generation is preserved");
     }
 
+    /// The removed carrier does not survive an upgrade: nothing ever read it, and the promise
+    /// it was written for is delivered by the overlay's hidings, so the table is dropped on
+    /// open rather than left to mislead whoever reads the schema next and to cost a write per
+    /// removal for ever (github#233).
+    #[test]
+    fn an_upgraded_store_drops_the_dead_tombstone_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        write_pre_root_id_store(&path);
+
+        let before = Connection::open(&path).unwrap();
+        let carried: Option<i64> = before
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'overlay_tombstones'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        drop(before);
+        assert_eq!(
+            carried,
+            Some(1),
+            "the fixture has to carry the dead table, or the drop below proves nothing",
+        );
+
+        let _store = Store::open(&path).unwrap();
+        let after = Connection::open(&path).unwrap();
+        let left: Option<i64> = after
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'overlay_tombstones'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(left, None, "an upgraded store must not keep a carrier nothing reads");
+    }
+
+    /// The journal maps a spelling to the key it was last attributed to; re-recording a
+    /// spelling replaces the record — the lifetime rule: a link replaced by a regular file
+    /// moves its spelling while the old key, whose file still lives, keeps its own record
+    /// (github#192).
+    #[test]
+    fn recorded_spellings_follow_the_key_they_were_last_attributed_to() {
+        let store = Store::in_memory().unwrap();
+        let link = "/ws/cf/ExtLink/Module.bsl";
+        let target = FileKey::new("ext", "Module.bsl");
+        assert!(store.path_spelling_key(link, "code").unwrap().is_none());
+
+        store.record_path_spelling(link, &target, "code").unwrap();
+        assert_eq!(store.path_spelling_key(link, "code").unwrap(), Some(target.clone()));
+
+        let own = FileKey::configuration("ExtLink/Module.bsl");
+        store.record_path_spelling(link, &own, "code").unwrap();
+        assert_eq!(store.path_spelling_key(link, "code").unwrap(), Some(own));
+        assert_eq!(
+            store.path_spelling_key("/ws/ext/Module.bsl", "code").unwrap(),
+            None,
+            "the old key, if its file still lives, keeps its own record under its own spelling",
+        );
+    }
+
+    /// The directory answer covers strict descendants by whole component — `Dir.bak` is not
+    /// inside `Dir` — and a spelling reached twice in one batch keeps the LAST key
+    /// (github#192).
+    #[test]
+    fn the_journal_covers_descendants_and_batch_duplicates() {
+        let store = Store::in_memory().unwrap();
+        let spelling = |rel: &str| {
+            rel.split('/').fold(std::path::PathBuf::new(), |path, part| path.join(part))
+        };
+        let dir = spelling("ws/Dir");
+        let a_spelling = spelling("ws/Dir/A.bsl");
+        let b_spelling = spelling("ws/Dir/Sub/B.bsl");
+        let sibling = spelling("ws/Dir.bak/C.bsl");
+        let twice = spelling("ws/Twice.bsl");
+        let first = FileKey::configuration("Dir/A.bsl");
+        let second = FileKey::new("ext", "Sub/B.bsl");
+        store
+            .record_path_spellings(
+                "code",
+                &[
+                    (a_spelling.to_string_lossy().into_owned(), first.clone()),
+                    (b_spelling.to_string_lossy().into_owned(), second.clone()),
+                    (
+                        sibling.to_string_lossy().into_owned(),
+                        FileKey::configuration("Dir.bak/C.bsl"),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.path_spelling_key(&a_spelling.to_string_lossy(), "code").unwrap(),
+            Some(first.clone())
+        );
+        let mut under = store.path_spellings_under(&dir.to_string_lossy(), "code").unwrap();
+        under.sort();
+        let mut expected = vec![first, second.clone()];
+        expected.sort();
+        assert_eq!(under, expected, "only whole-component descendants belong to the directory");
+
+        store
+            .record_path_spellings(
+                "code",
+                &[
+                    (twice.to_string_lossy().into_owned(), FileKey::configuration("Twice.bsl")),
+                    (twice.to_string_lossy().into_owned(), second.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.path_spelling_key(&twice.to_string_lossy(), "code").unwrap(),
+            Some(second)
+        );
+    }
+
     #[test]
     fn checkpointed_root_migration_rolls_back_at_64_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -5304,14 +5471,6 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO overlay_tombstones (root_id, path, collection, deleted_at)
-                 VALUES ('cfe/one', 'CommonModules/C/Ext/Module.bsl', 'code', '2026-01-01')",
-                [],
-            )
-            .unwrap();
-        store
-            .conn
-            .execute(
                 "INSERT INTO overlay_files (root_id, path, hash, indexed_at, collection)
                  VALUES ('cfe/one', 'CommonModules/D/Ext/Module.bsl', x'0f', 100, 'code')",
                 [],
@@ -5342,7 +5501,6 @@ mod tests {
         for (table, duplicated) in [
             ("files", taken),
             ("baseline_manifest_files", taken),
-            ("overlay_tombstones", "CommonModules/C/Ext/Module.bsl"),
             ("overlay_files", "CommonModules/D/Ext/Module.bsl"),
             ("overlay_fingerprint_cache", taken),
             ("context_dirty", "CommonModules/B/Ext/Module.bsl"),
@@ -6855,28 +7013,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_tombstone_persistence() {
-        let store = Store::in_memory().unwrap();
-        assert!(store.overlay_tombstone_paths("code").unwrap().is_empty());
-
-        store.insert_overlay_tombstone(CONFIGURATION_ROOT_ID, "src/A.bsl", "code").unwrap();
-        store.insert_overlay_tombstone(CONFIGURATION_ROOT_ID, "src/B.bsl", "code").unwrap();
-
-        let paths = store.overlay_tombstone_paths("code").unwrap();
-        assert_eq!(paths.len(), 2);
-        assert!(paths.contains(&FileKey::configuration("src/A.bsl")));
-        assert!(paths.contains(&FileKey::configuration("src/B.bsl")));
-
-        store.remove_overlay_tombstone(CONFIGURATION_ROOT_ID, "src/A.bsl").unwrap();
-        let paths = store.overlay_tombstone_paths("code").unwrap();
-        assert_eq!(paths.len(), 1);
-        assert!(paths.contains(&FileKey::configuration("src/B.bsl")));
-
-        store.clear_overlay_tombstones("code").unwrap();
-        assert!(store.overlay_tombstone_paths("code").unwrap().is_empty());
-    }
-
-    #[test]
     fn overlay_file_with_chunks_roundtrip() {
         let mut store = Store::in_memory().unwrap();
         let hash = blake3::hash(b"overlay content");
@@ -6919,12 +7055,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        store.insert_overlay_tombstone(CONFIGURATION_ROOT_ID, "src/B.bsl", "code").unwrap();
-
         store.clear_overlay_state("code").unwrap();
         assert_eq!(store.overlay_file_count("code").unwrap(), 0);
         assert_eq!(store.overlay_chunk_count("code").unwrap(), 0);
-        assert_eq!(store.overlay_tombstone_count("code").unwrap(), 0);
     }
 
     #[test]
@@ -7074,7 +7207,6 @@ mod tests {
                 None,
             )
             .unwrap();
-        store.insert_overlay_tombstone(&key.root_id, &key.path, "code").unwrap();
         store.mark_context_dirty("code", &key.root_id, &key.path).unwrap();
         store
             .save_overlay_fingerprint_cache(
@@ -7098,7 +7230,6 @@ mod tests {
                 WorkspaceStoreTransition {
                     changed_root_ids: &changed_root_ids,
                     cleanup: &HashSet::new(),
-                    tombstones: &HashSet::new(),
                     upserts: &[],
                     token_layout_claim: None,
                 },
@@ -7109,7 +7240,6 @@ mod tests {
 
         assert!(store.file_hash(&key.root_id, &key.path).unwrap().is_none());
         assert_eq!(store.overlay_file_count("code").unwrap(), 0);
-        assert!(!store.overlay_tombstone_paths("code").unwrap().contains(&key));
         assert!(!store.context_dirty_paths("code").unwrap().contains(&key));
         assert!(!store.overlay_fingerprint_keys().unwrap().contains(&key));
     }
@@ -7456,7 +7586,6 @@ mod tests {
                         WorkspaceStoreTransition {
                             changed_root_ids: &roots,
                             cleanup: &keys,
-                            tombstones: &HashSet::new(),
                             upserts: &[],
                             token_layout_claim: None,
                         },

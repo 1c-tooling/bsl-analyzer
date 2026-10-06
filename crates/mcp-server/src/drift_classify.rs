@@ -49,7 +49,7 @@ pub(crate) struct DriftClassification {
     /// registers them into the live resident in place. Empty without a baseline (search
     /// treats any present file as `bsl_modified`).
     pub bsl_added: Vec<DriftPath>,
-    /// `.bsl` files gone from disk. Search tombstones them; diagnostics tombstones the
+    /// `.bsl` files gone from disk. Search removes them; diagnostics tombstones the
     /// resident registration in place (only tracked files land here with a baseline).
     pub bsl_removed: Vec<DriftPath>,
     /// A change no point-refresh can express: a removed directory subtree whose
@@ -136,7 +136,7 @@ pub(crate) fn classify_drift(
                 },
             },
             None => match baseline {
-                // Search: a gone file is a tombstone (`.bsl`) or a metadata removal (`.xml`).
+                // Search: a gone file is a removal (`.bsl`) or a metadata removal (`.xml`).
                 None => {
                     if is_xml {
                         out.xml_paths.push(drift_path(&key));
@@ -176,7 +176,7 @@ mod tests {
     }
 
     /// Without a baseline (search), on-disk truth drives the taxonomy: a present `.bsl`
-    /// is a body edit, a gone `.bsl` a tombstone, any `.xml` a resolver input, and a
+    /// is a body edit, a gone `.bsl` a removal, any `.xml` a resolver input, and a
     /// subtree removal a re-walk. No fingerprints are computed.
     #[test]
     fn stateless_policy_buckets_by_kind_and_extension() {
