@@ -6223,15 +6223,17 @@ impl SearchEngine {
     }
 }
 
-/// Whether this path is PROVEN to be gone, as opposed to merely unreadable.
+/// Whether the indexed file at this path is PROVEN to be gone, as opposed to merely unreadable.
 ///
 /// Following links, because a link whose target is deleted is deleted as far as anything
 /// reading the file is concerned. `NotADirectory` counts too: a path whose parent is a file
-/// cannot exist. Everything else — a permission error, a momentary race — is an unanswered
-/// question, and an unanswered question is not evidence of deletion.
+/// cannot exist. So does anything that is not a regular file — a directory now standing at
+/// the path is not the file the walk indexed, and the walk would never index it. Everything
+/// else — a permission error, a momentary race — is an unanswered question, and an
+/// unanswered question is not evidence of deletion.
 fn proven_absent(path: &Path) -> bool {
     match std::fs::metadata(path) {
-        Ok(_) => false,
+        Ok(metadata) => !metadata.is_file(),
         Err(err) => {
             matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
         }
@@ -10961,6 +10963,35 @@ mod tests {
             engine.store().path_spelling_key(&spelling, "code").unwrap(),
             Some(indexed),
             "a context mark is not an index write and keeps the recorded key",
+        );
+    }
+
+    /// A key names a regular file, so a directory standing at its path is no evidence the
+    /// file lives: the walk would never index it, and the journal's answer must not be
+    /// withheld over it.
+    #[test]
+    fn a_directory_in_place_of_an_indexed_file_proves_the_file_gone() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let configuration = workspace.join("cf");
+        let module = configuration.join("CommonModules").join("Б").join("Ext").join("Module.bsl");
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&module, "Процедура Первая()\nКонецПроцедуры").unwrap();
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(&workspace, &configuration, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+        let key = FileKey::new(crate::CONFIGURATION_ROOT_ID, "CommonModules/Б/Ext/Module.bsl");
+        engine.store().upsert_file(&key.root_id, &key.path, b"h", "code").unwrap();
+        engine.record_workspace_spellings(&key, &[module.as_path()]).unwrap();
+
+        fs::remove_file(&module).unwrap();
+        fs::create_dir(&module).unwrap();
+        assert!(engine.remove_workspace_path(&module).unwrap());
+        assert_eq!(
+            engine.store().file_hash(&key.root_id, &key.path).unwrap(),
+            None,
+            "a directory where the file stood does not keep the file's row alive",
         );
     }
 
