@@ -3880,7 +3880,6 @@ impl SearchEngine {
         let Some(key) = self.workspace_file_key(path) else {
             return Ok(false);
         };
-        self.record_point_spelling(path, &key);
         self.mark_workspace_key_context_dirty(&key)?;
         Ok(true)
     }
@@ -10936,6 +10935,33 @@ mod tests {
             .mark_workspace_path_context_dirty("CommonModules/Б/Ext/Module.bsl")
             .expect("marking a workspace path is not an error");
         assert!(marked, "a configuration-relative path resolves to its stored key");
+    }
+
+    /// A context mark re-renders a stored context and indexes nothing, so it must not move a
+    /// spelling's journal record to whatever the spelling attributes to now: the record names
+    /// the key the file was indexed under, and a later removal of that spelling has to find it.
+    #[test]
+    fn a_context_mark_leaves_the_spelling_journal_alone() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let configuration = workspace.join("cf");
+        let module = configuration.join("CommonModules").join("Б").join("Ext").join("Module.bsl");
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&module, "Процедура Первая()\nКонецПроцедуры").unwrap();
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(&workspace, &configuration, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+        let indexed = FileKey::new("ext", "CommonModules/Б/Ext/Module.bsl");
+        let spelling = module.to_string_lossy().into_owned();
+        engine.store().record_path_spelling(&spelling, &indexed, "code").unwrap();
+
+        assert!(engine.mark_workspace_path_context_dirty(&module).unwrap());
+        assert_eq!(
+            engine.store().path_spelling_key(&spelling, "code").unwrap(),
+            Some(indexed),
+            "a context mark is not an index write and keeps the recorded key",
+        );
     }
 
     fn write_transition_module(root: &std::path::Path, procedure: &str) {
