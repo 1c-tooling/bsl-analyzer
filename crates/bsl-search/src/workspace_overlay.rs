@@ -889,7 +889,7 @@ impl WorkspaceOverlayCache {
             let baseline_files: HashMap<FileKey, Vec<u8>> =
                 store.all_files_in_collection("code")?.into_iter().collect();
             let refreshed = if !self.initialized || !self.watcher_mode || self.full_rescan_pending {
-                self.full_refresh(&baseline_files, roots, embedder, batch_size, hash_mode)
+                self.full_refresh(&baseline_files, roots, embedder, batch_size, hash_mode, store)
             } else if !self.dirty_paths.is_empty() {
                 let dirty: Vec<FileKey> = self.dirty_paths.drain().map(|(key, _)| key).collect();
                 self.refresh_dirty_paths(
@@ -930,8 +930,10 @@ impl WorkspaceOverlayCache {
         embedder: Option<&Embedder>,
         batch_size: usize,
         hash_mode: BaselineHashMode,
+        store: &Store,
     ) -> Result<(), SearchError> {
         let scanned = scan_workspace_files(roots);
+        record_scanned_spellings(store, &scanned);
         self.full_refresh_scanned(baseline_files, scanned, embedder, batch_size, hash_mode)
     }
 
@@ -1403,6 +1405,7 @@ impl WorkspaceOverlayCache {
         store: &Store,
     ) -> Result<(), SearchError> {
         let scanned = scan_workspace_files(roots);
+        record_scanned_spellings(store, &scanned);
         self.full_refresh_from_manifest_scanned(
             manifest_fingerprints,
             scanned,
@@ -1704,6 +1707,7 @@ impl WorkspaceOverlayCache {
         embedder: Option<&Embedder>,
     ) -> Result<RefreshPlan, SearchError> {
         let scanned = scan_workspace_files(roots);
+        record_scanned_spellings(store, &scanned);
         Self::plan_full_refresh_from_manifest_scanned_with_embedder(
             manifest_fingerprints,
             scanned,
@@ -2419,6 +2423,26 @@ fn root_is_reachable(roots: &WorkspaceRoots, key: &FileKey) -> bool {
         // the tree behind it, and a dangling or cycled root link is the walk's "unreadable
         // root", not the file's deletion.
         .is_some_and(|(_, root)| std::fs::metadata(root).is_ok())
+}
+
+/// Record every scanned file's two spellings, best effort.
+///
+/// The journal is what a removal has and re-attribution does not; a write that fails costs
+/// the fallback behaviour for those spellings, not the refresh (github#192).
+fn record_scanned_spellings(store: &Store, scanned: &ScannedFiles) {
+    let mut records: Vec<(String, FileKey)> = Vec::new();
+    let mut seen = HashSet::new();
+    for file in &scanned.files {
+        for spelling in [&file.abs_path, &file.fingerprint.canonical] {
+            let rendered = spelling.to_string_lossy().into_owned();
+            if !rendered.is_empty() && seen.insert(rendered.clone()) {
+                records.push((rendered, file.key.clone()));
+            }
+        }
+    }
+    if let Err(error) = store.record_path_spellings("code", &records) {
+        tracing::warn!("failed to record a scan's path spellings: {error}");
+    }
 }
 
 /// The pure projection of a walk result into overlay terms. Roots may nest, so
@@ -4090,6 +4114,7 @@ mod tests {
                 None,
                 32,
                 BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
             )
             .unwrap();
         let overlay = cache.snapshot();
@@ -4337,6 +4362,7 @@ mod tests {
                 None,
                 32,
                 BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
             )
             .unwrap();
         assert_eq!(cache.snapshot().lexical_documents.len(), 2, "both diverge at first");
@@ -4616,7 +4642,14 @@ mod tests {
             .unwrap();
         assert!(cache.needs_full_rescan(), "raw full refresh");
         cache
-            .full_refresh(&HashMap::new(), &roots, None, 32, BaselineHashMode::RawFileBytes)
+            .full_refresh(
+                &HashMap::new(),
+                &roots,
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
+            )
             .unwrap();
         assert!(!cache.needs_full_rescan(), "a clean raw refresh clears it");
 
@@ -4747,7 +4780,16 @@ mod tests {
         let baseline = HashMap::from([(key("Edited.bsl"), b"baseline-differs".to_vec())]);
         let roots = single_root(workspace);
         let mut cache = WorkspaceOverlayCache::default();
-        cache.full_refresh(&baseline, &roots, None, 32, BaselineHashMode::RawFileBytes).unwrap();
+        cache
+            .full_refresh(
+                &baseline,
+                &roots,
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
+            )
+            .unwrap();
         assert_eq!(cache.snapshot().lexical_documents[0].symbol_name, "Изменённая");
         assert!(cache.snapshot().hidden_paths.contains(&key("Edited.bsl")));
 
@@ -4758,7 +4800,14 @@ mod tests {
             return;
         }
         let (result, warns) = warns_during(|| {
-            cache.full_refresh(&baseline, &roots, None, 32, BaselineHashMode::RawFileBytes)
+            cache.full_refresh(
+                &baseline,
+                &roots,
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
+            )
         });
         restore_access(&edited);
         result.unwrap();
@@ -6462,13 +6511,31 @@ mod tests {
         let baseline = HashMap::from([(key("A.bsl"), b"baseline-differs".to_vec())]);
         let roots = single_root(workspace);
         let mut cache = WorkspaceOverlayCache::default();
-        cache.full_refresh(&baseline, &roots, None, 32, BaselineHashMode::RawFileBytes).unwrap();
+        cache
+            .full_refresh(
+                &baseline,
+                &roots,
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
+            )
+            .unwrap();
         assert_eq!(cache.snapshot().lexical_documents[0].symbol_name, "Первая");
         let mtime = fs::metadata(&file).unwrap().modified().unwrap();
         fs::write(&file, "Процедура Вторая()\nКонецПроцедуры").unwrap();
         fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
         cache.mark_dirty_path(key("A.bsl"));
-        cache.full_refresh(&baseline, &roots, None, 32, BaselineHashMode::RawFileBytes).unwrap();
+        cache
+            .full_refresh(
+                &baseline,
+                &roots,
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             cache.snapshot().lexical_documents[0].symbol_name,
             "Вторая",

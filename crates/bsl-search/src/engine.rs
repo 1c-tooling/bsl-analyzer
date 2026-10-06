@@ -229,6 +229,10 @@ struct WorkspaceRootsTransitionStaging {
     changed_root_ids: HashSet<String>,
     cleanup: HashSet<FileKey>,
     obsolete_baseline: HashSet<FileKey>,
+    /// Every spelling the planned walk reached its files through, ready to be recorded beside
+    /// the transition's rows: a root move re-attributes spellings, and the journal has to
+    /// follow the world the transition published (github#192).
+    spellings: Vec<(String, FileKey)>,
     upserts: Vec<WorkspaceTransitionFile>,
     /// The arguments of the in-place overlay transition, not a rebuilt overlay. Staging must not
     /// hold the engine lock while it scans, and a cache cloned before that scan is a photograph
@@ -2222,7 +2226,30 @@ impl SearchEngine {
             roots.excluded(),
             roots.user_excluded(),
         );
-        Self::files_from_scan(roots, &set)
+        let files = Self::files_from_scan(roots, &set);
+        self.record_scanned_spellings(&files);
+        files.into_iter().map(|file| (file.key, file.walked)).collect()
+    }
+
+    /// Record every scanned file's two spellings, best effort.
+    ///
+    /// The journal is what a removal has and re-attribution does not; a write that fails
+    /// costs the fallback behaviour for those spellings, not the ingest — so the walk is
+    /// not failed over it (github#192).
+    fn record_scanned_spellings(&self, files: &[ScannedWorkspaceFile]) {
+        let mut records: Vec<(String, FileKey)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for file in files {
+            for spelling in [&file.walked, &file.canonical] {
+                let rendered = spelling.to_string_lossy().into_owned();
+                if !rendered.is_empty() && seen.insert(rendered.clone()) {
+                    records.push((rendered, file.key.clone()));
+                }
+            }
+        }
+        if let Err(error) = self.store.record_path_spellings("code", &records) {
+            tracing::warn!("failed to record the walk's path spellings: {error}");
+        }
     }
 
     /// The corpus a walk describes: every source file it reached, under the key its owning root
@@ -2236,7 +2263,7 @@ impl SearchEngine {
     fn files_from_scan(
         roots: &WorkspaceRoots,
         set: &project_model::SourceSet,
-    ) -> Vec<(FileKey, std::path::PathBuf)> {
+    ) -> Vec<ScannedWorkspaceFile> {
         let mut seen = HashSet::new();
         let mut files = Vec::new();
         for file in &set.files {
@@ -2249,7 +2276,11 @@ impl SearchEngine {
             if !seen.insert(key.clone()) {
                 continue;
             }
-            files.push((key, file.walked.clone()));
+            files.push(ScannedWorkspaceFile {
+                key,
+                walked: file.walked.clone(),
+                canonical: file.canonical.clone(),
+            });
         }
         files
     }
@@ -2276,6 +2307,9 @@ impl SearchEngine {
             };
             Self::files_from_scan(roots, set)
         };
+        self.record_scanned_spellings(&files);
+        let files: Vec<(FileKey, std::path::PathBuf)> =
+            files.into_iter().map(|file| (file.key, file.walked)).collect();
         self.ingest_files_fts(&files)
     }
 
@@ -3398,10 +3432,31 @@ impl SearchEngine {
             ));
         }
         let next_index = VectorIndex::build(self.dim, &embeddings)?;
+        // Both spellings of every planned file, collected here where the walk's identities are
+        // still in hand — the apply step writes them beside the rows (github#192).
+        let spellings = {
+            let mut records: Vec<(String, FileKey)> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for (key, identity) in plan
+                .files
+                .iter()
+                .map(|file| (&file.key, &file.identity))
+                .chain(plan.unread_files.iter().map(|file| (&file.key, &file.identity)))
+            {
+                for spelling in [&identity.abs_path, &identity.canonical] {
+                    let rendered = spelling.to_string_lossy().into_owned();
+                    if !rendered.is_empty() && seen.insert(rendered.clone()) {
+                        records.push((rendered, key.clone()));
+                    }
+                }
+            }
+            records
+        };
         validated.staging = Some(WorkspaceRootsTransitionStaging {
             changed_root_ids: changed_ids,
             cleanup,
             obsolete_baseline,
+            spellings,
             upserts,
             unread_present: unread_keys,
             overlay_files,
@@ -3470,7 +3525,6 @@ impl SearchEngine {
             WorkspaceStoreTransition {
                 changed_root_ids: &staging.changed_root_ids,
                 cleanup: &staging.cleanup,
-                tombstones: &staging.obsolete_baseline,
                 upserts: &staging.upserts,
                 token_layout_claim: self.embedder.as_ref().and_then(Embedder::token_layout_claim),
             },
@@ -3482,6 +3536,12 @@ impl SearchEngine {
         }
         let staging =
             validated.staging.take().expect("staging checked immediately before the transaction");
+        // The transition published a world with these spellings; the journal follows it. Best
+        // effort like every journal write: a failure costs the fallback behaviour for those
+        // spellings, not the transition that already committed (github#192).
+        if let Err(error) = self.store.record_path_spellings("code", &staging.spellings) {
+            tracing::warn!("failed to record the transition's path spellings: {error}");
+        }
         // Applied to the LIVE cache, never installed over it: whatever the window between
         // staging and this commit admitted — a point mark, a settled refresh, a whole overlay
         // publication — is still there and keeps its meaning. The transition changes only the
@@ -3546,11 +3606,23 @@ impl SearchEngine {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<bool, SearchError> {
-        let Some(key) = self.workspace_file_key(path.as_ref()) else {
+        let path = path.as_ref();
+        let Some(key) = self.workspace_file_key(path) else {
             return Ok(false);
         };
+        self.record_point_spelling(path, &key);
         self.mark_workspace_key_dirty(key)?;
         Ok(true)
+    }
+
+    /// Record a point event's spelling, best effort.
+    ///
+    /// A point mark is an index WRITE, and the spelling it arrived as is what a later removal
+    /// of that spelling looks up — a failure costs that fallback, not the mark (github#192).
+    fn record_point_spelling(&self, path: &Path, key: &FileKey) {
+        if let Err(error) = self.record_workspace_path_spelling(path, key) {
+            tracing::warn!(?path, "failed to record a point event's path spelling: {error}");
+        }
     }
 
     pub fn mark_workspace_key_dirty(&self, key: FileKey) -> Result<(), SearchError> {
@@ -3725,6 +3797,48 @@ impl CarrierSnapshot {
             None => Vec::new(),
         }
     }
+
+    /// The keys a drain's removals name: `removed_paths` are the exact paths it reported
+    /// gone, `removed_subtrees` are the paths under which every indexed file is gone.
+    /// `reader` is the store half the caller opened — the journal is read through it, off the
+    /// engine lock, like the carriers themselves.
+    ///
+    /// A path the journal holds is answered by the journal ALONE: the spelling names the key
+    /// its file was indexed under, and re-attribution now would name a different one — which
+    /// is exactly the defect the pair exists to close (github#192). That answer is gated by
+    /// the absence proof, so removing a link whose target lives takes nothing with it. A path
+    /// the journal does not hold falls back to attribution, with the event-driven meaning it
+    /// had before the journal existed.
+    pub fn removal_keys(
+        &self,
+        reader: &Store,
+        removed_paths: &[PathBuf],
+        removed_subtrees: &[PathBuf],
+    ) -> Result<Vec<FileKey>, SearchError> {
+        let Some(roots) = &self.roots else {
+            return Ok(Vec::new());
+        };
+        let mut keys = self.vanished_keys(removed_subtrees);
+        let mut seen: HashSet<FileKey> = keys.iter().cloned().collect();
+        for spelling in removal_spellings(roots, removed_subtrees) {
+            for key in reader
+                .path_spelling_key(&spelling, "code")?
+                .into_iter()
+                .chain(reader.path_spellings_under(&spelling, "code")?)
+            {
+                if !seen.contains(&key) && proven_absent_key(roots, &key) {
+                    seen.insert(key.clone());
+                    keys.push(key);
+                }
+            }
+        }
+        for key in removed_path_keys(roots, reader, removed_paths)? {
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
 }
 
 /// The store key of a workspace `.bsl` file under `roots`, or `None` when it is not a `.bsl`
@@ -3739,8 +3853,8 @@ pub fn workspace_file_key_in(roots: &WorkspaceRoots, path: &Path) -> Option<File
     // would be one that is FORBIDDEN to exist (the walk drops such files), so canonical
     // attribution is meaningless there; the walked spelling is the only key the file could
     // ever have been indexed under — the key a removal must reach. A GONE target still
-    // attributes canonically: it was a file if it was anything, and the tombstone path
-    // needs the last known spelling.
+    // attributes canonically: it was a file if it was anything, and the removal path needs
+    // the last known spelling.
     let target_is_source = project_model::file_role(&canonical) == project_model::FileRole::Source
         && match std::fs::metadata(&canonical) {
             Ok(metadata) => metadata.is_file(),
@@ -3762,7 +3876,8 @@ impl SearchEngine {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<bool, SearchError> {
-        let Some(key) = self.workspace_file_key(path.as_ref()) else {
+        let path = path.as_ref();
+        let Some(key) = self.workspace_file_key(path) else {
             return Ok(false);
         };
         self.mark_workspace_key_context_dirty(&key)?;
@@ -3836,8 +3951,8 @@ impl SearchEngine {
     /// Remove one workspace `.bsl` file after a local deletion, closing every path a
     /// stale hit could survive:
     /// - drops its `files` row and cascaded `chunks`/FTS rows from the store;
-    /// - writes an overlay tombstone so a baseline (Postgres-mode) hit for the same path
-    ///   cannot resurrect it;
+    /// - hides a baseline (Postgres-mode) copy of the same path in the overlay so it
+    ///   cannot resurrect the file;
     /// - marks the path dirty in the in-memory overlay cache so a cached entry stops
     ///   serving stale hits on the next refresh (`refresh_dirty_paths` hides a gone file);
     /// - evicts exactly the deleted chunks' vectors from the live index incrementally.
@@ -3847,11 +3962,75 @@ impl SearchEngine {
     /// deliberately does NOT reload every embedding or re-persist the sidecar. Returns
     /// whether the path was a workspace `.bsl`.
     pub fn remove_workspace_path(&mut self, path: impl AsRef<Path>) -> Result<bool, SearchError> {
-        let Some(key) = self.workspace_file_key(path.as_ref()) else {
+        let path = path.as_ref();
+        // The journal speaks for a spelling it holds, alone: it names the key the file was
+        // indexed under, while re-attribution now would name a different one — that is the
+        // whole reason the pair is kept (github#192). Its answer is gated by the absence
+        // proof, so a link removed while its target lives takes nothing with it.
+        if let Some(recorded) = self.recorded_spelling_key(path)? {
+            let roots = self.workspace_roots.as_ref().expect("a recorded spelling has a table");
+            if proven_absent_key(roots, &recorded) {
+                self.remove_workspace_key(&recorded)?;
+            }
+            return Ok(true);
+        }
+        // No record: the spelling is answered by attribution with its event-driven meaning,
+        // exactly as before the journal existed.
+        let Some(key) = self.workspace_file_key(path) else {
             return Ok(false);
         };
         self.remove_workspace_key(&key)?;
         Ok(true)
+    }
+
+    /// The journal's answer for the spellings `path` can arrive under — the path as given and
+    /// its canonical counterpart while one still resolves.
+    fn recorded_spelling_key(&self, path: &Path) -> Result<Option<FileKey>, SearchError> {
+        let Some(roots) = self.workspace_roots.as_ref() else {
+            return Ok(None);
+        };
+        for spelling in removal_spellings(roots, &[path.to_path_buf()]) {
+            if let Some(key) = self.store.path_spelling_key(&spelling, "code")? {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Record the spellings a path was indexed under: the one given, and its canonical
+    /// counterpart while it resolves.
+    ///
+    /// Called where an index WRITE happens, not where a query does: the journal describes the
+    /// generation this store serves, and a lookup has no business extending it (github#192).
+    pub fn record_workspace_path_spelling(
+        &self,
+        path: &Path,
+        key: &FileKey,
+    ) -> Result<(), SearchError> {
+        let Some(roots) = self.workspace_roots.as_ref() else {
+            return Ok(());
+        };
+        let (walked, canonical) = roots.spellings_of(path);
+        self.record_workspace_spellings(key, &[walked.as_path(), canonical.as_path()])
+    }
+
+    /// [`Self::record_workspace_path_spelling`] for spellings the caller already holds — a
+    /// walk has both sides in hand, and re-deriving the canonical one would read a disk the
+    /// walk no longer describes.
+    pub fn record_workspace_spellings(
+        &self,
+        key: &FileKey,
+        spellings: &[&Path],
+    ) -> Result<(), SearchError> {
+        let mut records: Vec<(String, FileKey)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for spelling in spellings {
+            let rendered = spelling.to_string_lossy().into_owned();
+            if !rendered.is_empty() && seen.insert(rendered.clone()) {
+                records.push((rendered, key.clone()));
+            }
+        }
+        self.store.record_path_spellings("code", &records)
     }
 
     /// [`Self::remove_workspace_path`] for a caller that already holds the store
@@ -3900,7 +4079,26 @@ impl SearchEngine {
         let Some(roots) = self.workspace_roots.as_ref() else {
             return Ok(Vec::new());
         };
-        Ok(vanished_keys_in(roots, &self.carrier_keys()?, dirs))
+        let mut candidates = vanished_keys_in(roots, &self.carrier_keys()?, dirs);
+        let mut seen: HashSet<FileKey> = candidates.iter().cloned().collect();
+        // The journal answers what attribution no longer can — the key a removed spelling was
+        // indexed under — and the absence proof gates every journal answer, so a spelling whose
+        // file lives on (a link removed while its target stays) takes nothing with it
+        // (github#192).
+        for spelling in removal_spellings(roots, dirs) {
+            let recorded = self
+                .store
+                .path_spelling_key(&spelling, "code")?
+                .into_iter()
+                .chain(self.store.path_spellings_under(&spelling, "code")?);
+            for key in recorded {
+                if !seen.contains(&key) && proven_absent_key(roots, &key) {
+                    seen.insert(key.clone());
+                    candidates.push(key);
+                }
+            }
+        }
+        Ok(candidates)
     }
 
     /// Apply an already-materialized removal set without further filesystem probes.
@@ -3970,7 +4168,6 @@ impl SearchEngine {
         }
         // Collected before the row goes, because the row is where they live.
         let chunk_ids = self.store.chunk_ids_for_file("code", &key.root_id, &key.path)?;
-        self.store.insert_overlay_tombstone(&key.root_id, &key.path, "code")?;
         // The dead file's fingerprint row must not survive it: the dirty mark dies with the
         // process, and a namesake recreated at the same (len, mtime, canonical) would inherit
         // the "verified" claim across a restart.
@@ -4006,6 +4203,18 @@ impl SearchEngine {
             "code",
             self.embedder.as_ref().and_then(Embedder::token_layout_claim),
         )?;
+        // Housekeeping, not coverage: a failure here leaves at most one stale record, which the
+        // next index write at the same spelling overwrites, so the removal is not failed over it
+        // (github#192).
+        if let Err(error) =
+            self.store.forget_path_spellings_for_key(&key.root_id, &key.path, "code")
+        {
+            tracing::warn!(
+                root = ?key.root_id,
+                path = %key.path,
+                "failed to forget a removed key's path spellings: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -4049,10 +4258,10 @@ impl SearchEngine {
 
     /// Reconcile the workspace `code` collection against the set of `.bsl` files actually
     /// present on disk (`present_abs`, absolute paths from a fresh walk): every key no longer
-    /// present is removed via [`Self::remove_workspace_key_with`] (tombstone + overlay dirty +
-    /// incremental vector eviction). This closes the gap where a file deleted during a lost
-    /// watch window (change-hub overflow or a structural subtree rescan) keeps its rows and
-    /// vectors forever, because the ordinary drift path only marks files that still exist.
+    /// present is removed via [`Self::remove_workspace_key_with`] (overlay dirty + baseline
+    /// hiding + incremental vector eviction). This closes the gap where a file deleted during
+    /// a lost watch window (change-hub overflow or a structural subtree rescan) keeps its rows
+    /// and vectors forever, because the ordinary drift path only marks files that still exist.
     ///
     /// Candidates come from EVERY carrier (see [`Self::carrier_keys`]), not from the store
     /// rows alone: those rows are a snapshot of the boot walk, so a file indexed afterwards
@@ -6014,19 +6223,86 @@ impl SearchEngine {
     }
 }
 
-/// Whether this path is PROVEN to be gone, as opposed to merely unreadable.
+/// Whether the indexed file at this path is PROVEN to be gone, as opposed to merely unreadable.
 ///
 /// Following links, because a link whose target is deleted is deleted as far as anything
 /// reading the file is concerned. `NotADirectory` counts too: a path whose parent is a file
-/// cannot exist. Everything else — a permission error, a momentary race — is an unanswered
-/// question, and an unanswered question is not evidence of deletion.
+/// cannot exist. So does anything that is not a regular file — a directory now standing at
+/// the path is not the file the walk indexed, and the walk would never index it. Everything
+/// else — a permission error, a momentary race — is an unanswered question, and an
+/// unanswered question is not evidence of deletion.
 fn proven_absent(path: &Path) -> bool {
     match std::fs::metadata(path) {
-        Ok(_) => false,
+        Ok(metadata) => !metadata.is_file(),
         Err(err) => {
             matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
         }
     }
+}
+
+/// The spellings a removal of one of `paths` can arrive under: the path as given on disk,
+/// and its canonical counterpart while one still resolves. Both are recorded at index time
+/// (the walk has both sides), so both are tried when a removal asks who the spelling was.
+fn removal_spellings(roots: &WorkspaceRoots, paths: &[PathBuf]) -> Vec<String> {
+    let mut spellings = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        let (walked, canonical) = roots.spellings_of(path);
+        for spelling in [walked, canonical] {
+            let rendered = spelling.to_string_lossy().into_owned();
+            if !rendered.is_empty() && seen.insert(rendered.clone()) {
+                spellings.push(rendered);
+            }
+        }
+    }
+    spellings
+}
+
+/// The keys a drain's removed PATHS name, with the journal answering for a spelling it holds
+/// and attribution for a spelling it does not.
+///
+/// A path the journal holds is answered by the journal alone: the spelling names the key its
+/// file was indexed under, and re-attribution now would name a different one — which is the
+/// defect the pair exists to close (github#192). The journal answer is gated by the absence
+/// proof, so removing a link whose target lives takes nothing with it. A spelling the journal
+/// does not hold keeps the event-driven attribution it had before the journal existed: a store
+/// whose journal has not been populated yet behaves exactly as it used to.
+pub fn removed_path_keys(
+    roots: &WorkspaceRoots,
+    reader: &Store,
+    removed_paths: &[PathBuf],
+) -> Result<Vec<FileKey>, SearchError> {
+    let mut keys = Vec::new();
+    let mut seen: HashSet<FileKey> = HashSet::new();
+    for path in removed_paths {
+        let mut recorded = None;
+        for spelling in removal_spellings(roots, std::slice::from_ref(path)) {
+            if let Some(key) = reader.path_spelling_key(&spelling, "code")? {
+                recorded = Some(key);
+                break;
+            }
+        }
+        match recorded {
+            Some(key) => {
+                if proven_absent_key(roots, &key) && seen.insert(key.clone()) {
+                    keys.push(key);
+                }
+            }
+            None => {
+                if let Some(key) = workspace_file_key_in(roots, path) {
+                    if seen.insert(key.clone()) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// Whether the file `key` names is proven gone, through the spelling a reader opens it by.
+fn proven_absent_key(roots: &WorkspaceRoots, key: &FileKey) -> bool {
+    roots.resolve(key).is_some_and(|path| proven_absent(&path))
 }
 
 /// The keys under `dirs` whose files are proven gone, attributed by the DECLARED spellings
@@ -6067,6 +6343,29 @@ fn vanished_keys_in(
                 })
                 .map(|(id, _)| id.to_owned()),
         );
+        // A root declared THROUGH a link keeps its declared spelling, while its files —
+        // and the roots registered under its target — are spelled from the target, which
+        // the table captured when it was built. When the target is what got deleted, the
+        // removed path is the root's declared spelling (or a path inside it), and the
+        // nested roots match neither spelling of it: their keys would be left behind,
+        // spelled as the walk saw them through the link that is now gone (github#190).
+        // The nested roots are read from the table for exactly that reason — the disk can
+        // no longer say where the link led. Candidates only: every key is still proven
+        // gone file by file below.
+        for (_, declared, target) in roots.entries_with_canonical() {
+            if declared != walked && !crate::workspace_roots::starts_at(&walked, declared) {
+                continue;
+            }
+            swallowed_roots.extend(
+                roots
+                    .entries_with_canonical()
+                    .filter(|(_, nested_declared, nested_canonical)| {
+                        crate::workspace_roots::starts_at(nested_declared, target)
+                            || crate::workspace_roots::starts_at(nested_canonical, target)
+                    })
+                    .map(|(nested_id, _, _)| nested_id.to_owned()),
+            );
+        }
     }
     if prefixes.is_empty() && swallowed_roots.is_empty() {
         return Vec::new();
@@ -6080,6 +6379,16 @@ fn vanished_keys_in(
         })
         .filter(|key| roots.resolve(key).is_some_and(|path| proven_absent(&path)))
         .collect()
+}
+
+/// One file a walk reached, with both spellings attribution had: the walked path is what a
+/// caller reads and what a removal arrives as; the canonical one is its counterpart under
+/// the target (github#192).
+#[derive(Debug, Clone)]
+pub(crate) struct ScannedWorkspaceFile {
+    pub(crate) key: FileKey,
+    pub(crate) walked: PathBuf,
+    pub(crate) canonical: PathBuf,
 }
 
 /// What a batch removal did: the count each caller reports, and the first fault, kept so a
@@ -6389,8 +6698,9 @@ mod tests {
         }
 
         let mut expected = HashSet::new();
-        for (key, walked_path) in &files {
-            let source = fs::read_to_string(walked_path).unwrap();
+        for file in &files {
+            let key = &file.key;
+            let source = fs::read_to_string(&file.walked).unwrap();
             for parent in crate::Chunker::source_chunks(&source) {
                 let identity = (
                     key.clone(),
@@ -6403,8 +6713,9 @@ mod tests {
         }
 
         let mut actual = HashSet::new();
-        for (key, walked_path) in &files {
-            let source = fs::read_to_string(walked_path).unwrap();
+        for file in &files {
+            let key = &file.key;
+            let source = fs::read_to_string(&file.walked).unwrap();
             let mut groups = HashMap::<(String, u32, u32), Vec<IndexedDocument>>::new();
             for document in documents_by_file.remove(key).unwrap_or_default() {
                 let span = document.source_span.as_ref().expect("token rows need provenance");
@@ -6615,7 +6926,6 @@ mod tests {
         );
         assert!(outcome.is_break());
         assert!(engine.store().file_hash(&removed.root_id, &removed.path).unwrap().is_some());
-        assert!(!engine.store().overlay_tombstone_paths("code").unwrap().contains(&removed));
         assert!(!engine.context_dirty_paths("code").unwrap().contains(&context));
         assert!(engine.workspace_overlay_dirty_paths().unwrap().is_empty());
     }
@@ -8582,7 +8892,7 @@ mod tests {
 
     /// A structural rescan reconciles the store against disk: a file deleted during a lost
     /// watch window (hub overflow / subtree removal) — absent from the freshly walked set —
-    /// is removed (FTS rows dropped, live vector evicted, tombstone written); a file still
+    /// is removed (FTS rows dropped, live vector evicted, baseline copy hidden); a file still
     /// present is untouched. Without this, a deleted file lingers in the index forever.
     #[test]
     fn reconcile_workspace_files_removes_stored_but_gone_files() {
@@ -8656,14 +8966,6 @@ mod tests {
             !engine.text_search("Оставшаяся", 10, Some("code")).unwrap().is_empty(),
             "the surviving file is intact",
         );
-        assert!(
-            engine
-                .store()
-                .overlay_tombstone_paths("code")
-                .unwrap()
-                .contains(&FileKey::configuration("Gone.bsl")),
-            "a tombstone blocks a baseline hit from resurrecting the gone file",
-        );
         // The gone file's vector answers nothing; the survivor's still does.
         let hits = engine.search_with_embedding(&vec_a, 5, None).unwrap();
         assert!(
@@ -8693,38 +8995,6 @@ mod tests {
             })
             .collect();
         engine.sync_indexed_documents_in_collection("code", &documents, None).unwrap();
-    }
-
-    /// The store row is what a reconcile sees a key by, so it must be the LAST thing a
-    /// removal drops: a failure after it would leave nothing to select the key again, and
-    /// the retry mark reaches the overlay only. Checked on the tombstone, whose write has
-    /// always been fallible and has always run after the row.
-    #[test]
-    fn a_denied_tombstone_leaves_the_store_row_as_evidence() {
-        let dir = tempdir().unwrap();
-        let workspace = dir.path();
-        let db_path = workspace.join("bsl-search.db");
-        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
-        engine.set_workspace_root(workspace);
-        seed_rows(&mut engine, &["Removed.bsl"]);
-
-        let saboteur = rusqlite::Connection::open(&db_path).unwrap();
-        saboteur
-            .execute_batch(
-                "CREATE TRIGGER deny_tombstone BEFORE INSERT ON overlay_tombstones \
-                 BEGIN SELECT RAISE(FAIL, 'deny'); END;",
-            )
-            .unwrap();
-
-        assert!(engine.reconcile_workspace_files(&HashSet::new()).is_err(), "the denial surfaces");
-        assert_eq!(engine.file_count().unwrap(), 1, "the row survives as evidence for a retry");
-
-        saboteur.execute_batch("DROP TRIGGER deny_tombstone").unwrap();
-        assert_eq!(
-            engine.reconcile_workspace_files(&HashSet::new()).unwrap(),
-            1,
-            "once the fault clears, the key is still there to remove",
-        );
     }
 
     /// Retracting the fingerprint row used to be best effort: its failure was logged and the
@@ -9003,13 +9273,43 @@ mod tests {
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
         engine.set_workspace_root(workspace);
         seed_rows(&mut engine, &["AFailing.bsl", "BHealthy.bsl"]);
+        // The fallible store step before the row goes needs a row to fail on: both keys get a
+        // fingerprint entry, so the denial below lands on a step the removal really takes.
+        engine
+            .store()
+            .save_overlay_fingerprint_cache(
+                "snap",
+                &HashMap::from([
+                    (
+                        FileKey::configuration("AFailing.bsl"),
+                        crate::store::PersistedFingerprint {
+                            file_size: 1,
+                            file_mtime_secs: 1,
+                            file_mtime_nanos: 0,
+                            content_fingerprint: "fp".to_owned(),
+                            canonical: "AFailing.bsl".to_owned(),
+                        },
+                    ),
+                    (
+                        FileKey::configuration("BHealthy.bsl"),
+                        crate::store::PersistedFingerprint {
+                            file_size: 1,
+                            file_mtime_secs: 1,
+                            file_mtime_nanos: 0,
+                            content_fingerprint: "fp".to_owned(),
+                            canonical: "BHealthy.bsl".to_owned(),
+                        },
+                    ),
+                ]),
+            )
+            .unwrap();
 
         // Denied for exactly one key, so the batch has both a failing and a healthy member.
         let saboteur = rusqlite::Connection::open(&db_path).unwrap();
         saboteur
             .execute_batch(
-                "CREATE TRIGGER deny_one_tombstone BEFORE INSERT ON overlay_tombstones \
-                 WHEN NEW.path = 'AFailing.bsl' BEGIN SELECT RAISE(FAIL, 'deny'); END;",
+                "CREATE TRIGGER deny_one_fingerprint BEFORE DELETE ON overlay_fingerprint_cache \
+                 WHEN OLD.path = 'AFailing.bsl' BEGIN SELECT RAISE(FAIL, 'deny'); END;",
             )
             .unwrap();
 
@@ -9531,15 +9831,35 @@ mod tests {
         );
     }
 
-    /// A workspace removal writes an overlay tombstone so a baseline (Postgres-mode) hit
-    /// for the same path cannot resurrect the locally-deleted file.
+    /// A workspace removal HIDES a baseline (Postgres-mode) copy of the same path so it
+    /// cannot resurrect the locally-deleted file. The hiding lives in the overlay — the
+    /// negative carrier the store used to keep beside it was written and never read
+    /// (github#233) — so the promise is pinned where it is actually delivered.
     #[test]
-    fn remove_workspace_path_tombstones_so_a_baseline_hit_cannot_resurrect() {
+    fn remove_workspace_path_hides_a_baseline_hit_so_it_cannot_resurrect() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
         let db_path = workspace.join("bsl-search.db");
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
         engine.set_workspace_root(workspace);
+        // A baseline copy is what makes the hiding mean anything: a key outside the manifest
+        // has nothing to hide unless a local entry of its own is being replaced.
+        engine.set_serves_external_baseline(true).unwrap();
+        engine
+            .store()
+            .save_baseline_manifest(&crate::WorkspaceBaselineManifest {
+                snapshot_id: "snap".to_owned(),
+                snapshot_fingerprint: None,
+                files: vec![crate::BaselineManifestFile {
+                    root_id: crate::CONFIGURATION_ROOT_ID.to_owned(),
+                    collection: "code".to_owned(),
+                    path: "Removed.bsl".to_owned(),
+                    file_fingerprint: "fp-file".to_owned(),
+                    document_count: 1,
+                    file_object_id: "obj-1".to_owned(),
+                }],
+            })
+            .unwrap();
         engine
             .sync_indexed_documents_in_collection(
                 "code",
@@ -9562,10 +9882,14 @@ mod tests {
 
         assert!(engine.remove_workspace_path(workspace.join("Removed.bsl")).unwrap());
 
-        let tombstones = engine.store().overlay_tombstone_paths("code").unwrap();
-        assert!(
-            tombstones.contains(&FileKey::configuration("Removed.bsl")),
-            "the deleted path is tombstoned so a baseline hit stays hidden: {tombstones:?}",
+        let stats = engine.workspace_overlay_stats().unwrap().unwrap();
+        assert_eq!(
+            stats.hidden_paths, 1,
+            "the deleted path's baseline copy stays hidden so it cannot resurrect",
+        );
+        assert_eq!(
+            stats.deleted_files, 1,
+            "and the hiding is what carries the deletion, since no local entry is left",
         );
     }
 
@@ -9573,7 +9897,7 @@ mod tests {
     /// outer root reached through an alias, and an inner root registered under the
     /// alias's real path. A file deleted there cannot be canonicalized, and ranking
     /// the roots by their declared spellings alone would pick the outer one — so the
-    /// removal would tombstone a key nobody ever wrote and leave the real row serving
+    /// removal would drop a key nobody ever wrote and leave the real row serving
     /// a dead hit.
     #[cfg(unix)]
     #[test]
@@ -9896,6 +10220,318 @@ mod tests {
         );
     }
 
+    /// A removed directory can be the DECLARED spelling of a root while every key the root
+    /// holds is spelled from its canonical target — and the roots registered under that
+    /// target carry spellings the removed path never matches. Attribution alone answers
+    /// nothing there: the walk spelled those keys through the link that is now gone, so the
+    /// roots under the target are read from the table, which captured it while it still
+    /// resolved (github#190). The candidates stay gated by the absence proof.
+    #[test]
+    fn a_removed_alias_spelling_reaches_roots_under_its_vanished_target() {
+        let base = tempdir().unwrap();
+        let workspace = base.path().join("w");
+        let alias = workspace.join("alias");
+        let target = base.path().join("outside").join("outer");
+        let inner = target.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let module = inner.join("A.bsl");
+        fs::write(&module, "Процедура Внутренняя()\nКонецПроцедуры").unwrap();
+
+        let roots = crate::WorkspaceRoots::with_stated_spellings(
+            &workspace,
+            vec![
+                ("cfe/alias".to_owned(), alias.clone(), target.clone()),
+                ("cfe/inner".to_owned(), inner.clone(), inner.clone()),
+            ],
+        );
+        let key = FileKey::new("cfe/inner", "A.bsl");
+        let carriers = crate::key_carriers::CarrierKeys {
+            store_rows: [key.clone()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        assert!(
+            super::vanished_keys_in(&roots, &carriers, std::slice::from_ref(&alias)).is_empty(),
+            "a live file is not a removal, however the candidates were widened",
+        );
+        fs::remove_file(&module).unwrap();
+        assert_eq!(
+            super::vanished_keys_in(&roots, &carriers, std::slice::from_ref(&alias)),
+            vec![key],
+            "the nested root's key belongs to the removed tree",
+        );
+    }
+
+    /// The same repair when the removal names a path INSIDE the alias root rather than the
+    /// root itself: the spelling is still followed to the target, and the roots registered
+    /// under it are the ones whose keys the removal has to reach (github#190).
+    #[test]
+    fn a_removal_inside_an_alias_spelling_still_reaches_its_target() {
+        let base = tempdir().unwrap();
+        let workspace = base.path().join("w");
+        let alias = workspace.join("alias");
+        let target = base.path().join("outside").join("outer");
+        let inner = target.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let module = inner.join("A.bsl");
+        fs::write(&module, "Процедура Внутренняя()\nКонецПроцедуры").unwrap();
+
+        let roots = crate::WorkspaceRoots::with_stated_spellings(
+            &workspace,
+            vec![
+                ("cfe/alias".to_owned(), alias.clone(), target.clone()),
+                ("cfe/inner".to_owned(), inner.clone(), inner.clone()),
+            ],
+        );
+        let key = FileKey::new("cfe/inner", "A.bsl");
+        let carriers = crate::key_carriers::CarrierKeys {
+            store_rows: [key.clone()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        fs::remove_file(&module).unwrap();
+        assert_eq!(
+            super::vanished_keys_in(&roots, &carriers, &[alias.join("inner")]),
+            vec![key],
+            "a removed path inside the declared spelling still names the target's roots",
+        );
+    }
+
+    /// The journal fixture: a configuration root and an extension root, and a file the walk
+    /// reached through a link spelled inside the configuration. `link` is the spelling a drain
+    /// delivers; `target` is where the file physically lives.
+    fn link_spelling_journal_fixture(
+    ) -> (tempfile::TempDir, tempfile::TempDir, SearchEngine, PathBuf, PathBuf) {
+        let workspace_dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let workspace = workspace_dir.path().to_path_buf();
+        let configuration = workspace.join("cf");
+        let extension = outside.path().join("ext");
+        fs::create_dir_all(&configuration).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        let target = extension.join("Module.bsl");
+        fs::write(&target, "Процедура Ссылочная()\nКонецПроцедуры").unwrap();
+        let link = configuration.join("ExtLink").join("Module.bsl");
+
+        let mut engine = SearchEngine::fts_only(&workspace.join("bsl-search.db")).unwrap();
+        let roots = crate::WorkspaceRoots::with_stated_spellings(
+            &workspace,
+            vec![
+                (crate::CONFIGURATION_ROOT_ID.to_owned(), configuration.clone(), configuration),
+                ("ext".to_owned(), extension.clone(), extension),
+            ],
+        );
+        engine.initialize_workspace_roots(roots).unwrap();
+        (workspace_dir, outside, engine, link, target)
+    }
+
+    /// Deleting a file that was reached through a link spelled inside the configuration must
+    /// take the EXTENSION's key — the spelling names it — and leave the configuration's key
+    /// space untouched: no wrong-key hiding, no wrong-key mark, no row (github#192, topology A).
+    #[test]
+    fn a_removed_link_spelling_takes_the_key_the_walk_recorded() {
+        let (_workspace_dir, _outside, mut engine, link, target) = link_spelling_journal_fixture();
+        let key = FileKey::new("ext", "Module.bsl");
+        engine.store().upsert_file(&key.root_id, &key.path, b"h", "code").unwrap();
+        engine.record_workspace_spellings(&key, &[link.as_path(), target.as_path()]).unwrap();
+
+        // The removal arrives as the link spelling, with the target already gone.
+        fs::remove_file(&target).unwrap();
+        assert!(engine.remove_workspace_path(&link).unwrap());
+
+        assert_eq!(
+            engine.store().all_files_in_collection("code").unwrap().len(),
+            0,
+            "the extension's row is what the spelling named",
+        );
+        assert!(
+            engine
+                .workspace_overlay_dirty_paths()
+                .unwrap()
+                .iter()
+                .all(|dirty| dirty.root_id == "ext"),
+            "attribution rerun would have marked a configuration key nobody indexed",
+        );
+        assert_eq!(engine.workspace_overlay_stats().unwrap().unwrap().hidden_paths, 0);
+    }
+
+    /// Removing only the link while the file behind it lives must take NOTHING with it: the
+    /// journal answer is gated by the absence proof, so neither the point channel nor the
+    /// subtree channel may strand the live file's row (github#192, topology B).
+    #[test]
+    fn a_removed_link_whose_target_lives_takes_nothing() {
+        let (_workspace_dir, _outside, mut engine, link, target) = link_spelling_journal_fixture();
+        let key = FileKey::new("ext", "Module.bsl");
+        engine.store().upsert_file(&key.root_id, &key.path, b"h", "code").unwrap();
+        engine.record_workspace_spellings(&key, &[link.as_path(), target.as_path()]).unwrap();
+
+        assert!(engine.remove_workspace_path(&link).unwrap());
+        assert!(
+            engine.store().file_hash(&key.root_id, &key.path).unwrap().is_some(),
+            "a live target keeps answering search",
+        );
+        assert_eq!(
+            engine.remove_vanished_under(std::slice::from_ref(&link)).unwrap(),
+            0,
+            "and the subtree channel takes it no more than the point one",
+        );
+        assert!(engine.workspace_overlay_dirty_paths().unwrap().is_empty());
+    }
+
+    /// The batch materializer's journal answer [`CarrierSnapshot::removal_keys`]: a removed
+    /// link spelling names the extension's key once the target is gone, and the same answer is
+    /// withheld while the target lives (github#192).
+    #[test]
+    fn snapshot_removal_keys_answer_from_the_journal() {
+        let (_workspace_dir, _outside, engine, link, target) = link_spelling_journal_fixture();
+        let key = FileKey::new("ext", "Module.bsl");
+        engine.store().upsert_file(&key.root_id, &key.path, b"h", "code").unwrap();
+        engine.record_workspace_spellings(&key, &[link.as_path(), target.as_path()]).unwrap();
+        let reader = crate::Store::open_reader(engine.store().db_path()).unwrap();
+        let snapshot = engine.capture_carriers().unwrap().complete(&reader).unwrap();
+
+        assert!(
+            snapshot.removal_keys(&reader, std::slice::from_ref(&link), &[]).unwrap().is_empty(),
+            "a live target is not a removal, whatever the spelling says",
+        );
+        fs::remove_file(&target).unwrap();
+        assert_eq!(
+            snapshot.removal_keys(&reader, std::slice::from_ref(&link), &[]).unwrap(),
+            vec![key],
+            "the spelling names the key the walk recorded",
+        );
+    }
+
+    /// The journal is durable: an engine reopened on the same store without ever walking
+    /// resolves the same removal (github#192, invariant 4).
+    #[test]
+    fn the_journal_resolves_a_removal_after_a_restart_without_a_walk() {
+        let workspace_dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let workspace = workspace_dir.path().to_path_buf();
+        let configuration = workspace.join("cf");
+        let extension = outside.path().join("ext");
+        fs::create_dir_all(&configuration).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        let target = extension.join("Module.bsl");
+        fs::write(&target, "Процедура Ссылочная()\nКонецПроцедуры").unwrap();
+        let link = configuration.join("ExtLink").join("Module.bsl");
+        let db = workspace.join("bsl-search.db");
+        let key = FileKey::new("ext", "Module.bsl");
+        {
+            let engine = SearchEngine::fts_only(&db).unwrap();
+            engine.store().upsert_file(&key.root_id, &key.path, b"h", "code").unwrap();
+            engine.record_workspace_spellings(&key, &[link.as_path(), target.as_path()]).unwrap();
+        }
+
+        fs::remove_file(&target).unwrap();
+        let mut engine = SearchEngine::fts_only(&db).unwrap();
+        let roots = crate::WorkspaceRoots::with_stated_spellings(
+            &workspace,
+            vec![
+                (crate::CONFIGURATION_ROOT_ID.to_owned(), configuration.clone(), configuration),
+                ("ext".to_owned(), extension.clone(), extension),
+            ],
+        );
+        engine.initialize_workspace_roots(roots).unwrap();
+        assert!(engine.remove_workspace_path(&link).unwrap());
+        assert_eq!(
+            engine.store().all_files_in_collection("code").unwrap().len(),
+            0,
+            "the pair outlives the process that recorded it",
+        );
+    }
+
+    /// A store created before the journal existed is populated again by the ordinary write
+    /// paths after the update — the table being recreated empty is not the end of it
+    /// (github#192, invariant 5).
+    #[test]
+    fn a_store_that_predates_the_journal_is_populated_again_by_the_next_write() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("A.bsl");
+        fs::write(&file, "Процедура Точка()\nКонецПроцедуры").unwrap();
+        let db = workspace.join("bsl-search.db");
+        {
+            let engine = SearchEngine::fts_only(&db).unwrap();
+            let saboteur = rusqlite::Connection::open(&db).unwrap();
+            saboteur.execute_batch("DROP TABLE path_spellings").unwrap();
+            drop(saboteur);
+            drop(engine);
+        }
+
+        let mut engine = SearchEngine::fts_only(&db).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(workspace, workspace, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+        assert!(engine.mark_workspace_path_dirty(&file).unwrap());
+        assert!(
+            engine.store().path_spelling_key(&file.to_string_lossy(), "code").unwrap().is_some(),
+            "the update must not leave the journal empty",
+        );
+    }
+
+    /// The boot ingest is one of the index-write paths and records what it walked: a removal
+    /// arriving as the file's own spelling finds its key (github#192, population).
+    #[test]
+    fn the_boot_ingest_records_the_files_spellings() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("A.bsl");
+        fs::write(&file, "Процедура Первая()\nКонецПроцедуры").unwrap();
+        let mut engine = SearchEngine::fts_only(&workspace.join("bsl-search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(workspace, workspace, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+
+        engine.index_directory_fts(workspace).unwrap();
+
+        assert_eq!(
+            engine.store().path_spelling_key(&file.to_string_lossy(), "code").unwrap(),
+            Some(FileKey::configuration("A.bsl")),
+        );
+    }
+
+    /// A point mark is an index write too, so the spelling it arrived as is recorded beside
+    /// the key (github#192, population).
+    #[test]
+    fn a_point_mark_records_the_spelling_it_arrived_as() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("A.bsl");
+        fs::write(&file, "Процедура Точка()\nКонецПроцедуры").unwrap();
+        let engine = SearchEngine::fts_only(&workspace.join("bsl-search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(workspace, workspace, &[]);
+        let mut engine = engine;
+        engine.initialize_workspace_roots(roots).unwrap();
+
+        assert!(engine.mark_workspace_path_dirty(&file).unwrap());
+        assert_eq!(
+            engine.store().path_spelling_key(&file.to_string_lossy(), "code").unwrap(),
+            Some(FileKey::configuration("A.bsl")),
+        );
+    }
+
+    /// A cold overlay refresh scans the tree, and that scan populates the journal like every
+    /// other walk (github#192, population).
+    #[test]
+    fn a_cold_overlay_refresh_records_the_scanned_spellings() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("A.bsl");
+        fs::write(&file, "Процедура Оверлейная()\nКонецПроцедуры").unwrap();
+        let engine = SearchEngine::fts_only(&workspace.join("bsl-search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(workspace, workspace, &[]);
+        let mut engine = engine;
+        engine.initialize_workspace_roots(roots).unwrap();
+        engine.initialize_workspace_overlay_clean().unwrap();
+
+        engine.refresh_workspace_overlay_snapshot(true).unwrap();
+
+        assert_eq!(
+            engine.store().path_spelling_key(&file.to_string_lossy(), "code").unwrap(),
+            Some(FileKey::configuration("A.bsl")),
+        );
+    }
+
     /// A deletion PROVEN by the removal channel must drop the cached overlay entry even when
     /// the whole root vanished with the file: the point refresh would read the dead root as
     /// "unreachable, retry" and leave a ghost entry serving hits forever.
@@ -10090,14 +10726,31 @@ mod tests {
             .unwrap();
 
         let saboteur = rusqlite::Connection::open(&db_path).unwrap();
+        // The fallible store step before the row goes needs a row to fail on.
+        engine
+            .store()
+            .save_overlay_fingerprint_cache(
+                "snap",
+                &HashMap::from([(
+                    FileKey::configuration("Removed.bsl"),
+                    crate::store::PersistedFingerprint {
+                        file_size: 1,
+                        file_mtime_secs: 1,
+                        file_mtime_nanos: 0,
+                        content_fingerprint: "fp".to_owned(),
+                        canonical: "Removed.bsl".to_owned(),
+                    },
+                )]),
+            )
+            .unwrap();
         saboteur
             .execute_batch(
-                "CREATE TRIGGER deny_tombstone BEFORE INSERT ON overlay_tombstones \
+                "CREATE TRIGGER deny_fingerprint BEFORE DELETE ON overlay_fingerprint_cache \
                  BEGIN SELECT RAISE(FAIL, 'deny'); END;",
             )
             .unwrap();
         let result = engine.remove_workspace_path(workspace.join("Removed.bsl"));
-        assert!(result.is_err(), "the denied tombstone surfaces as an error");
+        assert!(result.is_err(), "the denied retraction surfaces as an error");
         assert!(
             engine
                 .workspace_overlay_dirty_paths_snapshot()
@@ -10284,6 +10937,62 @@ mod tests {
             .mark_workspace_path_context_dirty("CommonModules/Б/Ext/Module.bsl")
             .expect("marking a workspace path is not an error");
         assert!(marked, "a configuration-relative path resolves to its stored key");
+    }
+
+    /// A context mark re-renders a stored context and indexes nothing, so it must not move a
+    /// spelling's journal record to whatever the spelling attributes to now: the record names
+    /// the key the file was indexed under, and a later removal of that spelling has to find it.
+    #[test]
+    fn a_context_mark_leaves_the_spelling_journal_alone() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let configuration = workspace.join("cf");
+        let module = configuration.join("CommonModules").join("Б").join("Ext").join("Module.bsl");
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&module, "Процедура Первая()\nКонецПроцедуры").unwrap();
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(&workspace, &configuration, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+        let indexed = FileKey::new("ext", "CommonModules/Б/Ext/Module.bsl");
+        let spelling = module.to_string_lossy().into_owned();
+        engine.store().record_path_spelling(&spelling, &indexed, "code").unwrap();
+
+        assert!(engine.mark_workspace_path_context_dirty(&module).unwrap());
+        assert_eq!(
+            engine.store().path_spelling_key(&spelling, "code").unwrap(),
+            Some(indexed),
+            "a context mark is not an index write and keeps the recorded key",
+        );
+    }
+
+    /// A key names a regular file, so a directory standing at its path is no evidence the
+    /// file lives: the walk would never index it, and the journal's answer must not be
+    /// withheld over it.
+    #[test]
+    fn a_directory_in_place_of_an_indexed_file_proves_the_file_gone() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let configuration = workspace.join("cf");
+        let module = configuration.join("CommonModules").join("Б").join("Ext").join("Module.bsl");
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&module, "Процедура Первая()\nКонецПроцедуры").unwrap();
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let (roots, _) = crate::WorkspaceRoots::build(&workspace, &configuration, &[]);
+        engine.initialize_workspace_roots(roots).unwrap();
+        let key = FileKey::new(crate::CONFIGURATION_ROOT_ID, "CommonModules/Б/Ext/Module.bsl");
+        engine.store().upsert_file(&key.root_id, &key.path, b"h", "code").unwrap();
+        engine.record_workspace_spellings(&key, &[module.as_path()]).unwrap();
+
+        fs::remove_file(&module).unwrap();
+        fs::create_dir(&module).unwrap();
+        assert!(engine.remove_workspace_path(&module).unwrap());
+        assert_eq!(
+            engine.store().file_hash(&key.root_id, &key.path).unwrap(),
+            None,
+            "a directory where the file stood does not keep the file's row alive",
+        );
     }
 
     fn write_transition_module(root: &std::path::Path, procedure: &str) {
@@ -10480,7 +11189,6 @@ mod tests {
         let key = FileKey::new("cfe/one", "Broken.bsl");
         assert_eq!(engine.workspace_overlay_unread_count().unwrap(), 1);
         assert!(engine.workspace_overlay_dirty_paths().unwrap().contains(&key));
-        assert!(engine.store().overlay_tombstone_paths("code").unwrap().is_empty());
 
         fs::write(&extension_file, "Процедура Исцелена()\nКонецПроцедуры").unwrap();
         crate::point_refresh::point_refresh_for_test(&engine).expect("a dirty key to refresh");
@@ -10490,7 +11198,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_present_remote_baseline_is_not_hidden_or_tombstoned() {
+    fn unread_present_remote_baseline_is_not_hidden() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().join("ws");
         let configuration = workspace.join("cf");
@@ -10534,7 +11242,6 @@ mod tests {
         assert_eq!(stats.hidden_paths, 0);
         assert_eq!(stats.deleted_files, 0);
         assert_eq!(engine.workspace_overlay_unread_count().unwrap(), 1);
-        assert!(engine.store().overlay_tombstone_paths("code").unwrap().is_empty());
     }
 
     #[test]
@@ -10857,11 +11564,6 @@ mod tests {
         let stats = engine.workspace_overlay_stats().unwrap().unwrap();
         assert_eq!(stats.overlay_files, 0);
         assert_eq!(stats.deleted_files, 1, "the removed baseline key remains hidden");
-        assert!(engine
-            .store()
-            .overlay_tombstone_paths("code")
-            .unwrap()
-            .contains(&FileKey::new("cfe/one", relative)));
     }
 
     #[test]
@@ -11208,7 +11910,7 @@ mod tests {
         write_transition_module(&configuration, "Конфигурация");
         let extension_file = extension.join("CommonModules/Один/Ext/Module.bsl");
         fs::create_dir_all(extension_file.parent().unwrap()).unwrap();
-        fs::write(extension_file, "Процедура Расширение() Экспорт\nКонецПроцедуры\n").unwrap();
+        fs::write(&extension_file, "Процедура Расширение() Экспорт\nКонецПроцедуры\n").unwrap();
 
         let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
         let initial = crate::WorkspaceRoots::build(&workspace, &configuration, &[]).0;
@@ -11268,6 +11970,22 @@ mod tests {
             engine.workspace_roots().map(|roots| roots.ids().count()),
             Some(2),
             "the control: the extension root really was installed"
+        );
+        // The transition is one of the index-write paths: the spellings it published are
+        // recorded beside their keys, so a removal arriving as that path finds it
+        // (github#192).
+        let extension_key = engine
+            .workspace_file_key(&extension_file)
+            .expect("the transition published the extension's module");
+        let declared_spelling = engine
+            .workspace_roots()
+            .expect("the transition installed its roots")
+            .resolve(&extension_key)
+            .expect("the key names a file");
+        assert_eq!(
+            engine.store().path_spelling_key(&declared_spelling.to_string_lossy(), "code").unwrap(),
+            Some(extension_key),
+            "the transition records the spellings of the files it published",
         );
 
         assert!(

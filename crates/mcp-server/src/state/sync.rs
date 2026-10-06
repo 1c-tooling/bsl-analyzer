@@ -789,7 +789,7 @@ impl SharedState {
         let needs_carriers = plan.mark_all_context
             || !plan.removed_subtrees.is_empty()
             || plan.reconcile_present.is_some();
-        let (roots, carriers) = {
+        let (roots, carriers, db_path) = {
             let guard = match engine.acquire_for_owner(stop) {
                 Ok(guard) => guard,
                 Err(crate::tools::search::OwnerLockRefused::Closing) => {
@@ -805,7 +805,7 @@ impl SharedState {
             plan.roots_epoch = engine.workspace_roots_epoch();
             let Some(roots) = engine.workspace_roots().cloned() else { return };
             let carriers = if needs_carriers { Some(engine.capture_carriers()) } else { None };
-            (roots, carriers)
+            (roots, carriers, engine.store().db_path().to_path_buf())
         };
         #[cfg(test)]
         if needs_carriers {
@@ -818,10 +818,20 @@ impl SharedState {
         let key_of = |path: &PathBuf| bsl_search::workspace_file_key_in(&roots, path);
         plan.dirty_keys
             .extend(plan.dirty_paths.iter().chain(&plan.rewalk_paths).filter_map(key_of));
-        plan.removed_keys.extend(plan.removed_paths.iter().filter_map(key_of));
         plan.context_keys.extend(plan.context_paths.iter().filter_map(key_of));
 
         let prepared = (|| -> Result<(), bsl_search::SearchError> {
+            // The removed PATHS need the journal and nothing else: no carrier snapshot is
+            // built for a batch that only deletes files, so the hot path stays what it was
+            // (github#192).
+            if !plan.removed_paths.is_empty() {
+                let reader = bsl_search::Store::open_reader(&db_path)?;
+                plan.removed_keys.extend(bsl_search::removed_path_keys(
+                    &roots,
+                    &reader,
+                    &plan.removed_paths,
+                )?);
+            }
             let Some(capture) = carriers else { return Ok(()) };
             let capture = capture?;
             let reader = bsl_search::Store::open_reader(capture.db_path())?;
@@ -830,7 +840,14 @@ impl SharedState {
                 plan.context_keys.extend(snapshot.known_keys());
                 plan.mark_all_context = false;
             }
-            plan.removed_keys.extend(snapshot.vanished_keys(&plan.removed_subtrees));
+            // The subtrees go through the journal too: a spelling names the key its file was
+            // indexed under, which re-attribution cannot reconstruct once the links are gone
+            // (github#192).
+            plan.removed_keys.extend(snapshot.removal_keys(
+                &reader,
+                &[],
+                &plan.removed_subtrees,
+            )?);
             if let Some(present) = &plan.reconcile_present {
                 let present: std::collections::HashSet<_> =
                     present.iter().filter_map(key_of).collect();
@@ -1218,7 +1235,7 @@ impl SharedState {
     /// So a store row for a vanished file survives, and an [`OverlayInit::Clean`] — which asserts the
     /// store already equals the working tree — would serve that ghost forever. This walks the source
     /// tree (error-aware) and, on a CLEAN walk, calls [`SearchEngine::reconcile_workspace_files`] to
-    /// remove every stored-but-gone path (tombstone + overlay dirty + incremental vector eviction —
+    /// remove every stored-but-gone path (overlay dirty + baseline hiding + incremental vector eviction —
     /// the same removal path the overflow rescan ships).
     ///
     /// Returns whether the store was PROVEN reconciled: `false` on any walk error OR a reconcile
