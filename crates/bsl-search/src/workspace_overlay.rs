@@ -4800,7 +4800,14 @@ mod tests {
             return;
         }
         let (result, warns) = warns_during(|| {
-            cache.full_refresh(&baseline, &roots, None, 32, BaselineHashMode::RawFileBytes)
+            cache.full_refresh(
+                &baseline,
+                &roots,
+                None,
+                32,
+                BaselineHashMode::RawFileBytes,
+                &Store::in_memory().unwrap(),
+            )
         });
         restore_access(&edited);
         result.unwrap();
